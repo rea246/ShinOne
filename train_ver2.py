@@ -33,7 +33,11 @@ from torch_geometric.nn import GATv2Conv, global_mean_pool, global_max_pool
 # [Global Config]
 # ══════════════════════════════════════════════════════════════════
 NOISE_STD  = 0.05
-BATCH_SIZE = 32
+# BATCH_SIZE — VICReg의 Var/Cov는 배치 통계라 배치가 클수록 추정이 안정적이다.
+# 다만 32→2048 은 64배라, 에포크당 업데이트 횟수가 64배 줄어든다.
+# → 수렴 속도 유지를 위해 LR을 sqrt 규칙으로 함께 올린다(아래 main 참조).
+BATCH_SIZE = 2048
+REFERENCE_BATCH = 32   # LR sqrt-scaling 기준 배치 (원래 lr=1e-4 가 검증된 배치)
 
 # embedding_dim — 노드 임베딩 차원.
 # 노드 디코더는 embedding_dim -> num_node_features(=4) 복원이므로,
@@ -507,7 +511,7 @@ def train_one_epoch(
     n = 0
 
     for batch in train_loader:
-        batch = batch.to(device)
+        batch = batch.to(device, non_blocking=True)
         batch.edge_index = batch.edge_index.long()
         batch.x          = batch.x.float()
         batch.edge_attr  = batch.edge_attr.float()
@@ -577,7 +581,7 @@ def validate_epoch(
 
     with torch.no_grad():
         for batch in val_loader:
-            batch = batch.to(device)
+            batch = batch.to(device, non_blocking=True)
             batch.edge_index = batch.edge_index.long()
             batch.x          = batch.x.float()
             batch.edge_attr  = batch.edge_attr.float()
@@ -709,6 +713,17 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
 
+    # ── [Speedup — 정확도 trade-off 없는 순수 처리량 향상] ──────────
+    # TF32: Ampere(RTX 30xx/40xx, A100 등)+ 에서 fp32 matmul 을 TF32 로 가속.
+    #        학습 정확도 영향은 사실상 없음(이미 AMP 사용 중). 구형 GPU 면 자동 무시(no-op).
+    # cudnn.benchmark: 입력 shape 자동 튜닝(그래프라 효과 작지만 무해).
+    pin = (device.type == 'cuda')
+    if pin:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+        torch.set_float32_matmul_precision('high')
+
     node_scale, edge_scale = get_global_scales(train_files, cache_path="global_scales_train_only_v2.pt")
     node_scale  = node_scale.to(device)
     edge_scale  = edge_scale.to(device)
@@ -717,13 +732,18 @@ def main():
 
     val_noise_gen = torch.Generator(device=device).manual_seed(42)
 
+    # num_workers=0 유지: 데이터셋이 이미 RAM 프리로드라 워커 이득이 작고,
+    # Windows(spawn)에서는 워커가 큰 텐서를 복제해 시스템 RAM 을 낭비할 수 있음.
+    # pin_memory + non_blocking 은 H2D 전송을 연산과 겹쳐줘 무해한 이득.
     print("\n[1/2] 검증 데이터셋 로드 (fast)...")
     val_dataset = FastPreloadedDataset([val_file])
-    val_loader  = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+    val_loader  = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False,
+                             num_workers=0, pin_memory=pin)
 
     print("\n[2/2] 훈련 데이터셋 프리로드 (fast)...")
     train_dataset = FastPreloadedDataset(train_files)
-    train_loader  = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
+    train_loader  = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True,
+                               num_workers=0, pin_memory=pin)
 
     model = LayoutGAE(
         num_node_features=node_scale.size(0),
@@ -731,7 +751,13 @@ def main():
         embedding_dim=EMBEDDING_DIM
     ).to(device)
 
-    optimizer   = torch.optim.Adam(model.parameters(), lr=1e-4)
+    # LR sqrt-scaling: 큰 배치의 낮은 그래디언트 분산을 보상해 에포크당 진척을 유지.
+    # batch=2048 → 1e-4 * sqrt(2048/32) = 8e-4. (linear scaling 은 Adam 에 과함)
+    # warmup 없이도 grad clip(max_norm=5) 이 초반 발산을 막는 안전망 역할.
+    base_lr = 1e-4
+    lr = base_lr * (BATCH_SIZE / REFERENCE_BATCH) ** 0.5
+    optimizer   = torch.optim.Adam(model.parameters(), lr=lr)
+    print(f"[train_ver2] batch={BATCH_SIZE}  lr={lr:.2e} (sqrt-scaled from {base_lr:.0e}@{REFERENCE_BATCH})")
     weight_hop  = torch.tensor([5.0, 5.0, 2.0, 1.0, 7.0, 5.0, 5.0], device=device)
     scaler      = torch.amp.GradScaler('cuda')
     scheduler   = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
