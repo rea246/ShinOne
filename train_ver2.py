@@ -790,7 +790,9 @@ def main():
     lr = base_lr * (BATCH_SIZE / REFERENCE_BATCH) ** 0.5
     optimizer   = torch.optim.Adam(model.parameters(), lr=lr)
     print(f"[train_ver2] batch={BATCH_SIZE}  lr={lr:.2e} (sqrt-scaled from {base_lr:.0e}@{REFERENCE_BATCH})")
-    weight_hop  = torch.tensor([5.0, 5.0, 2.0, 1.0, 7.0, 5.0, 5.0], device=device)
+    # weight_hop = [h0, h1, h2, h3, edge_spatial, edge_vec, edge_extra]
+    # 재구성 loss 의 상대 비중. VICReg 대비 recon 지배도를 낮추려 하향 조정.
+    weight_hop  = torch.tensor([3.0, 3.0, 1.0, 1.0, 3.0, 2.0, 2.0], device=device)
     scaler      = torch.amp.GradScaler('cuda')
     scheduler   = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
 
