@@ -26,8 +26,8 @@ from torch_geometric.loader import DataLoader
 from torch_geometric.utils import scatter
 from torch_geometric.nn import GATv2Conv, global_mean_pool, global_max_pool
 
-# fast 포맷 로더/스케일 계산 (gds-to-gnn-preprocessor 가 저장하는 포맷 전용)
-from fast_format import FastPreloadedDataset, compute_global_scales_fast
+# fast 포맷 로더/스케일 계산은 이 파일 하단에 인라인 구현되어 있다.
+# (preprocessor.py 의 _pack_fast_chunk 가 저장하는 포맷 전용 — 외부 의존 없음)
 
 # ══════════════════════════════════════════════════════════════════
 # [Global Config]
@@ -144,6 +144,97 @@ class CompactPreloadedDataset(Dataset):
             hop2_mask=((packed >> 2) & 1).bool(),
             hop3_mask=((packed >> 3) & 1).bool()
         )
+
+
+# ══════════════════════════════════════════════════════════════════
+# [Fast Format — preprocessor.py 산출물 전용 로더 / 스케일 계산]
+#   preprocessor._pack_fast_chunk 가 저장하는 포맷:
+#     x          : (N,4) float16   노드 feature [cx, cy, w, h]
+#     edge_index : (2,E) int32      그래프-로컬 인덱스 (양방향)
+#     edge_attr  : (E,4) float16    [box_dist, center_dist, unit_x, unit_y]
+#     hop_packed : (N,)  int8       bit0=hop0 .. bit3=hop3+
+#     meta       : (G,4) int64      그래프별 슬라이스 [x0, x1, e0, e1]
+#     keys       : [gauge_name, ...]
+# ══════════════════════════════════════════════════════════════════
+class FastPreloadedDataset(Dataset):
+    """여러 PREPROCESSED_*.pt 청크를 RAM 에 병합 후 그래프 단위로 슬라이싱해 반환."""
+    def __init__(self, file_paths):
+        super().__init__()
+        xs, eis, eas, hms = [], [], [], []
+        self.slices = []                 # (x0,x1,e0,e1) — 전역 오프셋
+        x_off = e_off = 0
+
+        for f in file_paths:
+            d = torch.load(f, map_location='cpu', weights_only=False)
+            x, ei, ea = d['x'], d['edge_index'], d['edge_attr']
+            hp, meta = d['hop_packed'], d['meta']
+
+            xs.append(x); eis.append(ei); eas.append(ea); hms.append(hp)
+            # edge_index 값은 그래프-로컬(0-base)이라 전역 오프셋을 더하지 않는다.
+            # meta 슬라이스만 전역 오프셋으로 옮겨서 __getitem__ 이 올바른 블록을 자르게 한다.
+            for x0, x1, e0, e1 in meta.tolist():
+                self.slices.append((x0 + x_off, x1 + x_off, e0 + e_off, e1 + e_off))
+            x_off += x.size(0)
+            e_off += ei.size(1)
+
+        self.all_x          = torch.cat(xs, dim=0)
+        self.all_edge_index = torch.cat(eis, dim=1)   # (2, totalE) — 값은 그래프-로컬
+        self.all_edge_attr  = torch.cat(eas, dim=0)
+        self.all_hop_packed = torch.cat(hms, dim=0)
+        del xs, eis, eas, hms
+        gc.collect()
+        print(f"총 {len(self.slices)}개 그래프 시스템 RAM 안착 완료! (fast format)")
+
+    def __len__(self):
+        return len(self.slices)
+
+    def __getitem__(self, idx):
+        xs, xe, es, ee = self.slices[idx]
+        x          = self.all_x[xs:xe].float()
+        edge_attr  = self.all_edge_attr[es:ee].float()
+        edge_index = self.all_edge_index[:, es:ee].long()   # 로컬 인덱스 → 슬라이스한 x 와 정합
+        packed     = self.all_hop_packed[xs:xe]
+        return Data(
+            x=x, edge_index=edge_index, edge_attr=edge_attr,
+            hop0_mask=(packed & 1).bool(),
+            hop1_mask=((packed >> 1) & 1).bool(),
+            hop2_mask=((packed >> 2) & 1).bool(),
+            hop3_mask=((packed >> 3) & 1).bool()
+        )
+
+
+def compute_global_scales_fast(file_paths):
+    """
+    사전 병합된 x / edge_attr 전체 행 기준으로 feature 별 std(스케일) 계산.
+    (샘플링 없이 스트리밍 누적 → 메모리 안전)
+    반환: (node_scale (Fn,), edge_scale (Fe,))  — 0 방지용 하한 1e-6 클램프.
+    """
+    n_cnt = e_cnt = 0
+    n_sum = n_sqsum = e_sum = e_sqsum = None
+
+    for f in file_paths:
+        d = torch.load(f, map_location='cpu', weights_only=False)
+        x  = d['x'].float()
+        ea = d['edge_attr'].float()
+
+        xs, xsq = x.sum(0), (x * x).sum(0)
+        es, esq = ea.sum(0), (ea * ea).sum(0)
+        if n_sum is None:
+            n_sum, n_sqsum, e_sum, e_sqsum = xs, xsq, es, esq
+        else:
+            n_sum += xs;  n_sqsum += xsq
+            e_sum += es;  e_sqsum += esq
+        n_cnt += x.size(0)
+        e_cnt += ea.size(0)
+
+    if n_cnt == 0 or e_cnt == 0:
+        raise ValueError("스케일 계산 실패: 유효한 노드/엣지가 없습니다.")
+
+    n_mean = n_sum / n_cnt
+    e_mean = e_sum / e_cnt
+    node_scale = torch.sqrt((n_sqsum / n_cnt - n_mean ** 2).clamp_min(0)).clamp_min(1e-6)
+    edge_scale = torch.sqrt((e_sqsum / e_cnt - e_mean ** 2).clamp_min(0)).clamp_min(1e-6)
+    return node_scale, edge_scale
 
 
 def load_graph(path):
