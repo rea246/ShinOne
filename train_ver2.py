@@ -33,7 +33,9 @@ from torch_geometric.nn import GATv2Conv, global_mean_pool, global_max_pool
 # ══════════════════════════════════════════════════════════════════
 # [Global Config]
 # ══════════════════════════════════════════════════════════════════
-NOISE_STD  = 0.05
+# NOISE_STD — denoising 강도. dim 을 키우면(아래 8) 큰 latent 가 입력을 거의
+# 복사할 여지가 생기므로, 노이즈를 함께 올려 "복사로는 못 푸는" 압력을 유지한다.
+NOISE_STD  = 0.1
 # BATCH_SIZE — VICReg의 Var/Cov는 배치 통계라 배치가 클수록 추정이 안정적이다.
 # 다만 32→2048 은 64배라, 에포크당 업데이트 횟수가 64배 줄어든다.
 # → 수렴 속도 유지를 위해 LR을 sqrt 규칙으로 함께 올린다(아래 main 참조).
@@ -51,11 +53,13 @@ REFERENCE_BATCH = 32   # LR sqrt-scaling 기준 배치 (원래 lr=1e-4 가 검�
 NUM_WORKERS = 6
 
 # embedding_dim — 노드 임베딩 차원.
-# 노드 디코더는 embedding_dim -> num_node_features(=4) 복원이므로,
-# 차원이 크면(예: 32) 노드 단위에서 압축 병목이 사라져 인코더가
-# "학습 없이 입력을 그대로 복사"하는 지름길을 타게 된다(관찰된 실패).
-# dim=3 이면 3 -> 4 로 진짜 정보 병목이 생겨 인코더가 구조를 추상화하도록 강제된다.
-EMBEDDING_DIM = 3
+# 노드 디코더는 z_node(embedding_dim) -> num_node_features(=4) 복원이라,
+# dim=3 이면 3->4 로 정보 병목이 심해 재구성 정확도의 상한을 누른다(epoch 140에서
+# h1~39%/E_Space~26% 로 조기 수렴 관찰됨).
+# 원래 dim 을 작게 둔 이유(copy-collapse 방지)는 이제 denoising + VICReg 가 대신
+# 막아주므로, 병목을 완화해 표현력을 키운다: 3 -> 8.
+# (copy 여부는 visualize_encoder 의 effective rank / 클러스터 품질로 검증)
+EMBEDDING_DIM = 8
 
 # VICReg 가중치 — 재구성 loss (≈1~5 수렴 구간)와 스케일 맞춤
 # weight_inv : clean/noisy 임베딩을 가깝게 → 같은 패턴 = 같은 임베딩
@@ -805,13 +809,22 @@ def main():
     start_epoch       = 0
 
     # ── [Resume] 이전 체크포인트가 있으면 자동 복원 ──────────────
+    #   아키텍처(embedding_dim 등)를 바꾸면 이전 체크포인트와 shape 가 안 맞아
+    #   load_state_dict 가 RuntimeError 를 낸다. 이때 크래시 대신 '신규 학습'으로
+    #   안전하게 전환한다. (load_state_dict 는 strict 실패 시 아무것도 로드하지 않으므로
+    #   model 은 방금 생성한 초기 상태 그대로 → optimizer/scheduler 도 초기 상태로 일관)
     if os.path.exists(RESUME_PATH):
-        print(f"\n[Resume] '{RESUME_PATH}' 발견 → 학습 상태 복원 중...")
-        last_epoch, best_val_loss, patience_counter, ckpt_name = load_full_checkpoint(
-            RESUME_PATH, model, optimizer, scheduler, scaler, device
-        )
-        start_epoch = last_epoch + 1
-        print(f"[Resume] Epoch {start_epoch}부터 재개 | Best Val: {best_val_loss:.6f} | Patience: {patience_counter}")
+        print(f"\n[Resume] '{RESUME_PATH}' 발견 → 학습 상태 복원 시도...")
+        try:
+            last_epoch, best_val_loss, patience_counter, ckpt_name = load_full_checkpoint(
+                RESUME_PATH, model, optimizer, scheduler, scaler, device
+            )
+            start_epoch = last_epoch + 1
+            print(f"[Resume] Epoch {start_epoch}부터 재개 | Best Val: {best_val_loss:.6f} | Patience: {patience_counter}")
+        except Exception as e:
+            print(f"[Resume] ⚠ 복원 실패(아키텍처/포맷 불일치 가능): {e}")
+            print(f"[Resume] → 신규 학습으로 시작합니다. '{RESUME_PATH}' 는 다음 에포크부터 새 상태로 덮어써집니다.")
+            start_epoch = 0
     else:
         print(f"\n[train_ver2] 신규 학습 시작 (RESUME_PATH 없음)")
 
