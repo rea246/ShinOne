@@ -39,6 +39,14 @@ NOISE_STD  = 0.05
 BATCH_SIZE = 2048
 REFERENCE_BATCH = 32   # LR sqrt-scaling 기준 배치 (원래 lr=1e-4 가 검증된 배치)
 
+# NUM_WORKERS — DataLoader 병렬 collation 워커 수.
+#   0 이면 메인 스레드가 단독으로 수천 개 작은 그래프를 매 배치 PyG Batch 로 합쳐
+#   GPU 가 데이터를 기다리며 논다(= GPU 메모리 적게 쓰는데 느린 전형적 증상).
+#   >0 이면 collation 을 CPU 코어로 분산해 GPU 연산과 겹친다.
+#   - Linux(fork): 프리로드 텐서를 copy-on-write 로 공유 → 메모리 이득 거의 없이 빠름.
+#   - Windows(spawn): 워커가 데이터셋을 복제 → RAM 급증 시 0 으로 되돌릴 것.
+NUM_WORKERS = 4
+
 # embedding_dim — 노드 임베딩 차원.
 # 노드 디코더는 embedding_dim -> num_node_features(=4) 복원이므로,
 # 차원이 크면(예: 32) 노드 단위에서 압축 병목이 사라져 인코더가
@@ -732,18 +740,23 @@ def main():
 
     val_noise_gen = torch.Generator(device=device).manual_seed(42)
 
-    # num_workers=0 유지: 데이터셋이 이미 RAM 프리로드라 워커 이득이 작고,
-    # Windows(spawn)에서는 워커가 큰 텐서를 복제해 시스템 RAM 을 낭비할 수 있음.
-    # pin_memory + non_blocking 은 H2D 전송을 연산과 겹쳐줘 무해한 이득.
+    # DataLoader 성능 옵션:
+    #   - NUM_WORKERS>0: collation 을 CPU 코어로 분산 → GPU starvation 완화(가장 큰 이득).
+    #   - persistent_workers: 에포크마다 워커 재생성 비용 제거.
+    #   - prefetch_factor: 워커가 미리 배치를 쌓아 GPU 를 굶기지 않음.
+    #   - pin_memory + non_blocking: H2D 전송을 연산과 겹침.
+    dl_kw = dict(pin_memory=pin, num_workers=NUM_WORKERS)
+    if NUM_WORKERS > 0:
+        dl_kw.update(persistent_workers=True, prefetch_factor=4)
+    print(f"[DataLoader] num_workers={NUM_WORKERS}, pin_memory={pin}")
+
     print("\n[1/2] 검증 데이터셋 로드 (fast)...")
     val_dataset = FastPreloadedDataset([val_file])
-    val_loader  = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False,
-                             num_workers=0, pin_memory=pin)
+    val_loader  = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, **dl_kw)
 
     print("\n[2/2] 훈련 데이터셋 프리로드 (fast)...")
     train_dataset = FastPreloadedDataset(train_files)
-    train_loader  = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True,
-                               num_workers=0, pin_memory=pin)
+    train_loader  = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, **dl_kw)
 
     model = LayoutGAE(
         num_node_features=node_scale.size(0),
