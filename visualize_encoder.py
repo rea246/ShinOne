@@ -24,9 +24,14 @@ visualize_encoder.py — 학습된 encoder(GAE) 검증/시각화 파이프라인
 """
 
 import os
+import sys
 import csv
 import glob
 import argparse
+
+# 이 스크립트가 있는 폴더를 import 경로에 추가 →
+# 어느 CWD(예: bsub 잡)에서 실행하든 옆의 train_ver2.py / plot_preprocessor_check.py 를 찾는다.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import numpy as np
 import torch
