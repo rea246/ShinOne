@@ -2,6 +2,7 @@ import os
 import gc
 import time
 import pickle
+import random
 import tempfile
 import numpy as np
 import torch
@@ -50,6 +51,27 @@ def read_siemens_gg(file_path: str, precision: int) -> List[list]:
             cy = round((int(y1) + int(y2)) / 2 / precision, 4)
             gauge.append([nname, cx, cy])
     return gauge
+
+
+def load_gauge_file(file_path: str, precision: int) -> List[list]:
+    """확장자에 따라 .gg(Siemens) 또는 pickle 게이지 파일 1개를 읽는다."""
+    if file_path.split(".")[-1] == "gg":
+        return read_siemens_gg(file_path, precision)
+    with open(file_path, "rb") as f:
+        return pickle.load(f)
+
+
+def merge_and_shuffle_gauges(gauge_lists: List[List[list]], seed: int = 42) -> List[list]:
+    """
+    여러 게이지 소스를 하나로 통합한 뒤 무작위로 섞는다.
+    run_large_scale_tiled_vectorization 는 순서대로 chunk_size 개씩 끊어 저장하고,
+    train_ver2.py 는 그 청크(파일) 단위로 train/val 을 나눈다. 섞지 않으면 특정 청크가
+    특정 소스(파일)에 편향돼 val 청크가 전체 분포를 대표하지 못할 수 있다.
+    seed 고정으로 재현 가능하게 섞는다.
+    """
+    merged = [gauge for gauge_list in gauge_lists for gauge in gauge_list]
+    random.Random(seed).shuffle(merged)
+    return merged
 
 
 def _extract_poly_features(
@@ -368,7 +390,12 @@ def run_large_scale_tiled_vectorization(
 def main() -> None:
     start_time = time.time()
     ggds = "/user/beol32pi/USERS/HSW/4.study/13.pythonkob/260520_IMG_to_String/0.material/T2T.oas"
-    ggfile = "/user/beol32pi/USERS/HSW/4.study/13.pythonkob/260520_IMG_to_String/0.material/T2T.gg"
+    # 여러 게이지 소스(.gg/.pkl)를 한 번에 넣을 수 있다. 단일 파일만 쓰던 이전 방식도
+    # 그대로 동작한다(리스트 원소 1개).
+    ggfiles = [
+        "/user/beol32pi/USERS/HSW/4.study/13.pythonkob/260520_IMG_to_String/0.material/T2T.gg",
+    ]
+    shuffle_seed = 42
     layer_num = 93
     layer_type = 0
 
@@ -382,11 +409,9 @@ def main() -> None:
     os.makedirs(out_dir, exist_ok=True)
 
     chunk_size = 300000
-    if ggfile.split(".")[-1] == 'gg':
-        gauge = read_siemens_gg(ggfile, precision)
-    else:
-        with open(ggfile, "rb") as f:
-            gauge = pickle.load(f)
+    gauge_lists = [load_gauge_file(f, precision) for f in ggfiles]
+    gauge = merge_and_shuffle_gauges(gauge_lists, seed=shuffle_seed)
+    print(f" 게이지 {len(ggfiles)}개 소스 통합 → 총 {len(gauge)}개 (seed={shuffle_seed} 로 shuffle 완료)")
 
     print(f" {ggds} 멀티 프로세스 그래프 완본 데이터셋 빌더 작동 시작")
     run_large_scale_tiled_vectorization(
