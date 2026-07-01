@@ -10,6 +10,7 @@ layout_graphencoder.py 대비 변경점:
 
 import os
 import gc
+import time
 import glob
 import random
 import datetime
@@ -44,8 +45,10 @@ REFERENCE_BATCH = 32   # LR sqrt-scaling 기준 배치 (원래 lr=1e-4 가 검�
 #   GPU 가 데이터를 기다리며 논다(= GPU 메모리 적게 쓰는데 느린 전형적 증상).
 #   >0 이면 collation 을 CPU 코어로 분산해 GPU 연산과 겹친다.
 #   - Linux(fork): 프리로드 텐서를 copy-on-write 로 공유 → 메모리 이득 거의 없이 빠름.
+#     (read-only 슬라이싱이라 5.3GB 데이터 페이지는 워커 간 공유 유지 → RAM 폭증 없음)
 #   - Windows(spawn): 워커가 데이터셋을 복제 → RAM 급증 시 0 으로 되돌릴 것.
-NUM_WORKERS = 4
+# bsub -n 8 기준: 워커 6 + 메인 1 = 7 (코어 1 여유). span[hosts=1] 로 한 호스트에 몰 것.
+NUM_WORKERS = 6
 
 # embedding_dim — 노드 임베딩 차원.
 # 노드 디코더는 embedding_dim -> num_node_features(=4) 복원이므로,
@@ -518,7 +521,17 @@ def train_one_epoch(
     total_grad = 0.
     n = 0
 
+    # ── 병목 계측: nvidia-smi 를 못 볼 때 데이터 대기 vs 연산 시간을 로그로 판별 ──
+    #   t_data 가 지배적  → DataLoader(collation) 병목 → NUM_WORKERS↑ 로 개선
+    #   t_step 이 지배적  → GPU 연산/커널 병목       → torch.compile 등 고려
+    #   (loss.item() 등이 매 배치 GPU 를 동기화하므로 t_step 은 실제 GPU 시간을 포함)
+    t_data = t_step = 0.0
+    _end = time.time()
+
     for batch in train_loader:
+        t_data += time.time() - _end
+        _t0 = time.time()
+
         batch = batch.to(device, non_blocking=True)
         batch.edge_index = batch.edge_index.long()
         batch.x          = batch.x.float()
@@ -547,6 +560,8 @@ def train_one_epoch(
             loss = losses['total_loss']
 
         if not torch.isfinite(loss):
+            t_step += time.time() - _t0
+            _end = time.time()
             continue
 
         scaler.scale(loss).backward()
@@ -564,12 +579,16 @@ def train_one_epoch(
         total_vc    += losses['vic_cov'].item()
         n += 1
 
+        t_step += time.time() - _t0
+        _end = time.time()
+
     if n == 0:
-        return {k: 0. for k in ['total','recon','vi','vv','vc','grad']}
+        return {k: 0. for k in ['total','recon','vi','vv','vc','grad','t_data','t_step']}
     return {
         'total': total_loss/n, 'recon': total_recon/n,
         'vi': total_vi/n, 'vv': total_vv/n, 'vc': total_vc/n,
-        'grad': total_grad/n
+        'grad': total_grad/n,
+        't_data': t_data, 't_step': t_step,   # epoch 누적 (초)
     }
 
 
@@ -747,7 +766,7 @@ def main():
     #   - pin_memory + non_blocking: H2D 전송을 연산과 겹침.
     dl_kw = dict(pin_memory=pin, num_workers=NUM_WORKERS)
     if NUM_WORKERS > 0:
-        dl_kw.update(persistent_workers=True, prefetch_factor=4)
+        dl_kw.update(persistent_workers=True, prefetch_factor=2)
     print(f"[DataLoader] num_workers={NUM_WORKERS}, pin_memory={pin}")
 
     print("\n[1/2] 검증 데이터셋 로드 (fast)...")
@@ -798,6 +817,7 @@ def main():
           f"VICReg (Inv={VICREG_WEIGHT_INV}, Var={VICREG_WEIGHT_VAR}, Cov={VICREG_WEIGHT_COV})")
 
     for epoch in range(start_epoch, epochs):
+        _ep_t0 = time.time()
         tr = train_one_epoch(
             model, train_loader,
             node_scale, edge_scale, edge_scale_spatial, edge_scale_extra,
@@ -809,6 +829,17 @@ def main():
             weight_hop, device, val_noise_gen
         )
         scheduler.step(avg_val_loss)
+
+        # ── epoch 마다 성능/병목 한 줄 (epoch 이 길어 즉각 피드백 필요) ──
+        _ep_dt = time.time() - _ep_t0
+        _td, _ts = tr.get('t_data', 0.), tr.get('t_step', 0.)
+        _ratio = _td / (_td + _ts + 1e-9)
+        print(
+            f"Epoch {epoch+1:04d} | Val {avg_val_loss:.4f} | "
+            f"epoch {_ep_dt:.0f}s (train data {_td:.0f}s / compute {_ts:.0f}s, "
+            f"data {_ratio:.0%}) "
+            f"{'← DataLoader 병목: NUM_WORKERS↑' if _ratio > 0.5 else '← 연산 병목: compile 고려'}"
+        )
 
         if (epoch + 1) % 10 == 0:
             lr = optimizer.param_groups[0]['lr']
