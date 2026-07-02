@@ -82,9 +82,23 @@ def shuffle_gauge_list(gauge: List[list], seed: int = 42) -> List[list]:
     return shuffled
 
 
+def _polygon_hull_points(poly: db.Polygon) -> np.ndarray:
+    """폴리곤 hull 꼭짓점을 (V,2) DBU 좌표 배열로 반환 — 최소거리 계산용."""
+    return np.array([[pt.x, pt.y] for pt in poly.each_point_hull()], dtype=np.float64)
+
+
+def _box_corner_points(box: db.Box) -> np.ndarray:
+    """db.Box 를 4꼭짓점 (4,2) DBU 좌표 배열로 — 실제 폴리곤이 없는 합성 노드(T2T/Bridge)용
+    폴백, 그리고 each_point_hull() 이 비정상적으로 빈 값을 줄 때의 방어용."""
+    return np.array([
+        [box.left, box.bottom], [box.right, box.bottom],
+        [box.right, box.top],   [box.left, box.top],
+    ], dtype=np.float64)
+
+
 def _extract_poly_features(
     cell: db.Cell, layer_id: int, cx: float, cy: float, window_size: float, dbu: float, gname: str
-) -> Optional[Tuple[np.ndarray, List[db.Box], np.ndarray]]:
+) -> Optional[Tuple[np.ndarray, List[np.ndarray], np.ndarray]]:
 
     half_win = window_size / 2
     padding = 0.018
@@ -99,10 +113,11 @@ def _extract_poly_features(
         nodes = [[0.0, 0.0, 0.0, 0.0]]
         ccx_dbu = round(cx / dbu)
         ccy_dbu = round(cy / dbu)  # [BUG FIX] 기존에 cx로 잘못 들어가던 부분 수정
-        bboxes = [db.Box(ccx_dbu - 1000, ccy_dbu - 1000, ccx_dbu + 1000, ccy_dbu + 1000)]
+        synth_box = db.Box(ccx_dbu - 1000, ccy_dbu - 1000, ccx_dbu + 1000, ccy_dbu + 1000)
+        poly_points = [_box_corner_points(synth_box)]
         centers = [[0.0, 0.0]]
     else:
-        nodes, bboxes, centers = [], [], []
+        nodes, poly_points, centers = [], [], []
 
     tg_window_nm = half_win * 1000
 
@@ -115,12 +130,13 @@ def _extract_poly_features(
 
         if (-tg_window_nm <= bbox_cx <= tg_window_nm) and (-tg_window_nm <= bbox_cy <= tg_window_nm):
             nodes.append([bbox_cx, bbox_cy, bbox_w, bbox_h])
-            bboxes.append(bbox)
+            pts = _polygon_hull_points(poly)
+            poly_points.append(pts if pts.size else _box_corner_points(bbox))
             centers.append([bbox_cx, bbox_cy])
 
     if not nodes:
         return None
-    return np.array(nodes, dtype=np.float32), bboxes, np.array(centers, dtype=np.float32)
+    return np.array(nodes, dtype=np.float32), poly_points, np.array(centers, dtype=np.float32)
 
 
 def _pack_fast_chunk(chunk_dataset: dict) -> Optional[dict]:
@@ -187,18 +203,20 @@ def _flush_chunk_dataset(chunk_dataset: dict, out_dir: str, gdsname: str, chunk_
     return {}
 
 
-def _calculate_box_distance(b1: db.Box, b2: db.Box) -> float:
-    if b1.right < b2.left: dx = b2.left - b1.right
-    elif b2.right < b1.left: dx = b1.left - b2.right
-    else: dx = 0.0
+def _calculate_polygon_min_distance(p1: np.ndarray, p2: np.ndarray) -> float:
+    """
+    두 폴리곤의 hull 꼭짓점 좌표(각 (V,2), DBU 단위) 간 최소 유클리드 거리.
+    klayout 에는 폴리곤-폴리곤 최소거리를 직접 주는 함수가 없고(DRC용 threshold 체크인
+    Region.separation_check 뿐), edge-edge 거리 함수도 없다. 대신 vertex-to-vertex 최소거리를
+    쓴다 — 이론적으로는 진짜 최소거리의 상한(사선 edge 중간이 더 가까울 수 있음)이지만,
+    IC 레이아웃은 대부분 rectilinear(직각) 도형이라 실제 최근접점이 거의 항상 꼭짓점에서
+    나오므로 실용적으로는 true distance 와 거의 일치한다.
+    """
+    diff = p1[:, None, :] - p2[None, :, :]
+    return float(np.hypot(diff[..., 0], diff[..., 1]).min())
 
-    if b1.top < b2.bottom: dy = b2.bottom - b1.top
-    elif b2.top < b1.bottom: dy = b1.bottom - b2.top
-    else: dy = 0.0
-    return np.hypot(dx, dy)
 
-
-def _generate_edge_index(centers: np.ndarray, bboxes: list, max_dist: float, dbu: float) -> np.ndarray:
+def _generate_edge_index(centers: np.ndarray, poly_points: list, max_dist: float, dbu: float) -> np.ndarray:
     if centers is None or len(centers) < 2:
         return np.empty((0, 2), dtype=int)
 
@@ -236,13 +254,14 @@ def _generate_edge_index(centers: np.ndarray, bboxes: list, max_dist: float, dbu
         for mask in [mask_E, mask_N, mask_W, mask_S]:
             if np.any(mask):
                 masked_indices = curr_neighbors[mask]
-                box_dists = [
-                    _calculate_box_distance(bboxes[i], bboxes[n_idx]) for n_idx in masked_indices
+                poly_dists = [
+                    _calculate_polygon_min_distance(poly_points[i], poly_points[n_idx])
+                    for n_idx in masked_indices
                 ]
-                box_dists = np.array(box_dists, dtype=np.float32)
-                best_idx = np.argmin(box_dists)
+                poly_dists = np.array(poly_dists, dtype=np.float32)
+                best_idx = np.argmin(poly_dists)
 
-                if box_dists[best_idx] <= max_dist / dbu:
+                if poly_dists[best_idx] <= max_dist / dbu:
                     edges.add(tuple(sorted((i, masked_indices[best_idx]))))
 
     if not edges:
@@ -250,10 +269,12 @@ def _generate_edge_index(centers: np.ndarray, bboxes: list, max_dist: float, dbu
     return np.array(list(edges), dtype=int)
 
 
-def _calculate_edge_attributes(edge_index: np.ndarray, bboxes: list, centers: np.ndarray, dbu: float) -> np.ndarray:
+def _calculate_edge_attributes(edge_index: np.ndarray, poly_points: list, centers: np.ndarray, dbu: float) -> np.ndarray:
     if edge_index.size:
         u, v = edge_index.T
-        box_dist = np.array([_calculate_box_distance(bboxes[i], bboxes[j]) for i, j in zip(u, v)], dtype=np.float32) * dbu * 1000
+        box_dist = np.array([
+            _calculate_polygon_min_distance(poly_points[i], poly_points[j]) for i, j in zip(u, v)
+        ], dtype=np.float32) * dbu * 1000
         diff_vec = centers[v] - centers[u]
         center_dist = np.linalg.norm(diff_vec, axis=1).astype(np.float32)
         norms = np.where(center_dist == 0, 1e-6, center_dist)
@@ -278,15 +299,15 @@ def _worker_task(args) -> Tuple[str, Optional[dict]]:
         if poly_feature is None:
             return gname, None
 
-        node_matrix, bboxes, centers = poly_feature
+        node_matrix, poly_points, centers = poly_feature
         num_nodes = len(node_matrix)
 
         # [BUG FIX] 기존에 외부 max_dist 인자를 무시하고 250으로 하드코딩되던 부분 제거 혹은 유지 유연화
         # 필요시 이 부분을 완전히 주석처리하거나 유지하십시오. 여기서는 인자를 따르도록 주석 처리합니다.
         # max_dist = 250
 
-        raw_edges = _generate_edge_index(centers, bboxes, max_dist, dbu)
-        raw_attrs = _calculate_edge_attributes(raw_edges, bboxes, centers, dbu)
+        raw_edges = _generate_edge_index(centers, poly_points, max_dist, dbu)
+        raw_attrs = _calculate_edge_attributes(raw_edges, poly_points, centers, dbu)
 
         if raw_edges.size > 0:
             u, v = raw_edges.T

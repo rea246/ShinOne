@@ -90,9 +90,16 @@ def undirected_edges(ei: np.ndarray) -> np.ndarray:
 def verify_edge_attr(g: dict) -> dict:
     """
     저장된 edge_attr 를 노드 feature(x = [cx,cy,w,h]) 로부터 재계산해 비교.
-      center_dist : ||c_v - c_u||
-      unit_vec    : (c_v - c_u) / center_dist
-      box_dist    : 축정렬 사각형 간 gap = hypot(max(0,|dx|-(wu+wv)/2), max(0,|dy|-(hu+hv)/2))
+      center_dist : ||c_v - c_u||                       (정확히 재계산 가능 — 그대로 검증)
+      unit_vec    : (c_v - c_u) / center_dist            (정확히 재계산 가능 — 그대로 검증)
+      box_dist    : preprocessor.py 가 이제 실제 폴리곤 hull 꼭짓점 간 최소거리를 저장한다
+                    (_calculate_polygon_min_distance). 그런데 x 에는 bbox(w,h)만 남아있고
+                    원본 폴리곤 꼭짓점은 저장 안 하므로, 여기선 옛 방식대로 "축정렬 사각형 간
+                    gap"(hypot(max(0,|dx|-(wu+wv)/2), max(0,|dy|-(hu+hv)/2)))으로만 근사
+                    재계산한다. 두 값은 완전 직각(rectilinear) 사각형에서는 일치하지만,
+                    폴리곤이 사각형이 아니면 갈라진다 — 즉 아래 반환값의 "box_dist" 오차는
+                    이제 버그 신호가 아니라 "이 엣지의 폴리곤이 사각형에서 얼마나 벗어났는지"
+                    를 보여주는 참고 지표다. OK/MISMATCH 판정은 center_dist/unit_vec 만으로 낸다.
     반환: 각 항목 최대 절대 오차.
     """
     x, ei, ea = g["x"], g["edge_index"], g["edge_attr"]
@@ -207,9 +214,11 @@ def plot_graph(g: dict, out_path: str, max_attr_labels: int = 30) -> dict:
     # 검증 결과 텍스트 박스
     vr = verify_edge_attr(g)
     if vr.get("n_edges", 0) > 0:
-        ok = max(vr["box_dist"], vr["center_dist"], vr["unit_x"], vr["unit_y"]) < 1.0
+        # box_dist 는 이제 폴리곤 최소거리라 x=[cx,cy,w,h] 만으로는 정확 재계산이 안 됨(비사각형
+        # 폴리곤에서 어긋나는 게 정상) — OK/MISMATCH 판정은 center_dist/unit_vec 로만 낸다.
+        ok = max(vr["center_dist"], vr["unit_x"], vr["unit_y"]) < 1.0
         vtxt = (f"edge_attr re-check (max abs err vs node geom)\n"
-                f"  box_dist   : {vr['box_dist']:.4f} nm\n"
+                f"  box_dist   : {vr['box_dist']:.4f} nm  (참고용 — 폴리곤이 사각형에서 벗어난 정도)\n"
                 f"  center_dist: {vr['center_dist']:.4f} nm\n"
                 f"  unit_x     : {vr['unit_x']:.5f}\n"
                 f"  unit_y     : {vr['unit_y']:.5f}\n"
@@ -282,7 +291,9 @@ def main():
         out_path = os.path.join(args.out_dir, f"check_{idx:04d}_{safe_key}.png")
         vr = plot_graph(g, out_path)
         if vr.get("n_edges", 0) > 0:
-            status = "OK" if max(vr["box_dist"], vr["center_dist"], vr["unit_x"], vr["unit_y"]) < 1.0 else "MISMATCH"
+            # box_dist 는 참고용(폴리곤이 사각형에서 벗어난 정도) — 판정엔 안 씀. 주석은
+            # verify_edge_attr() docstring 참조.
+            status = "OK" if max(vr["center_dist"], vr["unit_x"], vr["unit_y"]) < 1.0 else "MISMATCH"
             print(f"  [{idx}] {g['key']}: nodes={len(g['x'])} edges={vr['n_edges']} "
                   f"| attr err(box={vr['box_dist']:.3f} cen={vr['center_dist']:.3f} "
                   f"ux={vr['unit_x']:.4f} uy={vr['unit_y']:.4f}) → {status} | saved {out_path}")
