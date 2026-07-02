@@ -53,25 +53,33 @@ def read_siemens_gg(file_path: str, precision: int) -> List[list]:
     return gauge
 
 
-def load_gauge_file(file_path: str, precision: int) -> List[list]:
-    """확장자에 따라 .gg(Siemens) 또는 pickle 게이지 파일 1개를 읽는다."""
+def load_gauge_list(file_path: str, precision: int) -> List[list]:
+    """
+    게이지 리스트를 읽는다.
+    - .gg 확장자: Siemens 텍스트 포맷을 파싱(read_siemens_gg).
+    - 그 외(.pkl 등): 외부 스크립트가 이미 [[gauge_name, cx, cy], ...] 형태로 다 만들어
+      result.append() 로 쌓은 뒤 pickle.dump 로 그대로 저장해둔 파일 — 그 리스트를 그대로 로드.
+      (여러 파일을 합치는 단계가 아니라, 이미 완성된 리스트 1개를 읽는 단계다.)
+    """
     if file_path.split(".")[-1] == "gg":
         return read_siemens_gg(file_path, precision)
     with open(file_path, "rb") as f:
         return pickle.load(f)
 
 
-def merge_and_shuffle_gauges(gauge_lists: List[List[list]], seed: int = 42) -> List[list]:
+def shuffle_gauge_list(gauge: List[list], seed: int = 42) -> List[list]:
     """
-    여러 게이지 소스를 하나로 통합한 뒤 무작위로 섞는다.
+    이미 완성된 게이지 리스트를 셔플만 한다(다른 파일과 합치지 않음).
     run_large_scale_tiled_vectorization 는 순서대로 chunk_size 개씩 끊어 저장하고,
-    train_ver2.py 는 그 청크(파일) 단위로 train/val 을 나눈다. 섞지 않으면 특정 청크가
-    특정 소스(파일)에 편향돼 val 청크가 전체 분포를 대표하지 못할 수 있다.
-    seed 고정으로 재현 가능하게 섞는다.
+    train_ver2.py 는 그 청크(파일) 단위로 train/val 을 나눈다. 원본 리스트가 append 된
+    순서 그대로(예: 위치/영역별로 뭉쳐서 쌓였다면) 청크를 나누면 특정 청크가 특정
+    영역/패턴에 편향돼 val 청크가 전체 분포를 대표하지 못할 수 있다 — 그래서 그래프
+    작업(run_large_scale_tiled_vectorization) 에 넘기기 전에 리스트 전체를 한 번 섞는다.
+    seed 고정으로 재현 가능하게 섞는다. 원본 list 는 훼손하지 않고 셔플된 복사본을 반환한다.
     """
-    merged = [gauge for gauge_list in gauge_lists for gauge in gauge_list]
-    random.Random(seed).shuffle(merged)
-    return merged
+    shuffled = list(gauge)
+    random.Random(seed).shuffle(shuffled)
+    return shuffled
 
 
 def _extract_poly_features(
@@ -390,11 +398,10 @@ def run_large_scale_tiled_vectorization(
 def main() -> None:
     start_time = time.time()
     ggds = "/user/beol32pi/USERS/HSW/4.study/13.pythonkob/260520_IMG_to_String/0.material/T2T.oas"
-    # 여러 게이지 소스(.gg/.pkl)를 한 번에 넣을 수 있다. 단일 파일만 쓰던 이전 방식도
-    # 그대로 동작한다(리스트 원소 1개).
-    ggfiles = [
-        "/user/beol32pi/USERS/HSW/4.study/13.pythonkob/260520_IMG_to_String/0.material/T2T.gg",
-    ]
+    # ggfile: 외부 스크립트가 [gauge_name, cx, cy] 를 result.append() 로 이미 다 쌓아
+    # pickle.dump 로 그대로 저장해둔 단일 .pkl(또는 .gg). 여러 파일을 합치는 게 아니라,
+    # 이미 완성된 리스트 1개를 읽어서 셔플만 하면 된다.
+    ggfile = "/user/beol32pi/USERS/HSW/4.study/13.pythonkob/260520_IMG_to_String/0.material/T2T.gg"
     shuffle_seed = 42
     layer_num = 93
     layer_type = 0
@@ -409,9 +416,10 @@ def main() -> None:
     os.makedirs(out_dir, exist_ok=True)
 
     chunk_size = 300000
-    gauge_lists = [load_gauge_file(f, precision) for f in ggfiles]
-    gauge = merge_and_shuffle_gauges(gauge_lists, seed=shuffle_seed)
-    print(f" 게이지 {len(ggfiles)}개 소스 통합 → 총 {len(gauge)}개 (seed={shuffle_seed} 로 shuffle 완료)")
+    # 1) 완성된 리스트 로드 -> 2) 그 리스트를 shuffle -> 3) shuffle 된 리스트로 그래프 작업
+    gauge = load_gauge_list(ggfile, precision)
+    gauge = shuffle_gauge_list(gauge, seed=shuffle_seed)
+    print(f" 게이지 {len(gauge)}개 로드 → shuffle 완료 (seed={shuffle_seed})")
 
     print(f" {ggds} 멀티 프로세스 그래프 완본 데이터셋 빌더 작동 시작")
     run_large_scale_tiled_vectorization(
