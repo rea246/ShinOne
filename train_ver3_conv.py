@@ -88,6 +88,17 @@ REFERENCE_BATCH = 32   # LR sqrt-scaling 기준 배치 (원래 lr=1e-4 가 검�
 # bsub -n 8 기준: 워커 6 + 메인 1 = 7 (코어 1 여유). span[hosts=1] 로 한 호스트에 몰 것.
 NUM_WORKERS = 6
 
+# USE_TORCH_COMPILE — 실험적/기본 OFF. GAT 레이어들이 hidden_dim 이 작은(16~32) 커널을
+# 배치마다 아주 많이 launch 하는 구조라(attention, edge_mlp, LayerNorm, GELU 등)
+# launch-overhead-bound 일 가능성이 높고, 이 경우 torch.compile 의 커널 퓨전이
+# t_step 을 크게 줄여줄 수 있다. 다만:
+#   - 그래프마다 노드/엣지 수가 달라 배치 shape 이 계속 바뀐다 → dynamic=True 없이 켜면
+#     매 배치 재컴파일(guard 재수집)이 발생해 오히려 느려질 수 있어 dynamic=True 로 켤 것.
+#   - torch_geometric 의 scatter/GATv2Conv 연산이 inductor 백엔드에서 100% 검증된 조합은
+#     아니라 이 환경(torch_geometric 미설치 샌드박스)에선 실행 테스트를 못 했다.
+# → 켜서 몇 epoch 만 돌려보고 t_step 이 줄었는지 직접 확인 후 유지 여부 결정할 것.
+USE_TORCH_COMPILE = False
+
 # embedding_dim — 노드 임베딩 차원.
 # 노드 디코더는 z_node(embedding_dim) -> num_node_features(=4) 복원이라,
 # dim=3 이면 3->4 로 정보 병목이 심해 재구성 정확도의 상한을 누른다(epoch 140에서
@@ -407,12 +418,14 @@ class LayoutGAE(nn.Module):
         self.edge_decoder = EdgeAttributeDecoder(embedding_dim, num_edge_features)
         self.center_proj  = nn.Sequential(nn.Linear(embedding_dim, embedding_dim), nn.GELU())
 
-    def forward(self, data):
+    def forward(self, data, decode: bool = True):
         z_node, z_edge = self.encoder(data)
         batch, num_graphs = data.batch, data.num_graphs
 
-        recon_node_attr = self.node_decoder(z_node)
-        recon_edge_attr = self.edge_decoder(z_edge)
+        # decode=False (VICReg clean-pass 전용): recon_* 는 compute_losses 에서
+        # 쓰이지 않는데도 항상 계산되고 있었다 — node/edge decoder MLP 만큼 헛일이라 스킵.
+        recon_node_attr = self.node_decoder(z_node) if decode else None
+        recon_edge_attr = self.edge_decoder(z_edge) if decode else None
 
         max_emb   = global_max_pool(z_node, batch)
         mean_emb  = global_mean_pool(z_node, batch)
@@ -509,7 +522,8 @@ def compute_losses(
     recon_ea, recon_na, z_noisy, valid_mask = model(noisy_batch)
 
     # ── clean forward (VICReg Invariance) ───────────────────────
-    _, _, z_clean, _ = model(clean_batch)
+    # z_clean(graph_emb)만 쓰고 recon 출력은 버려지므로 decode=False 로 계산 생략.
+    _, _, z_clean, _ = model(clean_batch, decode=False)
 
     # ── Reconstruction losses ───────────────────────────────────
     tx = clean_x if clean_x is not None else noisy_batch.x
@@ -563,15 +577,27 @@ def train_one_epoch(
     weight_hop, optimizer, device, scaler
 ):
     model.train()
-    total_loss = total_recon = 0.
-    total_vi = total_vv = total_vc = 0.
-    total_grad = 0.
+    # ── [v3_conv 성능 수정] 로깅용 누적을 GPU 텐서로 유지, epoch 끝에 .item() 1회만 호출.
+    #   기존엔 배치마다 loss/recon/vi/vv/vc(5) + grad-norm(2) 총 ~7번 .item() 을 불렀는데,
+    #   .item() 은 그 시점까지 큐잉된 GPU 커널이 전부 끝날 때까지 CPU 를 블로킹한다.
+    #   이 모델은 그래프가 작아 커널이 매우 많고 짧아서(launch-overhead-bound), 배치당
+    #   sync 7회가 t_step 을 실제 연산량보다 크게 부풀리는 주범이었다(data 3s/compute 59s
+    #   케이스). NaN/Inf loss 를 걸러 backward 를 스킵하는 체크(아래 isfinite(loss))만
+    #   배치당 필수 동기화로 남기고 나머지는 epoch 끝 1회로 미룬다.
+    #   부작용: 이제 배치 간 GPU 작업이 파이프라이닝되므로, 아래 t_data/t_step 로그는
+    #   "정확한 GPU 전용 시간" 이 아니라 근사치가 된다 — 실측 속도 향상은 epoch 전체
+    #   walltime(메인 루프의 Epoch 로그 줄)로 확인할 것.
+    total_loss_t  = torch.zeros((), device=device)
+    total_recon_t = torch.zeros((), device=device)
+    total_vi_t    = torch.zeros((), device=device)
+    total_vv_t    = torch.zeros((), device=device)
+    total_vc_t    = torch.zeros((), device=device)
+    total_grad_t  = torch.zeros((), device=device)
     n = 0
 
     # ── 병목 계측: nvidia-smi 를 못 볼 때 데이터 대기 vs 연산 시간을 로그로 판별 ──
     #   t_data 가 지배적  → DataLoader(collation) 병목 → NUM_WORKERS↑ 로 개선
     #   t_step 이 지배적  → GPU 연산/커널 병목       → torch.compile 등 고려
-    #   (loss.item() 등이 매 배치 GPU 를 동기화하므로 t_step 은 실제 GPU 시간을 포함)
     t_data = t_step = 0.0
     _end = time.time()
 
@@ -606,24 +632,23 @@ def train_one_epoch(
             )
             loss = losses['total_loss']
 
-        if not torch.isfinite(loss):
+        if not torch.isfinite(loss):   # 배치당 필수 동기화 1회 (NaN/Inf 스텝 스킵)
             t_step += time.time() - _t0
             _end = time.time()
             continue
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
-        gn = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0).item()
-        if torch.isfinite(torch.tensor(gn)):
-            total_grad += gn
+        gn = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)   # GPU 텐서, 동기화 없음
+        total_grad_t += torch.where(torch.isfinite(gn), gn, torch.zeros_like(gn))
         scaler.step(optimizer)
         scaler.update()
 
-        total_loss  += loss.item()
-        total_recon += losses['recon_loss'].item()
-        total_vi    += losses['vic_inv'].item()
-        total_vv    += losses['vic_var'].item()
-        total_vc    += losses['vic_cov'].item()
+        total_loss_t  += loss.detach()
+        total_recon_t += losses['recon_loss'].detach()
+        total_vi_t    += losses['vic_inv'].detach()
+        total_vv_t    += losses['vic_var'].detach()
+        total_vc_t    += losses['vic_cov'].detach()
         n += 1
 
         t_step += time.time() - _t0
@@ -632,9 +657,9 @@ def train_one_epoch(
     if n == 0:
         return {k: 0. for k in ['total','recon','vi','vv','vc','grad','t_data','t_step']}
     return {
-        'total': total_loss/n, 'recon': total_recon/n,
-        'vi': total_vi/n, 'vv': total_vv/n, 'vc': total_vc/n,
-        'grad': total_grad/n,
+        'total': (total_loss_t / n).item(), 'recon': (total_recon_t / n).item(),
+        'vi': (total_vi_t / n).item(), 'vv': (total_vv_t / n).item(), 'vc': (total_vc_t / n).item(),
+        'grad': (total_grad_t / n).item(),
         't_data': t_data, 't_step': t_step,   # epoch 누적 (초)
     }
 
@@ -647,11 +672,21 @@ def validate_epoch(
     model.eval()
     val_noise_gen.manual_seed(42)
 
-    total_loss = total_recon = total_clean_loss = 0.
-    total_vi = total_vv = total_vc = 0.
-    total_latent_std = 0.
-    rel = {'h0':0.,'h1':0.,'h2':0.,'h3':0.,'e_space':0.,'e_extra':0.}
-    angle_sum = edge_cnt = n = 0
+    # [v3_conv 성능 수정] train_one_epoch 와 동일한 이유로 GPU 텐서 누적 + epoch 끝 1회 sync.
+    # validate_epoch 은 배치당 원래 .item() 이 train 보다도 더 많았다(loss 5종 + emb_std +
+    # rel 6종 + angle_sum = 배치당 최대 13회 sync).
+    def _zero():
+        return torch.zeros((), device=device)
+    # 주의: `a = b = _zero()` 처럼 체이닝하면 같은 텐서 객체를 공유해 += (in-place) 가
+    # 서로를 오염시킨다 — 반드시 각자 별도로 만든다.
+    total_loss_t       = _zero()
+    total_recon_t      = _zero()
+    total_clean_loss_t = _zero()
+    total_vi_t = _zero(); total_vv_t = _zero(); total_vc_t = _zero()
+    total_latent_std_t = _zero()
+    rel_t = {k: _zero() for k in ('h0', 'h1', 'h2', 'h3', 'e_space', 'e_extra')}
+    angle_sum_t = _zero()
+    edge_cnt = n = 0
 
     with torch.no_grad():
         for batch in val_loader:
@@ -671,7 +706,7 @@ def validate_epoch(
                     node_scale, edge_scale_spatial, edge_scale_extra, weight_hop,
                     clean_x=clean_x, clean_edge_attr=clean_edge
                 )
-                total_clean_loss += cl['total_loss'].item()
+                total_clean_loss_t += cl['total_loss'].detach()
 
             # ── 노이즈 주입 ─────────────────────────────────────
             nn_  = torch.randn(batch.x.shape, generator=val_noise_gen,
@@ -692,40 +727,41 @@ def validate_epoch(
                     clean_x=clean_x, clean_edge_attr=clean_edge
                 )
                 recon_ea = losses['recon_edge_attr'].float()
-                emb_std  = losses['graph_embedding'].std(dim=0, correction=0).mean().item()
+                emb_std_t = losses['graph_embedding'].std(dim=0, correction=0).mean()
 
-            total_loss  += losses['total_loss'].item()
-            total_recon += losses['recon_loss'].item()
-            total_vi    += losses['vic_inv'].item()
-            total_vv    += losses['vic_var'].item()
-            total_vc    += losses['vic_cov'].item()
-            total_latent_std += emb_std
+            total_loss_t  += losses['total_loss'].detach()
+            total_recon_t += losses['recon_loss'].detach()
+            total_vi_t    += losses['vic_inv'].detach()
+            total_vv_t    += losses['vic_var'].detach()
+            total_vc_t    += losses['vic_cov'].detach()
+            total_latent_std_t += emb_std_t.detach()
 
-            rel['h0']      += losses['loss_h0'].item() ** 0.5 * 100
-            rel['h1']      += losses['loss_h1'].item() ** 0.5 * 100
-            rel['h2']      += losses['loss_h2'].item() ** 0.5 * 100
-            rel['h3']      += losses['loss_h3'].item() ** 0.5 * 100
-            rel['e_space'] += losses['loss_e_spatial_base'].item() ** 0.5 * 100
-            rel['e_extra'] += losses['loss_e_extra'].item() ** 0.5 * 100
+            rel_t['h0']      += torch.sqrt(losses['loss_h0'].detach()) * 100
+            rel_t['h1']      += torch.sqrt(losses['loss_h1'].detach()) * 100
+            rel_t['h2']      += torch.sqrt(losses['loss_h2'].detach()) * 100
+            rel_t['h3']      += torch.sqrt(losses['loss_h3'].detach()) * 100
+            rel_t['e_space'] += torch.sqrt(losses['loss_e_spatial_base'].detach()) * 100
+            rel_t['e_extra'] += torch.sqrt(losses['loss_e_extra'].detach()) * 100
 
-            if recon_ea.size(0) > 0:
+            if recon_ea.size(0) > 0:   # .size(0) 은 shape 메타데이터라 동기화 없음
                 cs   = F.cosine_similarity(recon_ea[:, 2:4], clean_edge[:, 2:4], dim=1).clamp(-1., 1.)
-                angle_sum += torch.rad2deg(torch.acos(cs)).sum().item()
-                edge_cnt  += recon_ea.size(0)
+                angle_sum_t += torch.rad2deg(torch.acos(cs)).sum()
+                edge_cnt    += recon_ea.size(0)
             n += 1
 
-    def _avg(v): return v / n if n > 0 else 0.
-    metrics = {k: _avg(v) for k, v in rel.items()}
+    # 여기서 처음으로 .item() 을 부른다 — epoch 전체에서 딱 1번 동기화.
+    def _avg(v): return (v / n).item() if n > 0 else 0.
+    metrics = {k: _avg(v) for k, v in rel_t.items()}
     metrics.update({
-        'e_vec':          angle_sum / edge_cnt if edge_cnt > 0 else 0.,
-        'clean_val_loss': _avg(total_clean_loss),
-        'latent_std':     _avg(total_latent_std),
-        'vic_inv':        _avg(total_vi),
-        'vic_var':        _avg(total_vv),
-        'vic_cov':        _avg(total_vc),
-        'recon_loss':     _avg(total_recon),
+        'e_vec':          (angle_sum_t / edge_cnt).item() if edge_cnt > 0 else 0.,
+        'clean_val_loss': _avg(total_clean_loss_t),
+        'latent_std':     _avg(total_latent_std_t),
+        'vic_inv':        _avg(total_vi_t),
+        'vic_var':        _avg(total_vv_t),
+        'vic_cov':        _avg(total_vc_t),
+        'recon_loss':     _avg(total_recon_t),
     })
-    return _avg(total_loss), metrics
+    return _avg(total_loss_t), metrics
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -829,6 +865,14 @@ def main():
         num_edge_features=edge_scale.size(0),
         embedding_dim=EMBEDDING_DIM
     ).to(device)
+
+    if USE_TORCH_COMPILE:
+        # 주의: compile 된 모델의 state_dict() 는 torch 버전에 따라 키에 "_orig_mod." 접두어가
+        # 붙을 수 있다 — visualize_encoder.py/extract_representatives.py 처럼 compile 없이
+        # 순수 LayoutGAE 에 load_state_dict 할 때 키 불일치가 날 수 있으니, best 체크포인트
+        # 로딩이 실패하면 이 접두어부터 확인할 것.
+        print("[train_ver3_conv] torch.compile 활성화 (dynamic=True — 배치별 그래프 크기 변동 대응)")
+        model = torch.compile(model, dynamic=True)
 
     # LR sqrt-scaling: 큰 배치의 낮은 그래디언트 분산을 보상해 에포크당 진척을 유지.
     # batch=2048 → 1e-4 * sqrt(2048/32) = 8e-4. (linear scaling 은 Adam 에 과함)
