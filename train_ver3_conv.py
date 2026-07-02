@@ -388,7 +388,12 @@ class EdgeUpdatingGATLayer(nn.Module):
 class LayoutGATEncoder(nn.Module):
     def __init__(self, num_node_features=4, num_edge_features=6, embedding_dim=EMBEDDING_DIM):
         super().__init__()
-        hidden_dim  = max(16, embedding_dim * 2)
+        # hidden_dim 은 GPU 8배수 정렬(텐서 코어)로 올림 — embedding_dim 자체가 홀수(예: 9)라도
+        # 가장 비싼 attention 레이어(layer1, heads=4)는 정렬 깨진 GEMM/커널로 떨어지지 않게 한다.
+        # dim=8→16, dim=16→32 는 원래도 8배수라 이 올림으로 값이 안 바뀐다(하위 호환).
+        # dim=9→18 처럼 어긋나는 값만 24 로 올라간다 — v3_conv 에서 dim=9 로 바꾼 뒤 compute
+        # time 이 dim=16(60s) 보다 오히려 dim=9(140s) 에서 더 걸린 원인으로 의심되는 지점.
+        hidden_dim  = max(16, -(-embedding_dim * 2 // 8) * 8)   # ceil to multiple of 8
         self.layer1 = EdgeUpdatingGATLayer(num_node_features, num_edge_features, hidden_dim, hidden_dim, heads=4)
         self.layer2 = EdgeUpdatingGATLayer(hidden_dim, hidden_dim, embedding_dim, embedding_dim, is_final=True, heads=1)
 
