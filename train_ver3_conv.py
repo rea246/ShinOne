@@ -104,12 +104,16 @@ USE_TORCH_COMPILE = False
 # dim=3 이면 3->4 로 정보 병목이 심해 재구성 정확도의 상한을 누른다(epoch 140에서
 # h1~39%/E_Space~26% 로 조기 수렴 관찰됨).
 # 원래 dim 을 작게 둔 이유(copy-collapse 방지)는 이제 denoising + VICReg 가 대신
-# 막아주므로, 병목을 완화해 표현력을 키운다: 3 -> 8 -> 16(v3_conv 실험, Cov=0.5 와 병행).
-# (copy 여부/collapse 여부는 visualize_encoder 의 effective rank / 클러스터 품질로 검증.
-#  dim 을 늘렸는데도 effective rank 가 안 늘면 표현력 확장이 아니라 여분 차원이 노이즈로만
-#  채워진 것 — Var/Cov 손실이 그 여분 차원까지 억지로 std≥1/decorrelate 시키려다 학습을
-#  불안정하게 만들 수 있으니 GradNorm 급등 여부도 같이 확인할 것.)
-EMBEDDING_DIM = 16
+# 막아주므로, 병목을 완화해 표현력을 키운다: 3 -> 8 -> 16(1차 실험, Cov=0.5 와 병행) -> 9.
+# 16 은 Cov(0.75→0.32)는 확실히 낮췄지만 Inv/Var/재구성 오차가 전반적으로 소폭 악화되고
+# patience(30)에 62 epoch 만에 조기종료돼, "8과 16 중간"으로 좁혀 8과 16 사이 최소 증분
+# 효과를 다시 본다. dim=9 는 아키텍처상 아무 제약이 없어(hidden_dim=max(16, dim*2)=18,
+# GATv2Conv 는 heads 로 나눠떨어질 필요 없이 head 당 out_channels=dim 을 그대로 쓰고
+# concat 후 node_head_proj 로 투영 — 홀수/짝수 무관하게 동작) 8로 원복할 필요는 없다.
+# 다만 GPU tensor-core 는 8의 배수(FP16/BF16)에서 살짝 더 효율적이라 8/16 대비 미세한
+# 속도 손해가 있을 수 있음(수치 정확도엔 영향 없음, 무시 가능한 수준).
+# (copy 여부/collapse 여부는 visualize_encoder 의 effective rank / 클러스터 품질로 검증.)
+EMBEDDING_DIM = 9
 
 # VICReg 가중치 — 재구성 loss (≈1~5 수렴 구간)와 스케일 맞춤
 # weight_inv : clean/noisy 임베딩을 가깝게 → 같은 패턴 = 같은 임베딩
@@ -816,7 +820,15 @@ def main():
         raise FileNotFoundError(f"청크 파일 없음: {FOLDER_PATH}")
     print(f"총 {len(all_files)}개 청크 파일 발견")
 
-    random.seed(42);  random.shuffle(all_files)
+    # VAL_SPLIT_SEED — v2 도 Train/Val 이 0.15/0.4 로 벌어져 있어(v3_conv 의 0.24/0.62 와
+    # 같은 비율대) capacity(dim) 문제가 아니라 val 로 뽑힌 청크 1개 자체가 유난히 어렵거나
+    # 편향된 분포일 가능성이 있다. seed 를 바꿔 다른 청크가 val 로 뽑히게 해서 갭이
+    # seed 에 따라 흔들리는지(=val 청크 편향) 아니면 그대로인지(=진짜 학습/일반화 문제)
+    # 갈라본다. (근본적으로는 preprocessor.py 의 merge_and_shuffle_gauges 로 청크 자체를
+    # 이미 섞도록 고쳐뒀으니, 그 버전으로 재전처리한 데이터를 쓰면 어느 청크가 val 이 되든
+    # 편향이 줄어든다 — 지금 청크가 그 이전에 만들어졌다면 이 seed 변경은 임시 진단용.)
+    VAL_SPLIT_SEED = 7   # v2/기존 v3_conv 런과 다른 값(기존 42)
+    random.seed(VAL_SPLIT_SEED);  random.shuffle(all_files)
     val_file    = all_files[0]
     train_files = all_files[1:]
 
@@ -889,7 +901,11 @@ def main():
 
     best_val_loss     = float('inf')
     patience_counter  = 0
-    patience          = 30
+    # 30 -> 40. 이전 v3_conv 런이 62 epoch(=best~32)에서 patience 30 으로 조기종료됐는데,
+    # LR 이 이미 2번(8e-4->2e-4) 줄어든 뒤였다 — 더 볼 여지가 있는지 10 epoch 더 준다.
+    # (무한정 늘리진 않음: "40까지만" — LR 스케줄러 patience=10 대비 4배 여유면 충분히
+    # plateau 판단 가능하다고 보고 상한을 둠.)
+    patience          = 40
     epochs            = 1000
     ckpt_name         = f"best_gae_v3_conv_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.pt"
     _save_thread      = None
