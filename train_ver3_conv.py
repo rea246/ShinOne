@@ -961,8 +961,11 @@ def main():
                 f"(목표: Inv↓  Var→0  Cov→0)"
             )
             print(
-                f"  [Recon]   h0={vm['h0']:.1f}% h1={vm['h1']:.1f}% | "
+                f"  [Recon]   h0={vm['h0']:.1f}% h1={vm['h1']:.1f}% h2={vm['h2']:.1f}% h3={vm['h3']:.1f}% | "
                 f"E_Space={vm['e_space']:.1f}% | E_Vec={vm['e_vec']:.2f}°"
+                # h2/h3 를 새로 노출: encoder 가 GAT 2층(=2-hop receptive field)이라
+                # hop3+ 노드엔 구조적으로 center 정보가 도달하지 못한다. 레이어를 늘릴지
+                # 판단하려면 h0/h1 대비 h2/h3 오차가 뚜렷이 큰지부터 데이터로 봐야 한다.
             )
 
         if avg_val_loss < best_val_loss:
