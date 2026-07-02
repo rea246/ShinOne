@@ -344,6 +344,24 @@ def _worker_task(args) -> Tuple[str, Optional[dict]]:
         return gname, None
 
 
+def _detect_allocated_cpus() -> int:
+    """
+    이 프로세스가 실제로 쓸 수 있는 CPU 개수를 판단한다.
+    os.cpu_count() 는 호스트의 전체 CPU 개수를 그대로 반환할 뿐, LSF 가 bsub -n 으로
+    할당한 슬롯 수는 반영하지 않는다(그 노드에서 cgroup/taskset affinity 를 강제하지
+    않는 구성이면 -n 8 로 던져도 24 가 찍힌다). 우선순위:
+      1) LSB_DJOB_NUMPROC — LSF 가 bsub -n 값 그대로 넣어주는 환경변수(가장 정확).
+      2) os.sched_getaffinity(0) — cgroup/taskset 으로 실제 pin 된 CPU 집합(Linux 전용).
+      3) os.cpu_count() — 위 둘 다 없을 때의 최후 폴백(호스트 전체 CPU, 과대추정 위험).
+    """
+    lsf_slots = os.environ.get("LSB_DJOB_NUMPROC")
+    if lsf_slots and lsf_slots.isdigit():
+        return int(lsf_slots)
+    if hasattr(os, "sched_getaffinity"):
+        return len(os.sched_getaffinity(0))
+    return os.cpu_count() or 4
+
+
 def run_large_scale_tiled_vectorization(
     ggds: str, gauge: list, window_list: list, out_dir: str, gdsname: str,
     layer_num: int, layer_type: int, chunk_size: int, max_dist: float = 300.0
@@ -354,9 +372,9 @@ def run_large_scale_tiled_vectorization(
     chunk_dataset = {}
     count, skip_count = 0, 0
 
-    avail_cpus = os.cpu_count() or 4
+    avail_cpus = _detect_allocated_cpus()
     num_workers = max(1, avail_cpus - 2)
-    print(f"[Parallel] 가동 프로세스 카운트: {num_workers} Cores")
+    print(f"[Parallel] 가동 프로세스 카운트: {num_workers} Cores (allocated={avail_cpus})")
 
     task_arguments = [(gname, xx, yy, win_loc, max_dist) for gname, xx, yy in gauge]
     start_time = time.time()
