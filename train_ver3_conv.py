@@ -13,6 +13,14 @@ train_ver2.py 대비 변경점:
   3. RESUME_PATH / ckpt_name 파일명을 v3_conv 전용으로 분리 — train_ver2.py 와
      같은 폴더에서 실행해도 서로의 체크포인트를 덮어쓰지 않는다.
      (global_scales 캐시는 전처리 데이터에서만 결정되는 값이라 v2 와 공유해도 무방 → 그대로 재사용)
+  4. EMBEDDING_DIM 8 → 16 — 애초에 "Cov 하향 대안" 목록엔 별도 실험으로 분리 권장했지만,
+     사용자 요청으로 Cov=0.5 변경과 함께 이 파일에 합쳐서 적용. 두 변경이 섞여 있어
+     "무엇 때문에 좋아졌는지" 원인 분리는 안 됨(필요하면 나중에 EMBEDDING_DIM=8 로 되돌려
+     Cov=0.5 단독 효과와 비교할 것). hidden_dim=max(16, embedding_dim*2) 등 관련 레이어
+     크기는 EMBEDDING_DIM 에서 자동 계산되므로 이 상수 외에 추가로 손댈 곳은 없다.
+     주의: 차원이 늘면 dim=8 대비 상관시킬 축이 더 많아져 Cov 항이 더 커질 여지도 있음 —
+     "차원 늘리기"와 "Cov weight 올리기"가 서로 다른 방향으로 당길 수 있으니 vic_cov 추이를
+     v2/v3_conv(dim=8) 로그와 비교해서 지켜볼 것.
 
 train_ver2.py 원본 변경 이력(참고):
   1. vicreg_loss() 추가 — 3항 완전 구현
@@ -31,10 +39,6 @@ Cov 하향 대안 (이 파일엔 미적용 — 방향성이 다르거나 트레�
     단점: **이 프로젝트엔 부적합할 가능성 높음** — 우리가 최종적으로 쓰는 건 projector 가
     아니라 graph_emb(z) 자체(클러스터링/대표추출 입력)라서, Cov 압력을 projector 에만 걸면
     정작 다운스트림에 쓰는 z 는 상관 제거 혜택을 못 받음.
-  - EMBEDDING_DIM 추가 확장(8→16 등)
-    장점: 차원 여유가 늘면 상관 없이 정보를 나눠 담기 쉬워짐.
-    단점: 3→8 로 이미 한 번 올렸고, 파라미터/연산량 증가 + 재구성-VICReg 균형 재조정 필요.
-    "하향"과 방향이 달라(모델 확장) 별도 실험으로 분리하는 게 낫다고 판단.
   - BATCH_SIZE 추가 증가
     장점: Var/Cov 는 배치 통계라 배치가 클수록 추정이 안정적.
     단점: 이미 2048 로 큼, GPU 메모리/LR 재조정 부담 대비 효과 불확실.
@@ -89,9 +93,12 @@ NUM_WORKERS = 6
 # dim=3 이면 3->4 로 정보 병목이 심해 재구성 정확도의 상한을 누른다(epoch 140에서
 # h1~39%/E_Space~26% 로 조기 수렴 관찰됨).
 # 원래 dim 을 작게 둔 이유(copy-collapse 방지)는 이제 denoising + VICReg 가 대신
-# 막아주므로, 병목을 완화해 표현력을 키운다: 3 -> 8.
-# (copy 여부는 visualize_encoder 의 effective rank / 클러스터 품질로 검증)
-EMBEDDING_DIM = 8
+# 막아주므로, 병목을 완화해 표현력을 키운다: 3 -> 8 -> 16(v3_conv 실험, Cov=0.5 와 병행).
+# (copy 여부/collapse 여부는 visualize_encoder 의 effective rank / 클러스터 품질로 검증.
+#  dim 을 늘렸는데도 effective rank 가 안 늘면 표현력 확장이 아니라 여분 차원이 노이즈로만
+#  채워진 것 — Var/Cov 손실이 그 여분 차원까지 억지로 std≥1/decorrelate 시키려다 학습을
+#  불안정하게 만들 수 있으니 GradNorm 급등 여부도 같이 확인할 것.)
+EMBEDDING_DIM = 16
 
 # VICReg 가중치 — 재구성 loss (≈1~5 수렴 구간)와 스케일 맞춤
 # weight_inv : clean/noisy 임베딩을 가깝게 → 같은 패턴 = 같은 임베딩
