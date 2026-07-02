@@ -763,6 +763,15 @@ def main():
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
+    # [진단] Cov weight 만 바꿨는데 compute 뿐 아니라 data 처리 시간(DataLoader, CPU 작업이라
+    # loss weight 와 무관)까지 같이 늘었다면, 코드 문제가 아니라 이번 job 이 다른/더 바쁜
+    # 노드-GPU 에 배정됐을 가능성이 높다. 다음 실행마다 어떤 호스트/GPU 를 받았는지 로그로
+    # 남겨서 "같은 dim=8인데 왜 60s->120s?" 를 재현 가능하게 비교할 것.
+    import socket
+    print(f"[env] host={socket.gethostname()}")
+    if device.type == 'cuda':
+        print(f"[env] gpu={torch.cuda.get_device_name(0)}  "
+              f"free/total={[round(x/1e9,1) for x in torch.cuda.mem_get_info()]} GB")
 
     # ── [Speedup — 정확도 trade-off 없는 순수 처리량 향상] ──────────
     # TF32: Ampere(RTX 30xx/40xx, A100 등)+ 에서 fp32 matmul 을 TF32 로 가속.
