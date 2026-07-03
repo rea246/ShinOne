@@ -384,12 +384,14 @@ class LayoutGAE(nn.Module):
         self.edge_decoder = EdgeAttributeDecoder(embedding_dim, num_edge_features)
         self.center_proj  = nn.Sequential(nn.Linear(embedding_dim, embedding_dim), nn.GELU())
 
-    def forward(self, data):
+    def forward(self, data, decode: bool = True):
         z_node, z_edge = self.encoder(data)
         batch, num_graphs = data.batch, data.num_graphs
 
-        recon_node_attr = self.node_decoder(z_node)
-        recon_edge_attr = self.edge_decoder(z_edge)
+        # decode=False (VICReg clean-pass 전용): recon_* 는 compute_losses 에서
+        # 쓰이지 않는데도 항상 계산되고 있었다 — node/edge decoder MLP 만큼 헛일이라 스킵.
+        recon_node_attr = self.node_decoder(z_node) if decode else None
+        recon_edge_attr = self.edge_decoder(z_edge) if decode else None
 
         max_emb   = global_max_pool(z_node, batch)
         mean_emb  = global_mean_pool(z_node, batch)
@@ -486,7 +488,8 @@ def compute_losses(
     recon_ea, recon_na, z_noisy, valid_mask = model(noisy_batch)
 
     # ── clean forward (VICReg Invariance) ───────────────────────
-    _, _, z_clean, _ = model(clean_batch)
+    # z_clean(graph_emb)만 쓰고 recon 출력은 버려지므로 decode=False 로 계산 생략.
+    _, _, z_clean, _ = model(clean_batch, decode=False)
 
     # ── Reconstruction losses ───────────────────────────────────
     tx = clean_x if clean_x is not None else noisy_batch.x
@@ -540,15 +543,24 @@ def train_one_epoch(
     weight_hop, optimizer, device, scaler
 ):
     model.train()
-    total_loss = total_recon = 0.
-    total_vi = total_vv = total_vc = 0.
-    total_grad = 0.
+    # ── [성능 수정] 로깅용 누적을 GPU 텐서로 유지, epoch 끝에 .item() 1회만 호출.
+    #   기존엔 배치마다 loss/recon/vi/vv/vc(5) + grad-norm(2) 총 ~7번 .item() 을 불렀는데,
+    #   .item() 은 그 시점까지 큐잉된 GPU 커널이 전부 끝날 때까지 CPU 를 블로킹한다.
+    #   그래프가 작아 커널이 매우 많고 짧아서(launch-overhead-bound), 배치 수가 많을수록
+    #   (23.7M graphs / batch 2048 ≈ 11,600 배치/epoch) 이 sync 비용이 누적돼 t_step 을
+    #   실제 연산량보다 크게 부풀린다. NaN/Inf loss 를 걸러 backward 를 스킵하는 체크만
+    #   배치당 필수 동기화로 남기고 나머지는 epoch 끝 1회로 미룬다.
+    total_loss_t  = torch.zeros((), device=device)
+    total_recon_t = torch.zeros((), device=device)
+    total_vi_t    = torch.zeros((), device=device)
+    total_vv_t    = torch.zeros((), device=device)
+    total_vc_t    = torch.zeros((), device=device)
+    total_grad_t  = torch.zeros((), device=device)
     n = 0
 
     # ── 병목 계측: nvidia-smi 를 못 볼 때 데이터 대기 vs 연산 시간을 로그로 판별 ──
     #   t_data 가 지배적  → DataLoader(collation) 병목 → NUM_WORKERS↑ 로 개선
     #   t_step 이 지배적  → GPU 연산/커널 병목       → torch.compile 등 고려
-    #   (loss.item() 등이 매 배치 GPU 를 동기화하므로 t_step 은 실제 GPU 시간을 포함)
     t_data = t_step = 0.0
     _end = time.time()
 
@@ -583,24 +595,23 @@ def train_one_epoch(
             )
             loss = losses['total_loss']
 
-        if not torch.isfinite(loss):
+        if not torch.isfinite(loss):   # 배치당 필수 동기화 1회 (NaN/Inf 스텝 스킵)
             t_step += time.time() - _t0
             _end = time.time()
             continue
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
-        gn = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0).item()
-        if torch.isfinite(torch.tensor(gn)):
-            total_grad += gn
+        gn = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)   # GPU 텐서, 동기화 없음
+        total_grad_t += torch.where(torch.isfinite(gn), gn, torch.zeros_like(gn))
         scaler.step(optimizer)
         scaler.update()
 
-        total_loss  += loss.item()
-        total_recon += losses['recon_loss'].item()
-        total_vi    += losses['vic_inv'].item()
-        total_vv    += losses['vic_var'].item()
-        total_vc    += losses['vic_cov'].item()
+        total_loss_t  += loss.detach()
+        total_recon_t += losses['recon_loss'].detach()
+        total_vi_t    += losses['vic_inv'].detach()
+        total_vv_t    += losses['vic_var'].detach()
+        total_vc_t    += losses['vic_cov'].detach()
         n += 1
 
         t_step += time.time() - _t0
@@ -609,9 +620,9 @@ def train_one_epoch(
     if n == 0:
         return {k: 0. for k in ['total','recon','vi','vv','vc','grad','t_data','t_step']}
     return {
-        'total': total_loss/n, 'recon': total_recon/n,
-        'vi': total_vi/n, 'vv': total_vv/n, 'vc': total_vc/n,
-        'grad': total_grad/n,
+        'total': (total_loss_t / n).item(), 'recon': (total_recon_t / n).item(),
+        'vi': (total_vi_t / n).item(), 'vv': (total_vv_t / n).item(), 'vc': (total_vc_t / n).item(),
+        'grad': (total_grad_t / n).item(),
         't_data': t_data, 't_step': t_step,   # epoch 누적 (초)
     }
 
@@ -624,11 +635,19 @@ def validate_epoch(
     model.eval()
     val_noise_gen.manual_seed(42)
 
-    total_loss = total_recon = total_clean_loss = 0.
-    total_vi = total_vv = total_vc = 0.
-    total_latent_std = 0.
-    rel = {'h0':0.,'h1':0.,'h2':0.,'h3':0.,'e_space':0.,'e_extra':0.}
-    angle_sum = edge_cnt = n = 0
+    # [성능 수정] train_one_epoch 와 동일한 이유로 GPU 텐서 누적 + epoch 끝 1회 sync.
+    def _zero():
+        return torch.zeros((), device=device)
+    # 주의: `a = b = _zero()` 처럼 체이닝하면 같은 텐서 객체를 공유해 += (in-place) 가
+    # 서로를 오염시킨다 — 반드시 각자 별도로 만든다.
+    total_loss_t       = _zero()
+    total_recon_t      = _zero()
+    total_clean_loss_t = _zero()
+    total_vi_t = _zero(); total_vv_t = _zero(); total_vc_t = _zero()
+    total_latent_std_t = _zero()
+    rel_t = {k: _zero() for k in ('h0', 'h1', 'h2', 'h3', 'e_space', 'e_extra')}
+    angle_sum_t = _zero()
+    edge_cnt = n = 0
 
     with torch.no_grad():
         for batch in val_loader:
@@ -648,7 +667,7 @@ def validate_epoch(
                     node_scale, edge_scale_spatial, edge_scale_extra, weight_hop,
                     clean_x=clean_x, clean_edge_attr=clean_edge
                 )
-                total_clean_loss += cl['total_loss'].item()
+                total_clean_loss_t += cl['total_loss'].detach()
 
             # ── 노이즈 주입 ─────────────────────────────────────
             nn_  = torch.randn(batch.x.shape, generator=val_noise_gen,
@@ -669,40 +688,41 @@ def validate_epoch(
                     clean_x=clean_x, clean_edge_attr=clean_edge
                 )
                 recon_ea = losses['recon_edge_attr'].float()
-                emb_std  = losses['graph_embedding'].std(dim=0, correction=0).mean().item()
+                emb_std_t = losses['graph_embedding'].std(dim=0, correction=0).mean()
 
-            total_loss  += losses['total_loss'].item()
-            total_recon += losses['recon_loss'].item()
-            total_vi    += losses['vic_inv'].item()
-            total_vv    += losses['vic_var'].item()
-            total_vc    += losses['vic_cov'].item()
-            total_latent_std += emb_std
+            total_loss_t  += losses['total_loss'].detach()
+            total_recon_t += losses['recon_loss'].detach()
+            total_vi_t    += losses['vic_inv'].detach()
+            total_vv_t    += losses['vic_var'].detach()
+            total_vc_t    += losses['vic_cov'].detach()
+            total_latent_std_t += emb_std_t.detach()
 
-            rel['h0']      += losses['loss_h0'].item() ** 0.5 * 100
-            rel['h1']      += losses['loss_h1'].item() ** 0.5 * 100
-            rel['h2']      += losses['loss_h2'].item() ** 0.5 * 100
-            rel['h3']      += losses['loss_h3'].item() ** 0.5 * 100
-            rel['e_space'] += losses['loss_e_spatial_base'].item() ** 0.5 * 100
-            rel['e_extra'] += losses['loss_e_extra'].item() ** 0.5 * 100
+            rel_t['h0']      += torch.sqrt(losses['loss_h0'].detach()) * 100
+            rel_t['h1']      += torch.sqrt(losses['loss_h1'].detach()) * 100
+            rel_t['h2']      += torch.sqrt(losses['loss_h2'].detach()) * 100
+            rel_t['h3']      += torch.sqrt(losses['loss_h3'].detach()) * 100
+            rel_t['e_space'] += torch.sqrt(losses['loss_e_spatial_base'].detach()) * 100
+            rel_t['e_extra'] += torch.sqrt(losses['loss_e_extra'].detach()) * 100
 
-            if recon_ea.size(0) > 0:
+            if recon_ea.size(0) > 0:   # .size(0) 은 shape 메타데이터라 동기화 없음
                 cs   = F.cosine_similarity(recon_ea[:, 2:4], clean_edge[:, 2:4], dim=1).clamp(-1., 1.)
-                angle_sum += torch.rad2deg(torch.acos(cs)).sum().item()
-                edge_cnt  += recon_ea.size(0)
+                angle_sum_t += torch.rad2deg(torch.acos(cs)).sum()
+                edge_cnt    += recon_ea.size(0)
             n += 1
 
-    def _avg(v): return v / n if n > 0 else 0.
-    metrics = {k: _avg(v) for k, v in rel.items()}
+    # 여기서 처음으로 .item() 을 부른다 — epoch 전체에서 딱 1번 동기화.
+    def _avg(v): return (v / n).item() if n > 0 else 0.
+    metrics = {k: _avg(v) for k, v in rel_t.items()}
     metrics.update({
-        'e_vec':          angle_sum / edge_cnt if edge_cnt > 0 else 0.,
-        'clean_val_loss': _avg(total_clean_loss),
-        'latent_std':     _avg(total_latent_std),
-        'vic_inv':        _avg(total_vi),
-        'vic_var':        _avg(total_vv),
-        'vic_cov':        _avg(total_vc),
-        'recon_loss':     _avg(total_recon),
+        'e_vec':          (angle_sum_t / edge_cnt).item() if edge_cnt > 0 else 0.,
+        'clean_val_loss': _avg(total_clean_loss_t),
+        'latent_std':     _avg(total_latent_std_t),
+        'vic_inv':        _avg(total_vi_t),
+        'vic_var':        _avg(total_vv_t),
+        'vic_cov':        _avg(total_vc_t),
+        'recon_loss':     _avg(total_recon_t),
     })
-    return _avg(total_loss), metrics
+    return _avg(total_loss_t), metrics
 
 
 # ══════════════════════════════════════════════════════════════════
