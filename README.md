@@ -46,9 +46,15 @@ B.csv 의 X, Y 와 input.pkl 의 좌표는 단위가 달라서, B.csv 좌표를
 `--scale`(기본 20000)로 나눠 input.pkl 좌표계로 맞춘 뒤 비교한다.
 `dist` 는 input.pkl 좌표계 기준 유클리드 거리다.
 
+다음 두 경우의 행은 C.csv 에서 제외된다:
+
+- 최근접 게이지가 `--max-dist`(기본 0.1 um) 이상 떨어져 있는 행
+- 매칭된 `gauge_name` 이 앞선 행에서 이미 사용된 행
+  (B.csv 순서 기준, 먼저 나온 행이 게이지를 차지)
+
 ```bash
 python3 match_nearest_gauge.py B.csv input.pkl -o C.csv
-python3 match_nearest_gauge.py B.csv input.pkl -o C.csv --scale 20000
+python3 match_nearest_gauge.py B.csv input.pkl -o C.csv --scale 20000 --max-dist 0.1
 ```
 
 의존성: numpy 필수, scipy 권장(cKDTree — 게이지가 수백만 개여도 빠름).

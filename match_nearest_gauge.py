@@ -10,6 +10,12 @@
   gauge_name, gauge_x, gauge_y, dist 컬럼을 붙인 파일.
   dist 는 input.pkl 좌표계 기준 유클리드 거리다.
 
+다음 두 경우의 행은 C.csv 에서 제외(pass)된다:
+- 최근접 게이지가 --max-dist(기본 0.1, input.pkl 좌표계 단위 = um)
+  이상 떨어져 있는 행
+- 매칭된 gauge_name 이 앞선 행에서 이미 사용된 행 (B.csv 순서 기준
+  먼저 나온 행이 게이지를 차지한다)
+
 최근접 탐색은 scipy 의 cKDTree 를 사용하고(수백만 게이지도 빠름),
 scipy 가 없으면 numpy 브루트포스로 대신한다.
 
@@ -81,6 +87,10 @@ def main(argv=None):
     )
     parser.add_argument("--x-column", default="X", help="B.csv 의 X 컬럼 이름 (기본값: X)")
     parser.add_argument("--y-column", default="Y", help="B.csv 의 Y 컬럼 이름 (기본값: Y)")
+    parser.add_argument(
+        "--max-dist", type=float, default=0.1,
+        help="이 거리(input.pkl 좌표계 단위, um) 이상 떨어진 행은 제외 (기본값: 0.1)",
+    )
     args = parser.parse_args(argv)
 
     names, gauge_coords = load_gauges(args.input_pkl)
@@ -114,17 +124,37 @@ def main(argv=None):
         if col in fieldnames:
             sys.exit(f"오류: B.csv 에 이미 '{col}' 컬럼이 있어 덮어쓸 수 없습니다.")
 
+    used_names = set()
+    skipped_far = skipped_dup = 0
+    kept_dists = []
+
     with open(args.output, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames + extra, lineterminator="\n")
         writer.writeheader()
         for row, j, d in zip(rows, idxs, dists):
-            row["gauge_name"] = names[j]
+            if d >= args.max_dist:
+                skipped_far += 1
+                continue
+            name = names[j]
+            if name in used_names:
+                skipped_dup += 1
+                continue
+            used_names.add(name)
+            row["gauge_name"] = name
             row["gauge_x"] = repr(float(gauge_coords[j, 0]))
             row["gauge_y"] = repr(float(gauge_coords[j, 1]))
             row["dist"] = f"{d:.6g}"
             writer.writerow(row)
+            kept_dists.append(d)
 
-    print(f"{len(rows)}행 매칭 완료 (평균 거리 {dists.mean():.4g}, 최대 {dists.max():.4g})")
+    kept = len(kept_dists)
+    print(
+        f"{len(rows)}행 중 {kept}행 저장 "
+        f"(거리 {args.max_dist} 이상 제외: {skipped_far}, 게이지 이름 중복 제외: {skipped_dup})"
+    )
+    if kept:
+        arr = np.array(kept_dists)
+        print(f"저장된 행의 거리: 평균 {arr.mean():.4g}, 최대 {arr.max():.4g}")
     print(f"저장 완료: {args.output}")
 
 
