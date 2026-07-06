@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+
+# 스크립트 산출물
+cluster_samples.csv
+B.csv
+C.csv
