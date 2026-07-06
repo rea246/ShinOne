@@ -61,12 +61,13 @@ def main(argv=None):
         help="그룹 기준 컬럼 이름 (기본값: cluster_id)",
     )
     parser.add_argument(
-        "-m", "--mode", choices=["first", "last", "random"], default="first",
-        help="클러스터 내 행 선택 방식 (기본값: first)",
+        "-m", "--mode", choices=["first", "last", "random"], default="random",
+        help="클러스터 내 행 선택 방식 (기본값: random — 입력이 좌표순으로 "
+             "정렬돼 있어도 편향 없이 뽑힌다)",
     )
     parser.add_argument(
-        "--seed", type=int, default=None,
-        help="--mode random 일 때 재현 가능한 결과를 위한 시드",
+        "--seed", type=int, default=42,
+        help="--mode random 일 때 재현용 시드 (기본값: 42)",
     )
     args = parser.parse_args(argv)
 
