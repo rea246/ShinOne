@@ -6,6 +6,7 @@ CSV 데이터에서 `cluster_id` 별로 대표 행을 하나씩 추출하는 도
 |----------|------|
 | `extract_cluster_samples.py` | 순차 처리. 작은 파일용, 코드가 단순함 |
 | `extract_cluster_samples_fast.py` | 멀티프로세스 병렬 처리. 수십 GB 대용량 파일용 |
+| `match_nearest_gauge.py` | 추출 결과(B.csv)에 input.pkl 의 최근접 게이지를 붙여 C.csv 생성 |
 
 ## extract_cluster_samples_fast.py (대용량 파일용)
 
@@ -32,6 +33,26 @@ python3 extract_cluster_samples_fast.py input.csv --mode random --seed 42
 
 제약: 따옴표로 감싼 필드 **안에 줄바꿈**이 있는 CSV는 지원하지 않는다
 (따옴표 안의 쉼표는 지원). 숫자/해시 데이터에는 해당 사항이 없다.
+
+## match_nearest_gauge.py (B.csv → C.csv 최근접 게이지 매칭)
+
+`extract_cluster_samples_fast.py` 의 결과물(B.csv)의 각 행에 대해,
+`preprocessor.py` 가 읽는 것과 같은 포맷의 게이지 리스트
+(`input.pkl`, `[[gauge_name, cx, cy], ...]` 를 pickle.dump 한 파일)에서
+가장 가까운 게이지를 찾아 `gauge_name, gauge_x, gauge_y, dist` 컬럼을
+붙인 C.csv 를 만든다.
+
+B.csv 의 X, Y 와 input.pkl 의 좌표는 단위가 달라서, B.csv 좌표를
+`--scale`(기본 20000)로 나눠 input.pkl 좌표계로 맞춘 뒤 비교한다.
+`dist` 는 input.pkl 좌표계 기준 유클리드 거리다.
+
+```bash
+python3 match_nearest_gauge.py B.csv input.pkl -o C.csv
+python3 match_nearest_gauge.py B.csv input.pkl -o C.csv --scale 20000
+```
+
+의존성: numpy 필수, scipy 권장(cKDTree — 게이지가 수백만 개여도 빠름).
+scipy 가 없으면 numpy 브루트포스로 자동 대체된다.
 
 ## extract_cluster_samples.py (순차 버전)
 
