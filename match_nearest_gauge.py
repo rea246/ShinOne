@@ -91,6 +91,11 @@ def main(argv=None):
         "--max-dist", type=float, default=0.1,
         help="이 거리(input.pkl 좌표계 단위, um) 이상 떨어진 행은 제외 (기본값: 0.1)",
     )
+    parser.add_argument(
+        "--inspect", metavar="CLUSTER_ID", default=None,
+        help="지정한 cluster_id 행의 최근접 게이지 top-5 를 브루트포스로 출력하고 "
+             "종료 (매칭 결과 검증용)",
+    )
     args = parser.parse_args(argv)
 
     names, gauge_coords = load_gauges(args.input_pkl)
@@ -116,6 +121,43 @@ def main(argv=None):
           float(r[args.y_column]) / args.scale] for r in rows],
         dtype=np.float64,
     )
+
+    # 단위/스케일 실수를 바로 잡아낼 수 있게 양쪽 좌표 범위를 항상 보여준다
+    g_min, g_max = gauge_coords.min(axis=0), gauge_coords.max(axis=0)
+    q_min, q_max = query.min(axis=0), query.max(axis=0)
+    print(f"input.pkl 좌표 범위:  X [{g_min[0]:g}, {g_max[0]:g}], Y [{g_min[1]:g}, {g_max[1]:g}]")
+    print(f"B.csv/{args.scale:g} 좌표 범위: X [{q_min[0]:g}, {q_max[0]:g}], Y [{q_min[1]:g}, {q_max[1]:g}]")
+    overlap = all(
+        q_min[a] <= g_max[a] and g_min[a] <= q_max[a] for a in (0, 1)
+    )
+    g_span = float(max(g_max - g_min))
+    q_span = float(max(q_max - q_min))
+    span_ratio = (q_span / g_span) if g_span > 0 and q_span > 0 else 1.0
+    if not overlap or span_ratio < 0.01 or span_ratio > 100:
+        print(
+            "[경고] 두 좌표 범위가 거의 겹치지 않거나 크기가 100배 이상 다릅니다. "
+            "--scale 값(단위 변환)이 잘못됐을 가능성이 큽니다. "
+            "예: input.pkl 이 nm 단위면 --scale 20 (B/20000=um 가 아니라 B/20=nm), "
+            "--max-dist 도 같은 단위로(0.1um=100nm → --max-dist 100).",
+            file=sys.stderr,
+        )
+
+    if args.inspect is not None:
+        targets = [
+            (i, r) for i, r in enumerate(rows)
+            if r.get("cluster_id", "") == args.inspect
+        ]
+        if not targets:
+            sys.exit(f"오류: cluster_id={args.inspect} 행을 B.csv 에서 찾지 못했습니다.")
+        for i, r in targets:
+            q = query[i]
+            print(f"\n[inspect] cluster_id={args.inspect}  "
+                  f"원본 ({r[args.x_column]}, {r[args.y_column]}) → 변환 ({q[0]:g}, {q[1]:g})")
+            d = np.hypot(gauge_coords[:, 0] - q[0], gauge_coords[:, 1] - q[1])
+            for rank, j in enumerate(np.argsort(d)[:5], 1):
+                print(f"  {rank}. {names[j]}  ({gauge_coords[j, 0]:g}, {gauge_coords[j, 1]:g})  "
+                      f"dist={d[j]:.6g}")
+        return
 
     idxs, dists = nearest_indices(gauge_coords, query)
 
