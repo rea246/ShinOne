@@ -16,26 +16,30 @@ CSV 데이터에서 `cluster_id` 별로 대표 행을 하나씩 추출하는 도
 ## extract_cluster_samples_fast.py (대용량 파일용)
 
 파일을 워커 수만큼 바이트 구간으로 나눠 여러 CPU가 동시에 스캔한다.
-행 전체를 파싱하지 않고 `cluster_id` 필드만 잘라내고, 이미 본 클러스터의
-행은 즉시 건너뛰기 때문에 순차 버전보다 코어당 처리량 자체도 훨씬 높다.
-메모리 사용량은 파일 크기와 무관하게 거의 일정하다(클러스터별 후보 행만 유지).
+행 전체를 파싱하지 않고 `cluster_id` 필드만 잘라내므로 순차 버전보다
+코어당 처리량도 훨씬 높다. 메모리 사용량은 파일 크기와 무관하게
+거의 일정하다(클러스터별 후보 행만 유지).
+
+`main()` 상단의 변수를 수정한 뒤 실행한다:
+
+```python
+def main():
+    input_path = "input.csv"   # 입력 CSV
+    output_path = "B.csv"      # 출력 CSV
+    key_column = "cluster_id"  # 그룹 기준 컬럼
+    mode = "random"            # first / last / random
+    seed = 42                  # random 모드 재현용 시드
+    workers = None             # None 이면 CPU 코어 수
+```
 
 ```bash
-# 기본: CPU 코어 수만큼 워커 사용
-python3 extract_cluster_samples_fast.py input.csv -o output.csv
-
-# 워커 수 지정
-python3 extract_cluster_samples_fast.py input.csv -o output.csv -j 16
-
-# first / last 모드, 기준 컬럼 변경은 순차 버전과 동일한 옵션 사용
-python3 extract_cluster_samples_fast.py input.csv --mode first
+python3 extract_cluster_samples_fast.py
 ```
 
 실측: 4코어 컨테이너에서 709 MiB / 1,600만 행 처리에 **3.2초 (약 220 MiB/s)**.
 같은 파일을 순차 버전으로 처리하면 102초가 걸린다 (약 32배).
-결과는 순차 버전과 동일함을 검증했다 (first/last 모드 diff 일치,
-워커 수를 바꿔도 결과 불변). random 모드는 시드+워커 수가 같으면
-재현되며, 워커 수가 달라지면 뽑히는 행은 달라지지만 균등성은 유지된다.
+first/last 모드 결과는 순차 버전과 동일하고 워커 수와 무관하다.
+random 모드는 시드+워커 수가 같으면 재현된다.
 
 제약: 따옴표로 감싼 필드 **안에 줄바꿈**이 있는 CSV는 지원하지 않는다
 (따옴표 안의 쉼표는 지원). 숫자/해시 데이터에는 해당 사항이 없다.
@@ -54,14 +58,28 @@ B.csv 의 X, Y 와 input.pkl 의 좌표는 단위가 달라서, B.csv 좌표를
 
 다음 두 경우의 행은 C.csv 에서 제외된다:
 
-- 최근접 게이지가 `--max-dist`(기본 0.1 um) 이상 떨어져 있는 행
+- 최근접 게이지가 `max_dist`(기본 0.1, pkl 좌표계 단위) 이상 떨어져 있는 행
 - 매칭된 `gauge_name` 이 앞선 행에서 이미 사용된 행
   (B.csv 순서 기준, 먼저 나온 행이 게이지를 차지)
 
-```bash
-python3 match_nearest_gauge.py B.csv input.pkl -o C.csv
-python3 match_nearest_gauge.py B.csv input.pkl -o C.csv --scale 20000 --max-dist 0.1
+`main()` 상단의 변수를 수정한 뒤 실행한다:
+
+```python
+def main():
+    b_csv = "B.csv"
+    input_pkl = "input.pkl"
+    output = "C.csv"
+    scale = 20000.0   # B.csv 좌표를 pkl 좌표계로 맞추는 나눗셈 값
+    max_dist = 0.1    # 이 거리 이상 떨어진 행은 제외
+    inspect = None    # cluster_id 를 넣으면 그 행의 top-5 최근접만 출력 (검증용)
 ```
+
+```bash
+python3 match_nearest_gauge.py
+```
+
+실행 시 양쪽 좌표 범위를 출력하고, 범위가 겹치지 않거나 크기가 100배
+이상 다르면 scale 오류 가능성을 경고한다.
 
 의존성: numpy 필수, scipy 권장(cKDTree — 게이지가 수백만 개여도 빠름).
 scipy 가 없으면 numpy 브루트포스로 자동 대체된다.

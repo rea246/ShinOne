@@ -1,30 +1,18 @@
 #!/usr/bin/env python3
-"""B.csv 의 각 행에 input.pkl 에서 가장 가까운 게이지를 찾아 붙여 C.csv 를 만든다.
+"""B.csv 의 각 행에 input.pkl 의 최근접 게이지를 찾아 붙여 C.csv 를 만든다.
 
-- input.pkl: preprocessor.py 의 load_gauge_list 가 읽는 것과 같은 포맷.
-  [[gauge_name, cx, cy], ...] 리스트를 pickle.dump 로 저장한 파일.
-- B.csv: extract_cluster_samples_fast.py 의 결과물. X, Y 컬럼을 가진다.
-  B.csv 의 좌표는 input.pkl 좌표계와 단위가 달라서 --scale(기본 20000)로
-  나눠서 비교한다. (변환: x = X / scale, y = Y / scale)
-- C.csv: B.csv 의 모든 컬럼 뒤에 최근접 게이지의
-  gauge_name, gauge_x, gauge_y, dist 컬럼을 붙인 파일.
-  dist 는 input.pkl 좌표계 기준 유클리드 거리다.
+- input.pkl: [[gauge_name, cx, cy], ...] 를 pickle.dump 한 파일
+  (preprocessor.py 의 load_gauge_list 와 같은 포맷).
+- B.csv: X, Y 컬럼을 가진 CSV. 좌표를 scale 로 나눠 pkl 좌표계로 맞춘다.
+- C.csv: B.csv 컬럼 뒤에 gauge_name, gauge_x, gauge_y, dist 를 붙인 파일.
 
-다음 두 경우의 행은 C.csv 에서 제외(pass)된다:
-- 최근접 게이지가 --max-dist(기본 0.1, input.pkl 좌표계 단위 = um)
-  이상 떨어져 있는 행
-- 매칭된 gauge_name 이 앞선 행에서 이미 사용된 행 (B.csv 순서 기준
-  먼저 나온 행이 게이지를 차지한다)
+제외되는 행:
+- 최근접 게이지가 max_dist 이상 떨어진 행
+- 매칭된 gauge_name 이 앞선 행에서 이미 사용된 행
 
-최근접 탐색은 scipy 의 cKDTree 를 사용하고(수백만 게이지도 빠름),
-scipy 가 없으면 numpy 브루트포스로 대신한다.
-
-사용법:
-    python3 match_nearest_gauge.py B.csv input.pkl -o C.csv
-    python3 match_nearest_gauge.py B.csv input.pkl -o C.csv --scale 20000
+설정은 main() 상단의 변수로 지정한다.
 """
 
-import argparse
 import csv
 import pickle
 import sys
@@ -38,7 +26,7 @@ except ImportError:
 
 
 def load_gauges(pkl_path):
-    """[[gauge_name, cx, cy], ...] 형태의 pkl 을 이름 리스트와 (N,2) 좌표로 분리."""
+    """pkl 을 이름 리스트와 (N,2) 좌표 배열로 분리."""
     with open(pkl_path, "rb") as f:
         gauge = pickle.load(f)
     if not gauge:
@@ -47,20 +35,17 @@ def load_gauges(pkl_path):
         names = [g[0] for g in gauge]
         coords = np.array([[float(g[1]), float(g[2])] for g in gauge], dtype=np.float64)
     except (IndexError, TypeError, ValueError) as e:
-        sys.exit(
-            f"오류: {pkl_path} 이 [[gauge_name, cx, cy], ...] 형태가 아닙니다 ({e})"
-        )
+        sys.exit(f"오류: {pkl_path} 이 [[gauge_name, cx, cy], ...] 형태가 아닙니다 ({e})")
     return names, coords
 
 
 def nearest_indices(gauge_coords, query_coords):
-    """query 각 점에 대해 가장 가까운 게이지 인덱스와 거리를 반환."""
+    """query 각 점의 최근접 게이지 인덱스와 거리. scipy 없으면 브루트포스."""
     if cKDTree is not None:
         tree = cKDTree(gauge_coords)
         dists, idxs = tree.query(query_coords, k=1)
         return np.atleast_1d(idxs), np.atleast_1d(dists)
 
-    # scipy 폴백: 쿼리(클러스터 수)는 적으므로 행 단위 브루트포스로 충분
     idxs = np.empty(len(query_coords), dtype=np.int64)
     dists = np.empty(len(query_coords), dtype=np.float64)
     for i, q in enumerate(query_coords):
@@ -71,92 +56,67 @@ def nearest_indices(gauge_coords, query_coords):
     return idxs, dists
 
 
-def main(argv=None):
-    parser = argparse.ArgumentParser(
-        description="B.csv 각 행에 input.pkl 의 최근접 게이지(name, x, y)를 붙여 C.csv 생성."
-    )
-    parser.add_argument("b_csv", help="B.csv 경로 (X, Y 컬럼 필요)")
-    parser.add_argument("input_pkl", help="input.pkl 경로 ([[gauge_name, cx, cy], ...])")
-    parser.add_argument(
-        "-o", "--output", default="C.csv",
-        help="출력 CSV 경로 (기본값: C.csv)",
-    )
-    parser.add_argument(
-        "--scale", type=float, default=20000.0,
-        help="B.csv 좌표를 input.pkl 좌표계로 맞추기 위한 나눗셈 값 (기본값: 20000)",
-    )
-    parser.add_argument("--x-column", default="X", help="B.csv 의 X 컬럼 이름 (기본값: X)")
-    parser.add_argument("--y-column", default="Y", help="B.csv 의 Y 컬럼 이름 (기본값: Y)")
-    parser.add_argument(
-        "--max-dist", type=float, default=0.1,
-        help="이 거리(input.pkl 좌표계 단위, um) 이상 떨어진 행은 제외 (기본값: 0.1)",
-    )
-    parser.add_argument(
-        "--inspect", metavar="CLUSTER_ID", default=None,
-        help="지정한 cluster_id 행의 최근접 게이지 top-5 를 브루트포스로 출력하고 "
-             "종료 (매칭 결과 검증용)",
-    )
-    args = parser.parse_args(argv)
-
-    names, gauge_coords = load_gauges(args.input_pkl)
-    print(f"게이지 {len(names):,}개 로드: {args.input_pkl}")
-
-    with open(args.b_csv, newline="", encoding="utf-8-sig") as f:
+def load_b_csv(b_csv, x_column, y_column, scale):
+    with open(b_csv, newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         if reader.fieldnames is None:
-            sys.exit(f"오류: 입력 파일이 비어 있습니다: {args.b_csv}")
-        for col in (args.x_column, args.y_column):
+            sys.exit(f"오류: 입력 파일이 비어 있습니다: {b_csv}")
+        for col in (x_column, y_column):
             if col not in reader.fieldnames:
-                sys.exit(
-                    f"오류: '{col}' 컬럼이 없습니다. "
-                    f"존재하는 컬럼: {', '.join(reader.fieldnames)}"
-                )
+                sys.exit(f"오류: '{col}' 컬럼이 없습니다. 존재하는 컬럼: {', '.join(reader.fieldnames)}")
         fieldnames = list(reader.fieldnames)
         rows = list(reader)
     if not rows:
-        sys.exit(f"오류: {args.b_csv} 에 데이터 행이 없습니다.")
+        sys.exit(f"오류: {b_csv} 에 데이터 행이 없습니다.")
 
     query = np.array(
-        [[float(r[args.x_column]) / args.scale,
-          float(r[args.y_column]) / args.scale] for r in rows],
+        [[float(r[x_column]) / scale, float(r[y_column]) / scale] for r in rows],
         dtype=np.float64,
     )
+    return fieldnames, rows, query
 
-    # 단위/스케일 실수를 바로 잡아낼 수 있게 양쪽 좌표 범위를 항상 보여준다
+
+def print_range_check(gauge_coords, query, scale):
+    """단위/스케일 실수를 잡아낼 수 있게 양쪽 좌표 범위를 출력하고 검사."""
     g_min, g_max = gauge_coords.min(axis=0), gauge_coords.max(axis=0)
     q_min, q_max = query.min(axis=0), query.max(axis=0)
     print(f"input.pkl 좌표 범위:  X [{g_min[0]:g}, {g_max[0]:g}], Y [{g_min[1]:g}, {g_max[1]:g}]")
-    print(f"B.csv/{args.scale:g} 좌표 범위: X [{q_min[0]:g}, {q_max[0]:g}], Y [{q_min[1]:g}, {q_max[1]:g}]")
-    overlap = all(
-        q_min[a] <= g_max[a] and g_min[a] <= q_max[a] for a in (0, 1)
-    )
+    print(f"B.csv/{scale:g} 좌표 범위: X [{q_min[0]:g}, {q_max[0]:g}], Y [{q_min[1]:g}, {q_max[1]:g}]")
+
+    overlap = all(q_min[a] <= g_max[a] and g_min[a] <= q_max[a] for a in (0, 1))
     g_span = float(max(g_max - g_min))
     q_span = float(max(q_max - q_min))
-    span_ratio = (q_span / g_span) if g_span > 0 and q_span > 0 else 1.0
-    if not overlap or span_ratio < 0.01 or span_ratio > 100:
-        print(
-            "[경고] 두 좌표 범위가 거의 겹치지 않거나 크기가 100배 이상 다릅니다. "
-            "--scale 값(단위 변환)이 잘못됐을 가능성이 큽니다. "
-            "예: input.pkl 이 nm 단위면 --scale 20 (B/20000=um 가 아니라 B/20=nm), "
-            "--max-dist 도 같은 단위로(0.1um=100nm → --max-dist 100).",
-            file=sys.stderr,
-        )
+    ratio = (q_span / g_span) if g_span > 0 and q_span > 0 else 1.0
+    if not overlap or ratio < 0.01 or ratio > 100:
+        print("[경고] 두 좌표 범위가 겹치지 않거나 크기가 100배 이상 다릅니다. "
+              "scale 값(단위 변환)을 확인하세요.", file=sys.stderr)
 
-    if args.inspect is not None:
-        targets = [
-            (i, r) for i, r in enumerate(rows)
-            if r.get("cluster_id", "") == args.inspect
-        ]
-        if not targets:
-            sys.exit(f"오류: cluster_id={args.inspect} 행을 B.csv 에서 찾지 못했습니다.")
-        for i, r in targets:
-            q = query[i]
-            print(f"\n[inspect] cluster_id={args.inspect}  "
-                  f"원본 ({r[args.x_column]}, {r[args.y_column]}) → 변환 ({q[0]:g}, {q[1]:g})")
-            d = np.hypot(gauge_coords[:, 0] - q[0], gauge_coords[:, 1] - q[1])
-            for rank, j in enumerate(np.argsort(d)[:5], 1):
-                print(f"  {rank}. {names[j]}  ({gauge_coords[j, 0]:g}, {gauge_coords[j, 1]:g})  "
-                      f"dist={d[j]:.6g}")
+
+def inspect_cluster(rows, query, names, gauge_coords, cluster_id, x_column, y_column):
+    """지정한 cluster_id 행의 최근접 게이지 top-5 를 브루트포스로 출력."""
+    targets = [(i, r) for i, r in enumerate(rows) if r.get("cluster_id", "") == str(cluster_id)]
+    if not targets:
+        sys.exit(f"오류: cluster_id={cluster_id} 행을 찾지 못했습니다.")
+    for i, r in targets:
+        q = query[i]
+        print(f"\n[inspect] cluster_id={cluster_id}  "
+              f"원본 ({r[x_column]}, {r[y_column]}) → 변환 ({q[0]:g}, {q[1]:g})")
+        d = np.hypot(gauge_coords[:, 0] - q[0], gauge_coords[:, 1] - q[1])
+        for rank, j in enumerate(np.argsort(d)[:5], 1):
+            print(f"  {rank}. {names[j]}  ({gauge_coords[j, 0]:g}, {gauge_coords[j, 1]:g})  "
+                  f"dist={d[j]:.6g}")
+
+
+def match(b_csv, input_pkl, output, scale, max_dist, x_column="X", y_column="Y",
+          inspect=None):
+    names, gauge_coords = load_gauges(input_pkl)
+    print(f"게이지 {len(names):,}개 로드: {input_pkl}")
+
+    fieldnames, rows, query = load_b_csv(b_csv, x_column, y_column, scale)
+    print_range_check(gauge_coords, query, scale)
+
+    if inspect is not None:
+        inspect_cluster(rows, query, names, gauge_coords, inspect, x_column, y_column)
         return
 
     idxs, dists = nearest_indices(gauge_coords, query)
@@ -164,17 +124,17 @@ def main(argv=None):
     extra = ["gauge_name", "gauge_x", "gauge_y", "dist"]
     for col in extra:
         if col in fieldnames:
-            sys.exit(f"오류: B.csv 에 이미 '{col}' 컬럼이 있어 덮어쓸 수 없습니다.")
+            sys.exit(f"오류: B.csv 에 이미 '{col}' 컬럼이 있습니다.")
 
     used_names = set()
     skipped_far = skipped_dup = 0
     kept_dists = []
 
-    with open(args.output, "w", newline="", encoding="utf-8") as f:
+    with open(output, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames + extra, lineterminator="\n")
         writer.writeheader()
         for row, j, d in zip(rows, idxs, dists):
-            if d >= args.max_dist:
+            if d >= max_dist:
                 skipped_far += 1
                 continue
             name = names[j]
@@ -190,14 +150,25 @@ def main(argv=None):
             kept_dists.append(d)
 
     kept = len(kept_dists)
-    print(
-        f"{len(rows)}행 중 {kept}행 저장 "
-        f"(거리 {args.max_dist} 이상 제외: {skipped_far}, 게이지 이름 중복 제외: {skipped_dup})"
-    )
+    print(f"{len(rows)}행 중 {kept}행 저장 "
+          f"(거리 {max_dist} 이상 제외: {skipped_far}, 게이지 이름 중복 제외: {skipped_dup})")
     if kept:
         arr = np.array(kept_dists)
         print(f"저장된 행의 거리: 평균 {arr.mean():.4g}, 최대 {arr.max():.4g}")
-    print(f"저장 완료: {args.output}")
+    print(f"저장 완료: {output}")
+
+
+def main():
+    b_csv = "B.csv"        # extract_cluster_samples_fast.py 결과물
+    input_pkl = "input.pkl"  # [[gauge_name, cx, cy], ...] pkl
+    output = "C.csv"       # 출력 CSV
+    scale = 20000.0        # B.csv 좌표를 pkl 좌표계로 맞추는 나눗셈 값
+    max_dist = 0.1         # 이 거리(pkl 좌표계 단위) 이상 떨어진 행은 제외
+    x_column = "X"
+    y_column = "Y"
+    inspect = None         # cluster_id 를 넣으면 그 행의 top-5 만 출력 (검증용)
+
+    match(b_csv, input_pkl, output, scale, max_dist, x_column, y_column, inspect)
 
 
 if __name__ == "__main__":
