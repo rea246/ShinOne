@@ -64,6 +64,7 @@ from matplotlib import cm
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
 from sklearn.metrics import silhouette_score
+from sklearn.neighbors import NearestNeighbors
 
 # ══════════════════════════════════════════════════════════════════
 # [Config]  — classify_tree 와 동일 데이터 경로
@@ -71,6 +72,10 @@ from sklearn.metrics import silhouette_score
 FOLDER_PATH   = "C:/Users/rea24/Documents/shinwon_note/pattern/2.Pattern_Classification/3.CODE/pythonProject2/dummy_dataset"
 FEATURE_CACHE = "hkeys_features.pt"
 OUT_DIR       = "h0_hdbscan_viz"
+# best 셋팅 캐시: --sweep 이 추천 조합을 여기에 저장, --apply-best 가 되불러옴.
+#   key=value TXT — 터미널에서 `cat` 으로 바로 확인 가능.
+BEST_SETTINGS_FILE = "h0_hdbscan_best_settings.txt"
+SCALE_K            = 25      # core distance 스케일 측정용 k번째 최근접 (안정적 근방)
 
 # 표본: UMAP/HDBSCAN 은 초선형+대용량 메모리라 20M 전량이 물리적으로 불가 →
 #   전체 유효행에서 "균일 무작위" 추출(불편추정). 탐지 하한 주의:
@@ -236,6 +241,54 @@ def _parse_list(s, cast):
     return out
 
 
+def core_distance_scale(X_cl, rng, k=SCALE_K, n_ref=20_000):
+    """군집화 공간의 "전형적 근방 거리" 측정 = k번째 최근접 거리의 중앙값.
+    epsilon 은 이 공간의 거리 단위라 스케일이 공간(raw 8d/pca 4d/umap)마다 다름.
+    → eps 를 이 값의 배수로 지정하면 어떤 공간에서도 의미 있는 범위를 훑는다."""
+    n = len(X_cl)
+    idx = np.arange(n) if n <= n_ref else rng.choice(n, n_ref, replace=False)
+    Xr = np.ascontiguousarray(X_cl[idx])
+    k_eff = min(k, len(Xr) - 1)
+    nn = NearestNeighbors(n_neighbors=k_eff + 1).fit(Xr)   # +1 = 자기 자신
+    d, _ = nn.kneighbors(Xr)
+    scale = float(np.median(d[:, -1]))
+    print(f"  [eps 스케일] {k_eff}번째 최근접 거리 중앙값 = {scale:.4f} "
+          f"(공간={CLUSTER_SPACE}, dim={X_cl.shape[1]}) → eps 배수의 기준")
+    return scale
+
+
+def write_best_settings(path, cfg, metrics_line, meta_line):
+    """추천 조합을 key=value TXT 로 저장 (터미널 `cat` 가독 + --apply-best 파싱)."""
+    ms = 'auto' if cfg['min_samples'] is None else cfg['min_samples']
+    with open(path, 'w', encoding='utf-8') as fp:
+        fp.write("# h0 HDBSCAN best settings — 자동 생성 (--sweep 추천)\n")
+        fp.write(f"# {meta_line}\n")
+        fp.write("# 재현: python h0_hdbscan_umap.py --apply-best "
+                 "(이 값으로 fit + 전량배정)\n")
+        fp.write(f"space={cfg['space']}\n")
+        fp.write(f"eff_dim={cfg['eff_dim']}\n")
+        fp.write(f"sample={cfg['sample']}\n")
+        fp.write(f"min_cluster_size={cfg['min_cluster_size']}\n")
+        fp.write(f"min_samples={ms}\n")
+        fp.write(f"epsilon={cfg['epsilon']:.6g}\n")   # 절대값(스케일 이미 반영)
+        fp.write(f"# metrics: {metrics_line}\n")
+    print(f"  [best 셋팅 저장] {path}  (터미널에서 `cat` 로 확인, "
+          "--apply-best 로 되불러옴)")
+
+
+def read_best_settings(path):
+    """key=value TXT → dict. 주석(#)/빈 줄 무시. 값은 문자열."""
+    cfg = {}
+    with open(path, encoding='utf-8') as fp:
+        for line in fp:
+            line = line.strip()
+            if not line or line.startswith('#') or '=' not in line:
+                continue
+            k, v = (s.strip() for s in line.split('=', 1))
+            cfg[k] = v
+    return cfg
+
+
 def _cluster_metrics(lab, X_cl, rng):
     """조합 하나의 평가 지표 묶음."""
     ids, cnts = np.unique(lab[lab >= 0], return_counts=True)
@@ -259,24 +312,28 @@ def _cluster_metrics(lab, X_cl, rng):
             'max_share': max_share, 'sizes_top5': top5}
 
 
-def run_sweep(X_cl, rng, args, out_dir):
+def run_sweep(X_cl, rng, args, out_dir, core_scale):
     import itertools
     mcs_list = _parse_list(args.sweep_mcs, int)
     ms_list = _parse_list(args.sweep_ms, int)
-    eps_list = _parse_list(args.sweep_eps, float)
-    combos = list(itertools.product(mcs_list, ms_list, eps_list))
+    mult_list = _parse_list(args.sweep_eps, float)   # eps 는 core_scale 의 "배수"
+    combos = list(itertools.product(mcs_list, ms_list, mult_list))
     print(f"\n[스윕] {len(combos)}개 조합 × 표본 {len(X_cl):,} "
           f"(공간={CLUSTER_SPACE}) — 조합당 수 분")
+    print(f"  eps 는 core_scale({core_scale:.4f}) 배수로 해석 "
+          f"→ 예: 0.5 배 = {0.5*core_scale:.4f}, 1.0 배 = {core_scale:.4f}")
 
     results = []
-    for i, (mcs, ms, eps) in enumerate(combos):
+    for i, (mcs, ms, mult) in enumerate(combos):
         t = time.time()
-        lab, dbcv, _, _ = run_hdbscan(X_cl, mcs, ms, eps or 0.0)
+        eps_abs = (mult or 0.0) * core_scale
+        lab, dbcv, _, _ = run_hdbscan(X_cl, mcs, ms, eps_abs)
         m = _cluster_metrics(lab, X_cl, rng)
-        m.update(mcs=mcs, ms=ms, eps=(eps or 0.0), dbcv=dbcv,
+        m.update(mcs=mcs, ms=ms, eps_mult=(mult or 0.0), eps=eps_abs, dbcv=dbcv,
                  sec=round(time.time() - t, 1))
         results.append(m)
-        print(f"  [{i+1}/{len(combos)}] mcs={mcs} ms={ms} eps={eps or 0.0} → "
+        print(f"  [{i+1}/{len(combos)}] mcs={mcs} ms={ms} "
+              f"eps={mult or 0.0}×={eps_abs:.4f} → "
               f"k={m['k']}  noise={m['noise']:.1%}  sil={m['sil']:.3f}  "
               f"DBCV={m['dbcv']:.3f}  최대군집 {m['max_share']:.0%}  ({m['sec']}s)")
 
@@ -286,13 +343,13 @@ def run_sweep(X_cl, rng, args, out_dir):
     csv_path = os.path.join(out_dir, f"h0_hdbscan_sweep_{tag}.csv")
     with open(csv_path, 'w', newline='', encoding='utf-8') as fp:
         w = csv.writer(fp)
-        w.writerow(['min_cluster_size', 'min_samples', 'epsilon', 'n_clusters',
-                    'noise_frac', 'silhouette', 'dbcv', 'eff_k', 'max_share',
-                    'sizes_top5', 'sec'])
+        w.writerow(['min_cluster_size', 'min_samples', 'eps_mult', 'epsilon',
+                    'n_clusters', 'noise_frac', 'silhouette', 'dbcv', 'eff_k',
+                    'max_share', 'sizes_top5', 'sec'])
         for r in results:
             w.writerow([r['mcs'], ('auto' if r['ms'] is None else r['ms']),
-                        r['eps'], r['k'], f"{r['noise']:.4f}",
-                        f"{r['sil']:.4f}", f"{r['dbcv']:.4f}",
+                        f"{r['eps_mult']:g}", f"{r['eps']:.6g}", r['k'],
+                        f"{r['noise']:.4f}", f"{r['sil']:.4f}", f"{r['dbcv']:.4f}",
                         f"{r['eff_k']:.2f}", f"{r['max_share']:.4f}",
                         '/'.join(map(str, r['sizes_top5'])), r['sec']])
     print(f"\n  [스윕] CSV: {csv_path}")
@@ -336,12 +393,26 @@ def run_sweep(X_cl, rng, args, out_dir):
               f"eps={r['eps']:g}  k={r['k']:>3}  noise={r['noise']:.1%}  "
               f"sil={r['sil']:.3f}  DBCV={r['dbcv']:.3f}  최대 {r['max_share']:.0%}")
     b = ranked[0]
+
+    # ── best 셋팅 캐시 저장 (터미널 가독 TXT → --apply-best 로 되불러옴) ──
+    best_cfg = {'space': CLUSTER_SPACE, 'eff_dim': args.eff_dim,
+                'sample': args.sample, 'min_cluster_size': b['mcs'],
+                'min_samples': b['ms'], 'epsilon': b['eps']}
+    metrics_line = (f"k={b['k']} noise={b['noise']:.1%} sil={b['sil']:.3f} "
+                    f"DBCV={b['dbcv']:.3f} max_share={b['max_share']:.0%} "
+                    f"eps_mult={b['eps_mult']:g}")
+    meta_line = (f"생성 {time.strftime('%Y-%m-%d %H:%M:%S')} | 표본 {args.sample} | "
+                 f"core_scale={core_scale:.4f} | 그리드 mcs=[{args.sweep_mcs}] "
+                 f"ms=[{args.sweep_ms}] eps배수=[{args.sweep_eps}]")
+    best_path = os.path.join(out_dir, BEST_SETTINGS_FILE)
+    write_best_settings(best_path, best_cfg, metrics_line, meta_line)
+
+    print(f"\n  [추천] 한 번에 재현+전량배정:\n    python h0_hdbscan_umap.py --apply-best")
     ms_arg = "" if b['ms'] is None else f" --min-samples {b['ms']}"
     eps_arg = "" if b['eps'] == 0 else f" --epsilon {b['eps']:g}"
-    print(f"\n  [추천] 재현+전량배정:\n    python h0_hdbscan_umap.py "
+    print(f"  [추천-명시형] python h0_hdbscan_umap.py "
           f"--space {CLUSTER_SPACE} --eff-dim {args.eff_dim} "
-          f"--min-cluster-size {b['mcs']}{ms_arg}{eps_arg} "
-          f"--assign-all --viz pca")
+          f"--min-cluster-size {b['mcs']}{ms_arg}{eps_arg} --assign-all --viz pca")
     return results
 
 
@@ -606,14 +677,42 @@ def main():
                          "영역까지 확장돼 커버리지 ↑ (군집화 공간 거리 단위)")
     ap.add_argument("--sweep", action="store_true",
                     help="파라미터 그리드 스윕 (단일 fit/plot 대신 조합 비교 "
-                         "CSV+PNG+추천 출력)")
+                         "CSV+PNG+추천 출력 + best 셋팅 TXT 저장)")
     ap.add_argument("--sweep-mcs", type=str, default="500,1000,2000,5000",
                     help="스윕할 min_cluster_size 목록 (콤마 구분)")
     ap.add_argument("--sweep-ms", type=str, default="none,100,25",
                     help="스윕할 min_samples 목록 (none=auto)")
-    ap.add_argument("--sweep-eps", type=str, default="0,0.25,0.5",
-                    help="스윕할 cluster_selection_epsilon 목록")
+    ap.add_argument("--sweep-eps", type=str, default="0,0.5,1,1.5",
+                    help="스윕할 epsilon — core distance 스케일의 '배수' 목록 "
+                         "(0=경계확장 없음, 1=전형적 근방거리 1개분). 절대거리로 "
+                         "자동 환산되어 공간(pca/raw/umap)이 달라도 의미 유지")
+    ap.add_argument("--apply-best", nargs="?", const="", default=None,
+                    metavar="PATH",
+                    help=f"best 셋팅 TXT 를 불러와 그대로 fit + 전량배정. 경로 "
+                         f"생략 시 {OUT_DIR}/{BEST_SETTINGS_FILE}. (--sweep 이 "
+                         f"저장한 파일; 터미널에서 `cat` 로 값 확인 가능)")
     args = ap.parse_args()
+
+    # ── --apply-best: 셋팅 TXT → args 덮어쓰기 (X 구성 전에 반영) ──
+    if args.apply_best is not None:
+        best_path = args.apply_best or os.path.join(_here, OUT_DIR,
+                                                    BEST_SETTINGS_FILE)
+        if not os.path.exists(best_path):
+            raise FileNotFoundError(
+                f"best 셋팅 파일 없음: {best_path} — 먼저 --sweep 을 실행하세요")
+        cfg = read_best_settings(best_path)
+        print(f"[apply-best] {best_path} 로드: {cfg}")
+        args.space = cfg.get('space', args.space)
+        args.eff_dim = int(cfg.get('eff_dim', args.eff_dim))
+        args.sample = int(cfg.get('sample', args.sample))
+        args.min_cluster_size = int(cfg.get('min_cluster_size',
+                                            args.min_cluster_size))
+        ms = cfg.get('min_samples', 'auto')
+        args.min_samples = None if ms in ('auto', 'none') else int(ms)
+        args.epsilon = float(cfg.get('epsilon', args.epsilon))
+        args.assign_all = True        # 불러오면 곧 전량배정(최종 적용)이 목적
+        args.viz = "pca"              # 최종 적용은 빠른 pca 투영으로
+
     HDB_SAMPLE, MIN_CLUSTER_SIZE, CLUSTER_SPACE = \
         args.sample, args.min_cluster_size, args.space
 
@@ -662,8 +761,10 @@ def main():
 
     # ── 스윕 모드: 조합 비교만 하고 종료 ──
     if args.sweep:
-        run_sweep(X_cl, rng, args, out_dir)
-        print(f"\n완료 ({time.time()-t0:.0f}s). 추천 조합으로 --assign-all 재실행하세요.")
+        core_scale = core_distance_scale(X_cl, rng)
+        run_sweep(X_cl, rng, args, out_dir, core_scale)
+        print(f"\n완료 ({time.time()-t0:.0f}s). best 셋팅 저장됨 → "
+              f"`python h0_hdbscan_umap.py --apply-best` 로 전량배정까지 한 번에.")
         return
 
     # ── HDBSCAN (발견 = 표본 fit) ──
