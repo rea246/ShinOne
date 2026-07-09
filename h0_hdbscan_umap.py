@@ -198,9 +198,12 @@ def umap_embed(X, n_components, min_dist, seed):
         return model.transform(X), "pca", model
 
 
-def run_hdbscan(X, min_cluster_size, min_samples, epsilon=0.0):
+def run_hdbscan(X, min_cluster_size, min_samples, epsilon=0.0,
+                core_dist_n_jobs=-1, verbose=True):
     """HDBSCAN fit (발견 단계). hdbscan 패키지 우선(DBCV·approximate_predict 제공),
-    없으면 sklearn 내장. 반환 (labels, dbcv, clusterer, impl)."""
+    없으면 sklearn 내장. 반환 (labels, dbcv, clusterer, impl).
+    core_dist_n_jobs: 단일 fit 은 -1(전 코어). combo 병렬(--jobs)일 땐 1 로
+      낮춰 코어 경합(oversubscription) 방지 — 그땐 combo 가 코어를 나눠 씀."""
     t = time.time()
     try:
         import hdbscan
@@ -208,7 +211,7 @@ def run_hdbscan(X, min_cluster_size, min_samples, epsilon=0.0):
                              min_samples=min_samples,
                              cluster_selection_epsilon=float(epsilon),
                              gen_min_span_tree=True, prediction_data=True,
-                             core_dist_n_jobs=-1)
+                             core_dist_n_jobs=core_dist_n_jobs)
         lab = cl.fit_predict(X)
         dbcv = float(getattr(cl, "relative_validity_", float("nan")))
         impl = "hdbscan"
@@ -216,11 +219,13 @@ def run_hdbscan(X, min_cluster_size, min_samples, epsilon=0.0):
         from sklearn.cluster import HDBSCAN as SKHDBSCAN   # sklearn>=1.3
         cl = SKHDBSCAN(min_cluster_size=min_cluster_size,
                        min_samples=min_samples,
-                       cluster_selection_epsilon=float(epsilon))
+                       cluster_selection_epsilon=float(epsilon),
+                       n_jobs=core_dist_n_jobs)
         lab = cl.fit_predict(X)
         dbcv, impl = float("nan"), "sklearn"
-    print(f"  [HDBSCAN/{impl}] fit {X.shape}  min_samples={min_samples} "
-          f"eps={epsilon}  ({time.time()-t:.0f}s)")
+    if verbose:
+        print(f"  [HDBSCAN/{impl}] fit {X.shape}  min_samples={min_samples} "
+              f"eps={epsilon}  ({time.time()-t:.0f}s)")
     return lab.astype(np.int64), dbcv, cl, impl
 
 
@@ -249,7 +254,7 @@ def core_distance_scale(X_cl, rng, k=SCALE_K, n_ref=20_000):
     idx = np.arange(n) if n <= n_ref else rng.choice(n, n_ref, replace=False)
     Xr = np.ascontiguousarray(X_cl[idx])
     k_eff = min(k, len(Xr) - 1)
-    nn = NearestNeighbors(n_neighbors=k_eff + 1).fit(Xr)   # +1 = 자기 자신
+    nn = NearestNeighbors(n_neighbors=k_eff + 1, n_jobs=-1).fit(Xr)  # +1=자기자신
     d, _ = nn.kneighbors(Xr)
     scale = float(np.median(d[:, -1]))
     print(f"  [eps 스케일] {k_eff}번째 최근접 거리 중앙값 = {scale:.4f} "
@@ -312,6 +317,20 @@ def _cluster_metrics(lab, X_cl, rng):
             'max_share': max_share, 'sizes_top5': top5}
 
 
+def _sweep_combo(mcs, ms, mult, core_scale, X_cl, seed, core_dist_n_jobs):
+    """조합 1개 실행 (joblib 워커에서 호출 가능하도록 모듈 최상위 함수).
+    병렬 모드면 core_dist_n_jobs=1 로 받아 코어 경합을 피한다."""
+    t = time.time()
+    rng = np.random.default_rng(seed)
+    eps_abs = (mult or 0.0) * core_scale
+    lab, dbcv, _, _ = run_hdbscan(X_cl, mcs, ms, eps_abs,
+                                  core_dist_n_jobs=core_dist_n_jobs, verbose=False)
+    m = _cluster_metrics(lab, X_cl, rng)
+    m.update(mcs=mcs, ms=ms, eps_mult=(mult or 0.0), eps=eps_abs, dbcv=dbcv,
+             sec=round(time.time() - t, 1))
+    return m
+
+
 def run_sweep(X_cl, rng, args, out_dir, core_scale):
     import itertools
     mcs_list = _parse_list(args.sweep_mcs, int)
@@ -323,20 +342,41 @@ def run_sweep(X_cl, rng, args, out_dir, core_scale):
     print(f"  eps 는 core_scale({core_scale:.4f}) 배수로 해석 "
           f"→ 예: 0.5 배 = {0.5*core_scale:.4f}, 1.0 배 = {core_scale:.4f}")
 
+    # ── combo 병렬 (--jobs) ─────────────────────────────────────────
+    #   각 HDBSCAN 이 core_dist_n_jobs=-1(전 코어)이라, combo 를 동시에 돌리면
+    #   코어 경합이 남 → 병렬 모드에선 combo 당 core_dist_n_jobs=1 로 낮추고
+    #   combo 를 코어 수만큼 채운다. HDBSCAN 트리 부분이 단일코어라 대체로 이게
+    #   더 빠름. ⚠ 메모리는 동시 combo 수만큼 배가됨.
+    if args.jobs != 1:
+        from joblib import Parallel, delayed
+        print(f"  [병렬] --jobs {args.jobs} → combo 동시 실행 "
+              f"(combo 당 core_dist_n_jobs=1, 메모리 ~{args.jobs}배 주의)")
+        results = Parallel(n_jobs=args.jobs, backend="loky", verbose=10)(
+            delayed(_sweep_combo)(mcs, ms, mult, core_scale, X_cl, SEED, 1)
+            for (mcs, ms, mult) in combos)
+        for i, (m, (mcs, ms, mult)) in enumerate(zip(results, combos)):
+            print(f"  [{i+1}/{len(combos)}] mcs={mcs} ms={ms} "
+                  f"eps={mult or 0.0}×={m['eps']:.4f} → k={m['k']}  "
+                  f"noise={m['noise']:.1%}  sil={m['sil']:.3f}  "
+                  f"DBCV={m['dbcv']:.3f}  최대군집 {m['max_share']:.0%}  ({m['sec']}s)")
+        return _finish_sweep(results, args, out_dir, core_scale)
+
+    # ── 순차 (--jobs 1, 기본) : 진행상황 라이브 출력 ────────────────
     results = []
     for i, (mcs, ms, mult) in enumerate(combos):
-        t = time.time()
-        eps_abs = (mult or 0.0) * core_scale
-        lab, dbcv, _, _ = run_hdbscan(X_cl, mcs, ms, eps_abs)
-        m = _cluster_metrics(lab, X_cl, rng)
-        m.update(mcs=mcs, ms=ms, eps_mult=(mult or 0.0), eps=eps_abs, dbcv=dbcv,
-                 sec=round(time.time() - t, 1))
+        m = _sweep_combo(mcs, ms, mult, core_scale, X_cl, SEED, -1)
         results.append(m)
+        eps_abs = m['eps']
         print(f"  [{i+1}/{len(combos)}] mcs={mcs} ms={ms} "
               f"eps={mult or 0.0}×={eps_abs:.4f} → "
               f"k={m['k']}  noise={m['noise']:.1%}  sil={m['sil']:.3f}  "
               f"DBCV={m['dbcv']:.3f}  최대군집 {m['max_share']:.0%}  ({m['sec']}s)")
 
+    return _finish_sweep(results, args, out_dir, core_scale)
+
+
+def _finish_sweep(results, args, out_dir, core_scale):
+    """스윕 결과 → CSV + 비교 plot + 순위/추천 + best 셋팅 TXT (순차/병렬 공용)."""
     # ── CSV (그리드 태그 포함 — LSF 분할 실행 시 서로 안 덮어씀) ──
     tag = (f"mcs{args.sweep_mcs}_ms{args.sweep_ms}_eps{args.sweep_eps}"
            .replace(',', '-').replace('.', 'p'))
@@ -686,6 +726,10 @@ def main():
                     help="스윕할 epsilon — core distance 스케일의 '배수' 목록 "
                          "(0=경계확장 없음, 1=전형적 근방거리 1개분). 절대거리로 "
                          "자동 환산되어 공간(pca/raw/umap)이 달라도 의미 유지")
+    ap.add_argument("--jobs", type=int, default=1,
+                    help="스윕 combo 동시 실행 수 (1=순차 기본, -1=전 코어). "
+                         "병렬 시 combo 당 core_dist_n_jobs=1 로 낮춰 경합 방지. "
+                         "⚠ 메모리는 동시 combo 수만큼 배가됨(표본 크면 주의)")
     ap.add_argument("--apply-best", nargs="?", const="", default=None,
                     metavar="PATH",
                     help=f"best 셋팅 TXT 를 불러와 그대로 fit + 전량배정. 경로 "
