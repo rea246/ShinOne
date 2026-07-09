@@ -47,7 +47,13 @@ MIN_SAMPLES      = 40
 EPSILON          = 0.11
 CLUSTER_METHOD   = "leaf"     # 'leaf'(잘게) | 'eom'(안정 큰 군집)
 
-# noise 를 soft 멤버십으로 최다확률 군집에 편입 (noise 0 으로). 발견 코어는 그대로.
+# 약한 군집 필터: persistence 낮거나 너무 작은 군집을 noise 로 돌린 뒤(다음 줄 soft가
+#   남은 군집으로만 재배정). persistence 는 hdbscan 패키지에서만 나옴(없으면 count 만).
+FILTER_WEAK          = True
+MIN_KEEP_PERSISTENCE = 0.05    # 이 미만 persistence 군집 녹임 (persistence 없으면 무시)
+MIN_KEEP_COUNT       = 0       # 이 미만 크기 군집 녹임 (0 = 미사용)
+
+# noise 를 soft 멤버십으로 최다확률(남은) 군집에 편입 (noise 0 으로). 발견 코어는 그대로.
 ASSIGN_SOFT      = True
 
 N_REPS  = 5             # 군집당 대표 패턴 수 (medoid 1 + 랜덤 4)
@@ -116,12 +122,41 @@ def run_hdbscan(X_cluster):
 
 
 # ══════════════════════════════════════════════════════════════════
-# 2-b. noise → 최다확률 군집 편입 (soft 배정)
+# 2-b. 약한 군집 → noise 전환 (필터)
 # ══════════════════════════════════════════════════════════════════
-def assign_noise_soft(cl, lab, X_cluster, impl):
-    """발견 코어는 그대로 두고 noise(-1) 만 편입 → noise 0.
-    hdbscan: all_points_membership_vectors 소프트 멤버십의 argmax.
-    sklearn 폴백: 최근접 이웃(KNN) 로 대체."""
+def filter_weak_clusters(lab, persist):
+    """persistence/count 문턱 미만 군집을 noise(-1) 로 전환.
+    반환 (lab_filtered, keep_ids). persist 없으면 count 만 적용."""
+    ids, cnts = np.unique(lab[lab >= 0], return_counts=True)
+    cnt_by = dict(zip(ids.tolist(), cnts.tolist()))
+    keep, dropped = [], []
+    for c in ids.tolist():
+        p = persist[c] if (persist is not None and c < len(persist)) else None
+        ok_p = (p is None) or (p >= MIN_KEEP_PERSISTENCE)
+        ok_n = cnt_by[c] >= MIN_KEEP_COUNT
+        (keep if (ok_p and ok_n) else dropped).append(c)
+
+    out = lab.copy()
+    if not dropped:
+        print("  [필터] 녹일 약한 군집 없음")
+        return out, keep
+    if len(keep) < 2:
+        print(f"  ⚠ [필터] 문턱이 너무 세서 남는 군집 {len(keep)}개 → 필터 건너뜀")
+        return out, ids.tolist()
+    out[np.isin(out, dropped)] = -1            # 약한 군집 → noise
+    for c in dropped:
+        p = persist[c] if (persist is not None and c < len(persist)) else float("nan")
+        print(f"  [필터] c{c} 녹임 → noise (count={cnt_by[c]:,}, persistence={p:.3f})")
+    return out, keep
+
+
+# ══════════════════════════════════════════════════════════════════
+# 2-c. noise → 최다확률 (남은) 군집 편입 (soft 배정)
+# ══════════════════════════════════════════════════════════════════
+def assign_noise_soft(cl, lab, X_cluster, impl, keep_ids=None):
+    """발견 코어는 그대로 두고 noise(-1, 필터로 녹인 것 포함) 만 편입 → noise 0.
+    hdbscan: all_points_membership_vectors 의 argmax (녹인 군집 컬럼은 제외).
+    sklearn 폴백: 남은 군집 점으로만 학습한 KNN 최근접."""
     noise = lab == -1
     if not noise.any() or lab.max() < 0:
         return lab.copy()
@@ -129,15 +164,20 @@ def assign_noise_soft(cl, lab, X_cluster, impl):
     t = time.time()
     if impl == "hdbscan":
         import hdbscan
-        soft = hdbscan.all_points_membership_vectors(cl)   # (N, K)
+        soft = hdbscan.all_points_membership_vectors(cl)   # (N, K_orig)
         if soft.ndim == 1:                                 # K==1 방어
             soft = soft.reshape(-1, 1)
+        if keep_ids is not None:                           # 녹인 군집 컬럼 배제
+            bias = np.full(soft.shape[1], -np.inf)
+            bias[np.array(keep_ids, dtype=int)] = 0.0
+            soft = soft + bias[None, :]
         out[noise] = np.argmax(soft, axis=1)[noise]
         how = "soft(all_points_membership)"
     else:
         from sklearn.neighbors import KNeighborsClassifier
+        core = lab >= 0                                    # 남은 군집(녹인 건 이미 -1)
         knn = KNeighborsClassifier(n_neighbors=15, n_jobs=-1).fit(
-            X_cluster[~noise], lab[~noise])
+            X_cluster[core], lab[core])
         out[noise] = knn.predict(X_cluster[noise])
         how = "KNN(k=15) 최근접"
     print(f"  [noise 편입/{how}] {int(noise.sum()):,}개 → 군집 배정  "
@@ -332,12 +372,27 @@ def main():
     cl, lab, dbcv, persist, impl = run_hdbscan(X_cluster)
     print_health(lab, dbcv, persist, title="발견 단계 (noise 포함)")
 
-    # noise → 최다확률 군집 편입 (soft). 발견 코어는 그대로.
+    # 약한 군집(persistence/count 문턱 미만) → noise 전환
+    keep_ids = None
+    if FILTER_WEAK:
+        lab, keep_ids = filter_weak_clusters(lab, persist)
+
+    # noise(원래 noise + 녹인 약한 군집) → 최다확률 "남은" 군집으로 soft 편입
     if ASSIGN_SOFT:
-        lab_final = assign_noise_soft(cl, lab, X_cluster, impl)
-        print_health(lab_final, dbcv, persist, title="soft 배정 후 (noise 0)")
+        lab_final = assign_noise_soft(cl, lab, X_cluster, impl, keep_ids)
     else:
         lab_final = lab
+
+    # 최종 라벨을 0..K'-1 로 재정렬 (녹인 군집 번호 구멍 메움)
+    final_ids = np.unique(lab_final[lab_final >= 0])
+    if len(final_ids) and not np.array_equal(final_ids, np.arange(len(final_ids))):
+        print(f"  [재번호] 최종 군집 {final_ids.tolist()} → 0..{len(final_ids)-1}")
+        remapped = lab_final.copy()
+        pos = lab_final >= 0
+        remapped[pos] = np.searchsorted(final_ids, lab_final[pos])
+        lab_final = remapped
+    # persist 는 발견 단계 지표라 재번호/재배정 후엔 의미 안 맞음 → None
+    print_health(lab_final, dbcv, None, title="필터+soft 배정 후 (최종)")
 
     # 시각화·대표패턴·저장은 최종 라벨 기준
     plot_scatter_2d(X_view2d, lab_final, rng)
