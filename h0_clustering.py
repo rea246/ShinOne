@@ -41,11 +41,14 @@ REDUCE_DIM  = 4          # 표준화 후 PCA 축소 차원 (h0 effective rank �
 SCATTER_MAX = 100_000    # 2D scatter 에 찍을 점 수 상한
 SEED        = 42
 
-# 내가 정한 군집화 조건 (지금까지 탐색으로 고른 값)
+# 내가 정한 군집화 조건 (탐색으로 확정: K=7, DBCV≈0.6, 최대군집≈40%)
 MIN_CLUSTER_SIZE = 1000
-MIN_SAMPLES      = 20
-EPSILON          = 0.0
+MIN_SAMPLES      = 40
+EPSILON          = 0.11
 CLUSTER_METHOD   = "leaf"     # 'leaf'(잘게) | 'eom'(안정 큰 군집)
+
+# noise 를 soft 멤버십으로 최다확률 군집에 편입 (noise 0 으로). 발견 코어는 그대로.
+ASSIGN_SOFT      = True
 
 N_REPS  = 5             # 군집당 대표 패턴 수 (medoid 1 + 랜덤 4)
 
@@ -92,28 +95,60 @@ def run_hdbscan(X_cluster):
                              cluster_selection_epsilon=float(EPSILON),
                              cluster_selection_method=CLUSTER_METHOD,
                              gen_min_span_tree=True,      # DBCV 위해
+                             prediction_data=True,        # soft 배정 위해
                              core_dist_n_jobs=-1)          # core 전부 사용
         lab = cl.fit_predict(X_cluster)
         dbcv = float(getattr(cl, "relative_validity_", float("nan")))
         persist = getattr(cl, "cluster_persistence_", None)
+        impl = "hdbscan"
     except ImportError:
-        print("  ⚠ hdbscan 패키지 없음 → sklearn 내장 사용 (DBCV·persistence 없음). "
+        print("  ⚠ hdbscan 패키지 없음 → sklearn 내장 사용 (DBCV·persistence·soft 없음). "
               "pip install hdbscan 권장")
         from sklearn.cluster import HDBSCAN as SKHDBSCAN
         cl = SKHDBSCAN(min_cluster_size=MIN_CLUSTER_SIZE, min_samples=MIN_SAMPLES,
                        cluster_selection_epsilon=float(EPSILON),
                        cluster_selection_method=CLUSTER_METHOD, n_jobs=-1)
         lab = cl.fit_predict(X_cluster)
-        dbcv, persist = float("nan"), None
+        dbcv, persist, impl = float("nan"), None, "sklearn"
     print(f"HDBSCAN fit 완료 ({time.time()-t:.0f}s)  "
           f"mcs={MIN_CLUSTER_SIZE} ms={MIN_SAMPLES} eps={EPSILON} method={CLUSTER_METHOD}")
-    return lab, dbcv, persist
+    return cl, lab, dbcv, persist, impl
+
+
+# ══════════════════════════════════════════════════════════════════
+# 2-b. noise → 최다확률 군집 편입 (soft 배정)
+# ══════════════════════════════════════════════════════════════════
+def assign_noise_soft(cl, lab, X_cluster, impl):
+    """발견 코어는 그대로 두고 noise(-1) 만 편입 → noise 0.
+    hdbscan: all_points_membership_vectors 소프트 멤버십의 argmax.
+    sklearn 폴백: 최근접 이웃(KNN) 로 대체."""
+    noise = lab == -1
+    if not noise.any() or lab.max() < 0:
+        return lab.copy()
+    out = lab.copy()
+    t = time.time()
+    if impl == "hdbscan":
+        import hdbscan
+        soft = hdbscan.all_points_membership_vectors(cl)   # (N, K)
+        if soft.ndim == 1:                                 # K==1 방어
+            soft = soft.reshape(-1, 1)
+        out[noise] = np.argmax(soft, axis=1)[noise]
+        how = "soft(all_points_membership)"
+    else:
+        from sklearn.neighbors import KNeighborsClassifier
+        knn = KNeighborsClassifier(n_neighbors=15, n_jobs=-1).fit(
+            X_cluster[~noise], lab[~noise])
+        out[noise] = knn.predict(X_cluster[noise])
+        how = "KNN(k=15) 최근접"
+    print(f"  [noise 편입/{how}] {int(noise.sum()):,}개 → 군집 배정  "
+          f"({time.time()-t:.0f}s)")
+    return out
 
 
 # ══════════════════════════════════════════════════════════════════
 # 3. 분류 건강도 수치 출력
 # ══════════════════════════════════════════════════════════════════
-def print_health(lab, dbcv, persist):
+def print_health(lab, dbcv, persist, title="h0 첫 군집화"):
     ids, cnts = np.unique(lab[lab >= 0], return_counts=True)
     n = len(lab)
     k = len(ids)
@@ -124,7 +159,7 @@ def print_health(lab, dbcv, persist):
     eff_k = float(np.exp(-(p * np.log(p)).sum())) if k else 0.0
 
     print("\n" + "=" * 60)
-    print("  분류 건강도 (h0 첫 군집화)")
+    print(f"  분류 건강도 ({title})")
     print("=" * 60)
     print(f"  군집 수 K        : {k}")
     print(f"  noise 비율       : {noise:.1%}    (낮을수록↑)")
@@ -294,17 +329,26 @@ def main():
     os.makedirs(OUT_DIR, exist_ok=True)
     X_cluster, X_view2d, samp_rows, all_keys, chunks, rng = load_and_prepare()
 
-    lab, dbcv, persist = run_hdbscan(X_cluster)
-    print_health(lab, dbcv, persist)
+    cl, lab, dbcv, persist, impl = run_hdbscan(X_cluster)
+    print_health(lab, dbcv, persist, title="발견 단계 (noise 포함)")
 
-    plot_scatter_2d(X_view2d, lab, rng)
-    plot_representatives(lab, X_cluster, samp_rows, all_keys, chunks, rng)
+    # noise → 최다확률 군집 편입 (soft). 발견 코어는 그대로.
+    if ASSIGN_SOFT:
+        lab_final = assign_noise_soft(cl, lab, X_cluster, impl)
+        print_health(lab_final, dbcv, persist, title="soft 배정 후 (noise 0)")
+    else:
+        lab_final = lab
 
-    # 라벨 저장 (다음 분류 단계의 입력으로 쓸 수 있게)
+    # 시각화·대표패턴·저장은 최종 라벨 기준
+    plot_scatter_2d(X_view2d, lab_final, rng)
+    plot_representatives(lab_final, X_cluster, samp_rows, all_keys, chunks, rng)
+
+    # 라벨 저장 (발견/최종 둘 다 — 다음 분류 단계 입력용)
     np.savez(os.path.join(OUT_DIR, "h0_labels.npz"),
-             rows=samp_rows, labels=lab)
+             rows=samp_rows, labels=lab_final, labels_discovery=lab)
     print(f"\n완료 ({time.time()-t0:.0f}s). 산출물: {OUT_DIR}/")
-    print("  h0_scatter_2d.png / h0_representatives.png / h0_labels.npz")
+    print("  h0_scatter_2d.png / h0_representatives.png / h0_labels.npz "
+          "(labels=최종, labels_discovery=발견)")
 
 
 if __name__ == "__main__":
