@@ -176,8 +176,19 @@ def plot_grid(X_view3d, results, rng):
 # ══════════════════════════════════════════════════════════════════
 # main
 # ══════════════════════════════════════════════════════════════════
+def check_impl():
+    """어느 HDBSCAN 구현을 쓰는지 알려준다. sklearn 내장은 DBCV(nan) 를 못 준다."""
+    try:
+        import hdbscan
+        print(f"HDBSCAN 구현: hdbscan {hdbscan.__version__}  → DBCV 제공 ✓")
+    except ImportError as e:
+        print("HDBSCAN 구현: sklearn 내장  → ⚠ DBCV 미제공(전부 nan)")
+        print(f"  실제 DBCV 를 보려면:  pip install hdbscan   (사유: {e})")
+
+
 def main():
     t0 = time.time()
+    check_impl()
     X_cluster, X_view3d, rng = load_and_prepare()
 
     print(f"\nHDBSCAN {len(CONDITIONS)}개 조건 실행:")
