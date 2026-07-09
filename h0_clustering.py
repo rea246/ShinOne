@@ -56,6 +56,12 @@ MIN_KEEP_COUNT       = 0       # 이 미만 크기 군집 녹임 (0 = 미사용)
 # noise 를 soft 멤버십으로 최다확률(남은) 군집에 편입 (noise 0 으로). 발견 코어는 그대로.
 ASSIGN_SOFT      = True
 
+# 전량 배정: 표본 최종라벨로 KNN 학습 → 전체 유효 h0 를 블록으로 강제 배정(noise 0).
+#   표본은 "발견"용이고, 이건 나머지 전량(1800만)에 같은 정책을 적용하는 2단계.
+ASSIGN_ALL       = True
+ASSIGN_K         = 15          # KNN 이웃 수
+ASSIGN_BLOCK     = 1_000_000   # 블록당 행 수 (메모리 조절)
+
 N_REPS  = 5             # 군집당 대표 패턴 수 (medoid 1 + 랜덤 4)
 
 HOP_COLORS = {0: "#e6194B", 1: "#f58231", 2: "#3cb44b", 3: "#9aa0a6"}
@@ -74,7 +80,8 @@ def load_and_prepare():
     samp_rows = (valid if len(valid) <= SAMPLE
                  else np.sort(rng.choice(valid, SAMPLE, replace=False)))
     X = h0[torch.from_numpy(samp_rows)].numpy().astype(np.float32)
-    X = StandardScaler().fit_transform(X)                    # 8d 표준화
+    scaler = StandardScaler().fit(X)                         # 8d 표준화(전량배정 때 재사용)
+    X = scaler.transform(X)
     print(f"표본 {len(samp_rows):,}개, {X.shape[1]}차원")
 
     if REDUCE_DIM < X.shape[1]:
@@ -83,10 +90,13 @@ def load_and_prepare():
         print(f"군집화 공간: PCA {X.shape[1]}d → {REDUCE_DIM}d "
               f"(설명분산 {pca.explained_variance_ratio_.sum():.0%})")
     else:
+        pca = None
         X_cluster = X
 
     X_view2d = PCA(n_components=2, random_state=SEED).fit_transform(X)  # 시각화용 2D
-    return X_cluster, X_view2d, samp_rows, all_keys, chunks, rng
+    # scaler/pca/h0/valid 는 전량 배정(assign_all) 때 블록 변환에 재사용
+    return (X_cluster, X_view2d, samp_rows, all_keys, chunks, rng,
+            h0, valid, scaler, pca)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -183,6 +193,41 @@ def assign_noise_soft(cl, lab, X_cluster, impl, keep_ids=None):
     print(f"  [noise 편입/{how}] {int(noise.sum()):,}개 → 군집 배정  "
           f"({time.time()-t:.0f}s)")
     return out
+
+
+# ══════════════════════════════════════════════════════════════════
+# 2-d. 전량 배정 — 표본 최종라벨로 KNN 학습 → 전체 유효 h0 블록 예측
+# ══════════════════════════════════════════════════════════════════
+def assign_all_rows(h0, valid, samp_rows, X_cluster, lab_final, scaler, pca):
+    """표본(발견) 최종라벨을 기준으로 전체 유효 h0 를 강제 배정(noise 0).
+    표본 행은 최종라벨 그대로, 나머지만 KNN 블록 예측 (선형)."""
+    from sklearn.neighbors import KNeighborsClassifier
+    t = time.time()
+    knn = KNeighborsClassifier(n_neighbors=ASSIGN_K, n_jobs=-1).fit(X_cluster, lab_final)
+
+    full = np.full(len(valid), -1, dtype=np.int32)
+    pos = np.searchsorted(valid, samp_rows)          # valid 는 정렬됨 → 표본 위치
+    full[pos] = lab_final                            # 표본은 확정 라벨 그대로
+    rest = np.setdiff1d(np.arange(len(valid)), pos, assume_unique=False)
+    print(f"[전량 배정] 유효 {len(valid):,} = 표본 {len(pos):,}(확정) + "
+          f"나머지 {len(rest):,}(KNN k={ASSIGN_K})")
+
+    for s in range(0, len(rest), ASSIGN_BLOCK):
+        bi = rest[s:s + ASSIGN_BLOCK]
+        Xb = h0[torch.from_numpy(valid[bi])].numpy().astype(np.float32)
+        Xb = scaler.transform(Xb)
+        if pca is not None:
+            Xb = pca.transform(Xb).astype(np.float32)
+        full[bi] = knn.predict(Xb)
+        print(f"  [배정] {min(s + len(bi), len(rest)):,}/{len(rest):,}", end="\r")
+        del Xb
+    print()
+    ids, cnts = np.unique(full, return_counts=True)
+    print(f"[전량 완료] noise={int((full < 0).sum()):,}  ({time.time()-t:.0f}s)")
+    print("  전량 군집 크기: " +
+          "  ".join(f"c{int(i)}:{c:,}({c/len(full):.1%})"
+                    for i, c in zip(ids, cnts) if i >= 0))
+    return full
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -367,7 +412,8 @@ def plot_representatives(lab, X_cluster, samp_rows, all_keys, chunks, rng):
 def main():
     t0 = time.time()
     os.makedirs(OUT_DIR, exist_ok=True)
-    X_cluster, X_view2d, samp_rows, all_keys, chunks, rng = load_and_prepare()
+    (X_cluster, X_view2d, samp_rows, all_keys, chunks, rng,
+     h0, valid, scaler, pca) = load_and_prepare()
 
     cl, lab, dbcv, persist, impl = run_hdbscan(X_cluster)
     print_health(lab, dbcv, persist, title="발견 단계 (noise 포함)")
@@ -394,16 +440,24 @@ def main():
     # persist 는 발견 단계 지표라 재번호/재배정 후엔 의미 안 맞음 → None
     print_health(lab_final, dbcv, None, title="필터+soft 배정 후 (최종)")
 
-    # 시각화·대표패턴·저장은 최종 라벨 기준
+    # 시각화·대표패턴·표본 저장은 최종 라벨 기준
     plot_scatter_2d(X_view2d, lab_final, rng)
     plot_representatives(lab_final, X_cluster, samp_rows, all_keys, chunks, rng)
-
-    # 라벨 저장 (발견/최종 둘 다 — 다음 분류 단계 입력용)
     np.savez(os.path.join(OUT_DIR, "h0_labels.npz"),
              rows=samp_rows, labels=lab_final, labels_discovery=lab)
+
+    # ── 전량 배정 (표본 최종라벨 → 전체 유효 h0 강제 배정) ──
+    if ASSIGN_ALL:
+        full = assign_all_rows(h0, valid, samp_rows, X_cluster, lab_final,
+                               scaler, pca)
+        np.savez(os.path.join(OUT_DIR, "h0_labels_full.npz"),
+                 rows=valid, labels=full)
+        print(f"  [저장] h0_labels_full.npz  (rows=전체 유효 global row, "
+              f"labels=군집; 총 {len(valid):,}개)")
+
     print(f"\n완료 ({time.time()-t0:.0f}s). 산출물: {OUT_DIR}/")
-    print("  h0_scatter_2d.png / h0_representatives.png / h0_labels.npz "
-          "(labels=최종, labels_discovery=발견)")
+    print("  h0_scatter_2d.png / h0_representatives.png / h0_labels.npz(표본)"
+          + ("  / h0_labels_full.npz(전량)" if ASSIGN_ALL else ""))
 
 
 if __name__ == "__main__":
