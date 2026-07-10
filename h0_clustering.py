@@ -23,7 +23,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
-from matplotlib import cm
+import seaborn as sns
 
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
@@ -65,6 +65,12 @@ ASSIGN_BLOCK     = 1_000_000   # 블록당 행 수 (메모리 조절)
 N_REPS  = 5             # 군집당 대표 패턴 수 (medoid 1 + 랜덤 4)
 
 HOP_COLORS = {0: "#e6194B", 1: "#f58231", 2: "#3cb44b", 3: "#9aa0a6"}
+
+# 검증된 categorical 팔레트(고정 순서, CVD-safe ΔE 24.2). 색만으로 식별 안 하도록
+#   각 군집에 직접 라벨을 찍는다(relief rule). surface/ink 는 밝은 배경용.
+PALETTE = ["#2a78d6", "#1baf7a", "#eda100", "#008300",
+           "#4a3aa7", "#e34948", "#e87ba4", "#eb6834"]
+SURFACE, INK, INK2, GRID, NOISEC = "#fcfcfb", "#0b0b0b", "#52514e", "#e1e0d9", "#c9c8c2"
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -266,33 +272,47 @@ def print_health(lab, dbcv, persist, title="h0 첫 군집화"):
 # 4. PCA-2D scatter
 # ══════════════════════════════════════════════════════════════════
 def plot_scatter_2d(X_view2d, lab, rng):
+    """군집 색(고정 팔레트) + noise 회색 + 중심 직접라벨 + 카운트 legend (seaborn)."""
+    sns.set_theme(style="white", context="talk")
     n = len(lab)
     draw = (np.arange(n) if n <= SCATTER_MAX
             else np.sort(rng.choice(n, SCATTER_MAX, replace=False)))
-    P = X_view2d
-    ids = np.unique(lab[lab >= 0])
-    colors = cm.tab20(np.linspace(0, 1, max(len(ids), 1)))
+    P, ids = X_view2d, np.unique(lab[lab >= 0])
 
-    fig, ax = plt.subplots(figsize=(11, 9))
-    nm = draw[lab[draw] < 0]
-    ax.scatter(P[nm, 0], P[nm, 1], s=2, c="#cccccc", alpha=0.25,
-               linewidths=0, label=f"noise ({(lab<0).sum():,})")
+    fig, ax = plt.subplots(figsize=(11, 9), facecolor=SURFACE)
+    ax.set_facecolor(SURFACE)
+    nm = draw[lab[draw] < 0]                                    # noise = 배경
+    ax.scatter(P[nm, 0], P[nm, 1], s=5, c=NOISEC, alpha=0.30, linewidths=0, zorder=1)
+
+    handles = []
     for i, cid in enumerate(ids):
+        color = PALETTE[i] if i < len(PALETTE) else "#9a9a94"   # 8개 초과는 회색(fold)
         m = draw[lab[draw] == cid]
-        ax.scatter(P[m, 0], P[m, 1], s=3, color=colors[i], alpha=0.5, linewidths=0)
+        ax.scatter(P[m, 0], P[m, 1], s=7, color=color, alpha=0.65, linewidths=0, zorder=2)
         allm = np.where(lab == cid)[0]
-        ax.text(np.median(P[allm, 0]), np.median(P[allm, 1]),
-                f"c{cid}\n{len(allm):,}", fontsize=9, ha="center", va="center",
-                weight="bold", bbox=dict(boxstyle="round,pad=0.2", fc="white",
-                                         ec=colors[i], alpha=0.85))
-    ax.legend(fontsize=8, loc="upper right")
-    ax.set_title(f"h0 HDBSCAN | K={len(ids)}  noise={(lab<0).mean():.1%}  "
-                 f"(PCA-2D, 표본 {n:,})")
-    ax.set_xlabel("PC1"); ax.set_ylabel("PC2")
-    ax.grid(True, ls=":", alpha=0.3)
+        ax.annotate(f"c{cid}", (np.median(P[allm, 0]), np.median(P[allm, 1])),
+                    ha="center", va="center", fontsize=13, fontweight="bold",
+                    color=INK, zorder=3,
+                    bbox=dict(boxstyle="circle,pad=0.3", fc="white", ec=color,
+                              lw=2, alpha=0.92))
+        handles.append(plt.Line2D([0], [0], marker="o", ls="", mfc=color, mec="none",
+                                  ms=9, label=f"c{cid}  {len(allm):,} ({len(allm)/n:.0%})"))
+    handles.append(plt.Line2D([0], [0], marker="o", ls="", mfc=NOISEC, mec="none",
+                              ms=9, label=f"noise  {(lab<0).sum():,} ({(lab<0).mean():.0%})"))
+
+    ax.legend(handles=handles, loc="center left", bbox_to_anchor=(1.01, 0.5),
+              frameon=False, fontsize=11, labelcolor=INK2,
+              title="cluster", title_fontsize=12)
+    ax.set_title(f"h0 HDBSCAN clusters  ·  K={len(ids)}, noise {(lab<0).mean():.0%}",
+                 fontsize=16, fontweight="bold", color=INK, pad=14)
+    ax.set_xlabel("PC1", color=INK2); ax.set_ylabel("PC2", color=INK2)
+    ax.tick_params(colors=INK2, labelsize=10)
+    ax.grid(True, color=GRID, lw=0.6, alpha=0.7)
+    sns.despine(ax=ax)
     fig.tight_layout()
     path = os.path.join(OUT_DIR, "h0_scatter_2d.png")
-    fig.savefig(path, dpi=130); plt.close(fig)
+    fig.savefig(path, dpi=140, facecolor=SURFACE, bbox_inches="tight")
+    plt.close(fig)
     print(f"  [scatter] {path}")
 
 
