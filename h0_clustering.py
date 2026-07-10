@@ -14,6 +14,7 @@ argv 없음 — 아래 CONFIG 만 고쳐서 실행. core 는 HDBSCAN 이 전부 
 """
 
 import os
+import csv
 import time
 
 import numpy as np
@@ -56,11 +57,13 @@ MIN_KEEP_COUNT       = 0       # 이 미만 크기 군집 녹임 (0 = 미사용)
 # noise 를 soft 멤버십으로 최다확률(남은) 군집에 편입 (noise 0 으로). 발견 코어는 그대로.
 ASSIGN_SOFT      = True
 
-# 전량 배정: 표본 최종라벨로 KNN 학습 → 전체 유효 h0 를 블록으로 강제 배정(noise 0).
-#   표본은 "발견"용이고, 이건 나머지 전량(1800만)에 같은 정책을 적용하는 2단계.
+# 전량 배정: 발견과 "동일한 밀도 잣대"로 전체 유효 h0 배정 → HDBSCAN
+#   membership_vector 의 argmax (녹인 군집 컬럼 제외 → 남은 군집으로만, noise 0).
+#   KNN(기하 최근접) 보다 느리지만, 배정 기준이 군집 정의(밀도)와 일치한다.
+#   (hdbscan 패키지 없으면 KNN 으로 자동 폴백.)
 ASSIGN_ALL       = True
-ASSIGN_K         = 15          # KNN 이웃 수
-ASSIGN_BLOCK     = 1_000_000   # 블록당 행 수 (메모리 조절)
+ASSIGN_K         = 15          # KNN 폴백 시 이웃 수
+ASSIGN_BLOCK     = 500_000     # 블록당 행 수 (membership_vector 는 무거워 작게)
 
 N_REPS  = 5             # 군집당 대표 패턴 수 (medoid 1 + 랜덤 4)
 
@@ -79,6 +82,7 @@ SURFACE, INK, INK2, GRID, NOISEC = "#fcfcfb", "#0b0b0b", "#52514e", "#e1e0d9", "
 def load_and_prepare():
     d = torch.load(CACHE_PATH, map_location="cpu", weights_only=False)
     h0, all_keys, chunks = d["features"]["h0"], d["keys"], d["chunks"]
+    h0_raw = d["features"].get("h0_raw")                     # 중심 raw [w,h] (없으면 None)
     valid = np.where((h0.abs().sum(1) != 0).numpy())[0]      # 빈 hop 제외
     print(f"h0 임베딩: 전체 {h0.shape[0]:,}  유효 {len(valid):,}")
 
@@ -102,7 +106,7 @@ def load_and_prepare():
     X_view2d = PCA(n_components=2, random_state=SEED).fit_transform(X)  # 시각화용 2D
     # scaler/pca/h0/valid 는 전량 배정(assign_all) 때 블록 변환에 재사용
     return (X_cluster, X_view2d, samp_rows, all_keys, chunks, rng,
-            h0, valid, scaler, pca)
+            h0, h0_raw, valid, scaler, pca)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -204,19 +208,29 @@ def assign_noise_soft(cl, lab, X_cluster, impl, keep_ids=None):
 # ══════════════════════════════════════════════════════════════════
 # 2-d. 전량 배정 — 표본 최종라벨로 KNN 학습 → 전체 유효 h0 블록 예측
 # ══════════════════════════════════════════════════════════════════
-def assign_all_rows(h0, valid, samp_rows, X_cluster, lab_final, scaler, pca):
-    """표본(발견) 최종라벨을 기준으로 전체 유효 h0 를 강제 배정(noise 0).
-    표본 행은 최종라벨 그대로, 나머지만 KNN 블록 예측 (선형)."""
-    from sklearn.neighbors import KNeighborsClassifier
+def assign_all_rows(h0, valid, samp_rows, X_cluster, lab_final, final_ids,
+                    cl, impl, scaler, pca):
+    """전량 배정 — 발견과 동일 밀도 잣대(HDBSCAN membership_vector)로.
+    각 블록: scaler→pca→membership_vector → 녹인 군집 컬럼(-inf) 제외 → argmax
+    → 원본 id 를 최종 contiguous 라벨로 매핑. noise 0. 표본 행은 최종라벨 그대로.
+    hdbscan 패키지 없으면(impl='sklearn') KNN 최근접으로 폴백."""
     t = time.time()
-    knn = KNeighborsClassifier(n_neighbors=ASSIGN_K, n_jobs=-1).fit(X_cluster, lab_final)
-
     full = np.full(len(valid), -1, dtype=np.int32)
-    pos = np.searchsorted(valid, samp_rows)          # valid 는 정렬됨 → 표본 위치
+    pos = np.searchsorted(valid, samp_rows)          # valid 정렬됨 → 표본 위치
     full[pos] = lab_final                            # 표본은 확정 라벨 그대로
-    rest = np.setdiff1d(np.arange(len(valid)), pos, assume_unique=False)
-    print(f"[전량 배정] 유효 {len(valid):,} = 표본 {len(pos):,}(확정) + "
-          f"나머지 {len(rest):,}(KNN k={ASSIGN_K})")
+    rest = np.setdiff1d(np.arange(len(valid)), pos)
+    keep = np.asarray(final_ids, dtype=int)          # 원본 kept id(정렬) → contiguous 매핑
+
+    use_mv = (impl == "hdbscan")
+    if use_mv:
+        import hdbscan
+    else:
+        print("  ⚠ sklearn 폴백 → membership_vector 불가, KNN 최근접 사용")
+        from sklearn.neighbors import KNeighborsClassifier
+        knn = KNeighborsClassifier(n_neighbors=ASSIGN_K, n_jobs=-1).fit(X_cluster, lab_final)
+    how = "membership_vector" if use_mv else "KNN 폴백"
+    print(f"[전량 배정/{how}] 유효 {len(valid):,} = 표본 {len(pos):,}(확정) + "
+          f"나머지 {len(rest):,}")
 
     for s in range(0, len(rest), ASSIGN_BLOCK):
         bi = rest[s:s + ASSIGN_BLOCK]
@@ -224,7 +238,16 @@ def assign_all_rows(h0, valid, samp_rows, X_cluster, lab_final, scaler, pca):
         Xb = scaler.transform(Xb)
         if pca is not None:
             Xb = pca.transform(Xb).astype(np.float32)
-        full[bi] = knn.predict(Xb)
+        if use_mv:
+            soft = hdbscan.membership_vector(cl, np.ascontiguousarray(Xb))
+            if soft.ndim == 1:                       # 군집 1개 방어
+                soft = soft.reshape(-1, 1)
+            bias = np.full(soft.shape[1], -np.inf)
+            bias[keep] = 0.0                         # 녹인 군집 컬럼 배제
+            orig = np.argmax(soft + bias[None, :], axis=1)
+            full[bi] = np.searchsorted(keep, orig).astype(np.int32)   # → contiguous
+        else:
+            full[bi] = knn.predict(Xb)
         print(f"  [배정] {min(s + len(bi), len(rest)):,}/{len(rest):,}", end="\r")
         del Xb
     print()
@@ -427,13 +450,49 @@ def plot_representatives(lab, X_cluster, samp_rows, all_keys, chunks, rng):
 
 
 # ══════════════════════════════════════════════════════════════════
+# 6. 군집별 h0 중심 raw 기하 [w,h] 요약 (대략적 그룹 특징)
+# ══════════════════════════════════════════════════════════════════
+def cluster_geometry(lab, samp_rows, h0_raw, out_dir):
+    """각 최종 군집의 h0 중심 raw 기하 [w,h] 평균/표준편차 + 종횡비(h/w).
+    캐시 h0_raw = 중심 hop 노드의 [w,h] (x,y 는 게이지 중심이라 ~0 → 저장 안 됨).
+    → 군집이 '대체로 어떤 크기/납작함의 중심 피처'인지 대략 특징이 보인다."""
+    if h0_raw is None:
+        print("  ⚠ 캐시에 h0_raw 없음 → 군집 기하 요약 생략")
+        return
+    wh = h0_raw[torch.from_numpy(samp_rows)].numpy().astype(np.float64)   # (n,2)=[w,h]
+    ids = np.unique(lab[lab >= 0])
+    print("\n" + "=" * 62)
+    print("  군집별 h0 중심 기하 (w,h)  [x,y ≈ 0 = 게이지 중심]")
+    print("=" * 62)
+    print(f"  {'cluster':>7} {'n':>8} | {'w_mean':>8} {'w_std':>7} | "
+          f"{'h_mean':>8} {'h_std':>7} | {'h/w':>5}")
+    rows = []
+    for cid in ids:
+        m = lab == cid
+        w, h = wh[m, 0], wh[m, 1]
+        ratio = float(h.mean() / w.mean()) if w.mean() else float("nan")
+        print(f"  c{int(cid):<6} {int(m.sum()):>8,} | {w.mean():>8.3f} {w.std():>7.3f} | "
+              f"{h.mean():>8.3f} {h.std():>7.3f} | {ratio:>5.2f}")
+        rows.append((int(cid), int(m.sum()), w.mean(), w.std(),
+                     h.mean(), h.std(), ratio))
+    print("=" * 62)
+    path = os.path.join(out_dir, "h0_cluster_geometry.csv")
+    with open(path, "w", newline="", encoding="utf-8") as fp:
+        wr = csv.writer(fp)
+        wr.writerow(["cluster", "n", "w_mean", "w_std", "h_mean", "h_std", "h_over_w"])
+        for r in rows:
+            wr.writerow([r[0], r[1]] + [f"{v:.4f}" for v in r[2:]])
+    print(f"  [군집 기하] {path}")
+
+
+# ══════════════════════════════════════════════════════════════════
 # main
 # ══════════════════════════════════════════════════════════════════
 def main():
     t0 = time.time()
     os.makedirs(OUT_DIR, exist_ok=True)
     (X_cluster, X_view2d, samp_rows, all_keys, chunks, rng,
-     h0, valid, scaler, pca) = load_and_prepare()
+     h0, h0_raw, valid, scaler, pca) = load_and_prepare()
 
     cl, lab, dbcv, persist, impl = run_hdbscan(X_cluster)
     print_health(lab, dbcv, persist, title="발견 단계 (noise 포함)")
@@ -460,23 +519,27 @@ def main():
     # persist 는 발견 단계 지표라 재번호/재배정 후엔 의미 안 맞음 → None
     print_health(lab_final, dbcv, None, title="필터+soft 배정 후 (최종)")
 
+    # 군집별 h0 중심 raw 기하 요약 (대략적 그룹 특징)
+    cluster_geometry(lab_final, samp_rows, h0_raw, OUT_DIR)
+
     # 시각화·대표패턴·표본 저장은 최종 라벨 기준
     plot_scatter_2d(X_view2d, lab_final, rng)
     plot_representatives(lab_final, X_cluster, samp_rows, all_keys, chunks, rng)
     np.savez(os.path.join(OUT_DIR, "h0_labels.npz"),
              rows=samp_rows, labels=lab_final, labels_discovery=lab)
 
-    # ── 전량 배정 (표본 최종라벨 → 전체 유효 h0 강제 배정) ──
+    # ── 전량 배정 (membership_vector — 발견과 동일 밀도 잣대) ──
     if ASSIGN_ALL:
         full = assign_all_rows(h0, valid, samp_rows, X_cluster, lab_final,
-                               scaler, pca)
+                               final_ids, cl, impl, scaler, pca)
         np.savez(os.path.join(OUT_DIR, "h0_labels_full.npz"),
                  rows=valid, labels=full)
         print(f"  [저장] h0_labels_full.npz  (rows=전체 유효 global row, "
               f"labels=군집; 총 {len(valid):,}개)")
 
     print(f"\n완료 ({time.time()-t0:.0f}s). 산출물: {OUT_DIR}/")
-    print("  h0_scatter_2d.png / h0_representatives.png / h0_labels.npz(표본)"
+    print("  h0_scatter_2d.png / h0_representatives.png / h0_cluster_geometry.csv"
+          " / h0_labels.npz(표본)"
           + ("  / h0_labels_full.npz(전량)" if ASSIGN_ALL else ""))
 
 
