@@ -7,14 +7,14 @@ coverage_visualize.py
 두 종류의 그림을 그린다.
 
   [Plot 1] PCA 2D 산점도 (겹침/비겹침 확인)
-      15차원 → PCA 로 2D 압축 후, Reference 와 Sample 을 seaborn 으로 겹쳐 그린다.
+      N차원 → PCA 로 2D 압축 후, Reference 와 Sample 을 seaborn 으로 겹쳐 그린다.
       산점도 + 각 집단의 2D KDE 등고선을 함께 그려, 두 분포가
       '겹치는 영역' 과 'Sample 이 Reference 를 벗어난 영역' 을 눈으로 구분한다.
 
-  [Plot 2] 차원별 Factor 영향력 (15장)
-      각 차원 d 를 그대로(raw) x축에 두고, 나머지 14차원을 PCA 로 1D 압축해 y축에 둔다.
+  [Plot 2] 차원별 Factor 영향력 (N_FEATURES 장)
+      각 차원 d 를 그대로(raw) x축에 두고, 나머지 (N-1)차원을 PCA 로 1D 압축해 y축에 둔다.
       → "차원 d 를 따라 Sample 과 Reference 가 어떻게 분포/이탈하는지"를
-        차원마다 한 장씩(총 15장) 저장한다.
+        차원마다 한 장씩(총 N_FEATURES 장) 저장한다.
 
 대용량 대응
     Reference(50GB)는 전부 그릴 수 없으므로 common.reservoir_sample_reference 로
@@ -35,12 +35,14 @@ import seaborn as sns
 from sklearn.decomposition import PCA
 
 from common import (
-    DummyDataGenerator, FEATURE_COLS, N_FEATURES,
-    fit_scaler, reservoir_sample_reference,
+    DummyDataGenerator, N_FEATURES,
+    fit_scaler, read_feature_matrix, reservoir_sample_reference,
 )
 
 # =============================================================================
 # CONFIG  ── 실행 파라미터를 여기서 직접 정의한다 (argparse 미사용)
+#   ※ '읽을 컬럼 범위'(FEATURE_COL_IDX)와 헤더 유무(HAS_HEADER)는 common.py 상단에서 설정한다.
+#     (Sample/Reference/모든 스크립트가 동일 컬럼 선택을 공유해야 하므로 한 곳에 둔다)
 # =============================================================================
 SAMPLE_PATH     = "dummy_sample.csv"
 REF_PATH        = "dummy_reference.csv"
@@ -60,9 +62,9 @@ REF_ROWS        = 2_000_000
 # =============================================================================
 def prepare_data():
     """스케일링된 (sample_scaled, ref_scaled) 를 반환한다."""
-    sample_df = pd.read_csv(SAMPLE_PATH)
-    scaler = fit_scaler(sample_df, SCALE_METHOD)
-    sample_scaled = scaler.transform(sample_df[FEATURE_COLS].values)
+    sample = read_feature_matrix(SAMPLE_PATH, fmt="csv")
+    scaler = fit_scaler(sample, SCALE_METHOD)
+    sample_scaled = scaler.transform(sample)
     ref_scaled = reservoir_sample_reference(
         REF_PATH, scaler, PLOT_DOWNSAMPLE, CHUNKSIZE, FMT
     )
@@ -82,7 +84,7 @@ def _labeled_frame(ref_2d, sample_2d, xcol, ycol):
 # =============================================================================
 def plot_pca_2d(sample_scaled, ref_scaled, out_path):
     """
-    15D → PCA 2D 로 투영해 Reference 와 Sample 을 겹쳐 그린다.
+    N차원 → PCA 2D 로 투영해 Reference 와 Sample 을 겹쳐 그린다.
     PCA 는 '모집단' 인 Reference 표본으로 학습하고, Sample 을 같은 축에 투영한다.
     """
     pca = PCA(n_components=2).fit(ref_scaled)
@@ -112,21 +114,21 @@ def plot_pca_2d(sample_scaled, ref_scaled, out_path):
 
 
 # =============================================================================
-# [Plot 2] 차원별 Factor 영향력 — d 는 raw, 나머지 14D 는 PCA 1D 압축 (15장)
+# [Plot 2] 차원별 Factor 영향력 — d 는 raw, 나머지 (N-1)D 는 PCA 1D 압축 (N_FEATURES 장)
 # =============================================================================
 def plot_per_dimension(sample_scaled, ref_scaled, out_dir):
     """
     각 차원 d 마다:
-        x축 = 차원 d 원본값(scaled), y축 = 나머지 14차원의 PC1
+        x축 = 차원 d 원본값(scaled), y축 = 나머지 (N-1)차원의 PC1
     Reference vs Sample 산점도를 한 장씩 저장한다.
     """
     os.makedirs(out_dir, exist_ok=True)
     palette = {"Reference": "#4C72B0", "Sample": "#DD8452"}
 
     for d in range(N_FEATURES):
-        others = [j for j in range(N_FEATURES) if j != d]   # d 를 뺀 14개 축
+        others = [j for j in range(N_FEATURES) if j != d]   # d 를 뺀 나머지 축
 
-        # 나머지 14D 를 PC1 로 압축 (Reference 로 학습 후 양쪽 투영)
+        # 나머지 (N-1)D 를 PC1 로 압축 (Reference 로 학습 후 양쪽 투영)
         pca = PCA(n_components=1).fit(ref_scaled[:, others])
         ref_rest = pca.transform(ref_scaled[:, others]).ravel()
         sam_rest = pca.transform(sample_scaled[:, others]).ravel()
@@ -148,7 +150,7 @@ def plot_per_dimension(sample_scaled, ref_scaled, out_dir):
                         linewidths=1.0, alpha=0.8)
 
         # 제목은 폰트 호환을 위해 ASCII 로 유지 (한글 폰트 미설치 환경에서도 안 깨짐)
-        plt.title(f"Factor f{d:02d}:  raw f{d:02d}  vs  rest-14D PC1 "
+        plt.title(f"Factor f{d:02d}:  raw f{d:02d}  vs  rest-{N_FEATURES-1}D PC1 "
                   f"(rest EVR {evr*100:.1f}%)")
         plt.legend(title="", loc="best")
         plt.tight_layout()
@@ -170,7 +172,7 @@ def run():
     # [Plot 1] PCA 2D 겹침
     plot_pca_2d(sample_scaled, ref_scaled, os.path.join(OUTPUT_DIR, "pca_2d_overlap.png"))
 
-    # [Plot 2] 차원별 Factor 영향력 (15장)
+    # [Plot 2] 차원별 Factor 영향력 (N_FEATURES 장)
     plot_per_dimension(sample_scaled, ref_scaled, os.path.join(OUTPUT_DIR, "per_dimension"))
 
     print(f"\n[완료] 모든 그림 저장 위치: {OUTPUT_DIR}/")

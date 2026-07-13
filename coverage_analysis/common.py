@@ -30,34 +30,78 @@ import numpy as np
 import pandas as pd
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
 
-# ---- 전역 상수 -------------------------------------------------------------
-N_FEATURES = 15
-FEATURE_COLS = [f"f{i:02d}" for i in range(N_FEATURES)]   # ['f00' ... 'f14']
-N_WORKERS = min(8, os.cpu_count() or 1)                   # 기본 병렬 프로세스 수
+# ---- 입력 데이터의 Feature 컬럼 선택 (위치 index 기준) ----------------------
+# 실제 입력 CSV/Parquet 는 '앞쪽 열들' 이 Feature Vector 이고 '뒤쪽 열' 은 사용하지 않는다.
+# 아래 인덱스(0-based, 위치 기준)에 해당하는 열만 읽고, 그 외 열은 아예 파싱하지 않는다.
+#   예) 0~20번째 열이 벡터, 그 뒤는 미사용  →  FEATURE_COL_IDX = list(range(0, 21))
+FEATURE_COL_IDX = list(range(0, 21))     # 0..20 열 = 총 21개 (끝 포함). 20개면 range(0, 20).
+HAS_HEADER      = True                   # 입력 CSV 에 헤더 행이 있으면 True, 없으면 False
+
+# ---- 위 선택에서 자동 산출되는 상수 (직접 수정 불필요) ----------------------
+N_FEATURES   = len(FEATURE_COL_IDX)                        # 실제 사용 차원 수
+FEATURE_COLS = [f"f{i:02d}" for i in range(N_FEATURES)]    # 내부 표준 컬럼명
+N_WORKERS    = min(8, os.cpu_count() or 1)                 # 기본 병렬 프로세스 수
+
+
+def _parquet_feature_names(path):
+    """Parquet 의 '위치 index' 를 실제 컬럼명으로 변환해 선택 대상 이름 목록을 돌려준다."""
+    import pyarrow.parquet as pq
+    all_names = pq.ParquetFile(path).schema_arrow.names
+    return [all_names[i] for i in FEATURE_COL_IDX]
+
+
+def read_feature_matrix(path, fmt=None):
+    """
+    작은 파일(예: Sample) 전체를 읽어 (n, N_FEATURES) float32 배열로 반환한다.
+    FEATURE_COL_IDX 위치의 열만 선택하고 나머지(뒤쪽 미사용 열)는 무시한다.
+    """
+    fmt = fmt or ("parquet" if path.endswith((".parquet", ".pq")) else "csv")
+    if fmt == "csv":
+        # usecols 에 정수 리스트를 주면 '열 위치' 기준으로 선택 (뒤쪽 열은 파싱조차 안 함)
+        df = pd.read_csv(path, usecols=FEATURE_COL_IDX,
+                         header=(0 if HAS_HEADER else None))
+    else:
+        import pyarrow.parquet as pq
+        names = _parquet_feature_names(path)
+        df = pq.read_table(path, columns=names).to_pandas()
+    return df.values.astype(np.float32)
 
 
 # =============================================================================
 # 1. Dummy Data Generator
 # =============================================================================
 class DummyDataGenerator:
-    """15차원 가상 데이터 생성기. 축마다 스케일이 다른(=정규화가 필요한) 상황을 재현한다."""
+    """
+    N차원(기본 N_FEATURES=21) 가상 데이터 생성기. 축마다 스케일이 다른 상황을 재현한다.
+    실제 입력을 모사하기 위해 Feature 열 뒤에 '사용하지 않는 열'(n_extra개)도 함께 써서,
+    위치 기준 컬럼 선택(FEATURE_COL_IDX)이 뒤쪽 열을 제대로 무시하는지 확인할 수 있게 한다.
+    """
 
-    def __init__(self, seed=42):
+    def __init__(self, seed=42, n_extra=3):
         self.rng = np.random.default_rng(seed)
+        self.n_extra = n_extra              # Feature 뒤에 붙일 미사용(junk) 열 개수
         # 축별로 서로 다른 평균/표준편차 → 'feature 마다 스케일이 다르다'는 전제 반영
         self.locs = self.rng.uniform(-5, 5, N_FEATURES) * self.rng.integers(1, 1000, N_FEATURES)
         self.scales = self.rng.uniform(0.5, 3, N_FEATURES) * self.rng.integers(1, 500, N_FEATURES)
 
     def _block(self, n_rows, shift=0.0):
-        """축별 스케일을 반영한 (n_rows, 15) 정규분포 블록. shift 는 분포 이동량."""
+        """축별 스케일을 반영한 (n_rows, N_FEATURES) 정규분포 블록. shift 는 분포 이동량."""
         return self.rng.normal(
             self.locs + shift * self.scales, self.scales, size=(n_rows, N_FEATURES)
         ).astype(np.float32)
 
+    def _frame(self, n_rows, shift=0.0):
+        """Feature 열 + 미사용 열(문자열/숫자)을 붙인 DataFrame. 위치 기준 선택 검증용."""
+        df = pd.DataFrame(self._block(n_rows, shift), columns=FEATURE_COLS)
+        for e in range(self.n_extra):        # 뒤쪽에 '안 쓰는 열' 추가 (일부러 문자열도 섞음)
+            df[f"unused_{e}"] = "junk" if e == 0 else self.rng.random(n_rows)
+        return df
+
     def make_sample(self, path, n_rows=1800):
         """가벼운 Sample Set 을 CSV 로 저장. Reference 대비 살짝 shift → 커버리지 < 100%."""
-        pd.DataFrame(self._block(n_rows, shift=0.3), columns=FEATURE_COLS).to_csv(path, index=False)
-        print(f"[DummyData] Sample 저장: {path} (rows={n_rows})")
+        self._frame(n_rows, shift=0.3).to_csv(path, index=False)
+        print(f"[DummyData] Sample 저장: {path} (rows={n_rows}, "
+              f"feature={N_FEATURES} + unused={self.n_extra})")
         return path
 
     def make_reference(self, path, total_rows=2_000_000, rows_per_block=200_000, fmt="csv"):
@@ -69,7 +113,7 @@ class DummyDataGenerator:
         try:
             for b in range(n_blocks):
                 n = min(rows_per_block, total_rows - b * rows_per_block)
-                df = pd.DataFrame(self._block(n), columns=FEATURE_COLS)
+                df = self._frame(n)
                 if fmt == "csv":
                     df.to_csv(path, mode="a", header=(b == 0), index=False)
                 else:
@@ -88,11 +132,12 @@ class DummyDataGenerator:
 # =============================================================================
 # 2. 스케일러 학습 (Sample Set 기준)
 # =============================================================================
-def fit_scaler(sample_df, method="minmax"):
-    """Sample Set 으로 스케일러를 학습한다. method: 'minmax' 또는 'standard'."""
+def fit_scaler(sample, method="minmax"):
+    """Sample Set(배열 (n, N_FEATURES))으로 스케일러를 학습한다. method: 'minmax'|'standard'."""
+    X = sample.values if hasattr(sample, "values") else np.asarray(sample)
     scaler = MinMaxScaler() if method == "minmax" else StandardScaler()
-    scaler.fit(sample_df[FEATURE_COLS].values)
-    print(f"[Scaler] Sample 기준 '{method}' 스케일러 학습 완료.")
+    scaler.fit(X)
+    print(f"[Scaler] Sample 기준 '{method}' 스케일러 학습 완료. (dim={X.shape[1]})")
     return scaler
 
 
@@ -100,15 +145,21 @@ def fit_scaler(sample_df, method="minmax"):
 # 3. 대용량 Reference chunk 스트리밍 (스케일링 포함)
 # =============================================================================
 def iter_reference_chunks(ref_path, scaler, chunksize=200_000, fmt=None):
-    """Reference 를 chunk 단위로 읽어 scaler 로 변환한 numpy 배열을 yield 한다."""
+    """
+    Reference 를 chunk 단위로 읽어 scaler 로 변환한 numpy 배열을 yield 한다.
+    FEATURE_COL_IDX 위치의 열만 읽고, 뒤쪽 미사용 열은 무시한다.
+    """
     fmt = fmt or ("parquet" if ref_path.endswith((".parquet", ".pq")) else "csv")
     if fmt == "csv":
-        for chunk in pd.read_csv(ref_path, chunksize=chunksize, usecols=FEATURE_COLS):
-            yield scaler.transform(chunk[FEATURE_COLS].values)
+        reader = pd.read_csv(ref_path, chunksize=chunksize,
+                             usecols=FEATURE_COL_IDX, header=(0 if HAS_HEADER else None))
+        for chunk in reader:                       # chunk 는 선택 열만, 오름차순 위치 순서
+            yield scaler.transform(chunk.values)
     else:
         import pyarrow.parquet as pq
-        for batch in pq.ParquetFile(ref_path).iter_batches(batch_size=chunksize, columns=FEATURE_COLS):
-            yield scaler.transform(batch.to_pandas()[FEATURE_COLS].values)
+        names = _parquet_feature_names(ref_path)
+        for batch in pq.ParquetFile(ref_path).iter_batches(batch_size=chunksize, columns=names):
+            yield scaler.transform(batch.to_pandas().values)
 
 
 # =============================================================================
@@ -159,10 +210,11 @@ def _rowgroup_reduce(task):
     ref_path, rg_indices, scaler, map_fn, reduce_fn, init_factory = task
     import pyarrow.parquet as pq
     pf = pq.ParquetFile(ref_path)
+    names = _parquet_feature_names(ref_path)          # 위치 index → 실제 컬럼명
     acc = init_factory()
     for rg in rg_indices:
-        tbl = pf.read_row_group(rg, columns=FEATURE_COLS)
-        X = scaler.transform(tbl.to_pandas()[FEATURE_COLS].values)
+        tbl = pf.read_row_group(rg, columns=names)
+        X = scaler.transform(tbl.to_pandas().values)
         acc = reduce_fn(acc, map_fn(X))
     return acc
 

@@ -1,7 +1,8 @@
-# 15차원 공간 커버리지 분석 (Coverage Analysis)
+# 다차원 공간 커버리지 분석 (Coverage Analysis)
 
-15차원 반도체/EDA Feature Vector 데이터셋에 대해, 대용량(약 50GB) **Reference Set** 대비
+N차원 반도체/EDA Feature Vector 데이터셋에 대해, 대용량(약 50GB) **Reference Set** 대비
 1,800행 **Sample Set** 의 공간 커버리지를 계산하는 베이스라인 코드.
+(차원 수는 입력 컬럼 선택으로 결정 — 아래 *입력 컬럼 설정* 참고. 기본값은 21차원.)
 
 ## 구성
 
@@ -12,13 +13,29 @@
 | `coverage_density.py` | **알고리즘 B** — 확률 밀도(KDE/GMM) 기반 커버리지 |
 | `coverage_visualize.py` | **시각화** — PCA 2D 겹침 그림 + 차원별 Factor 영향력 그림(15장) |
 
+## 입력 컬럼 설정 (중요)
+
+입력 CSV/Parquet 에서 **앞쪽 열들만 Feature Vector 이고 뒤쪽 열은 사용하지 않는** 경우가 많다.
+읽을 컬럼은 `common.py` 상단에서 **위치(index) 기준**으로 한 곳에서 지정한다
+(Sample·Reference·모든 스크립트가 동일 선택을 공유해야 하므로):
+
+```python
+# common.py
+FEATURE_COL_IDX = list(range(0, 21))   # 0~20번째 열(총 21개)만 사용, 그 뒤 열은 무시
+HAS_HEADER      = True                  # CSV 에 헤더 행이 있으면 True, 없으면 False
+# N_FEATURES 는 위 선택에서 자동 산출 (여기선 21)
+```
+
+- `usecols` 로 **선택한 열만 파싱**하므로, 뒤쪽 미사용 열은 문자열이어도 안전하게 무시된다.
+- 20개만 쓰려면 `range(0, 20)`, 특정 열만 쓰려면 임의 인덱스 리스트(예: `[0,1,2,5,8]`)도 가능.
+
 ## 핵심 설계
 
 - **메모리 안전**: Reference(50GB)는 절대 한 번에 로드하지 않는다.
   - CSV → `pandas.read_csv(chunksize=...)`, Parquet → `pyarrow.iter_batches(batch_size=...)`
 - **정규화 기준은 Sample Set**: Sample 으로 스케일러를 `fit` 한 뒤, 동일 스케일러를 Reference 에 `transform`.
-- **차원의 저주 대응 (알고리즘 A)**: 축당 Bin 을 3~5개로 거칠게 이산화하고, 전체 격자 배열(N^15) 대신
-  "실제로 점유된 격자 좌표 tuple 의 `set`"만 관리(Sparse).
+- **차원의 저주 대응 (알고리즘 A)**: 축당 Bin 을 3~5개로 거칠게 이산화하고, 전체 격자 배열(Bin^차원) 대신
+  "실제로 점유된 격자 좌표의 `set`"만 관리(Sparse).
 - **Downsampling (알고리즘 B)**: 단일 스트리밍 패스에서 **Reservoir Sampling**으로 균일하게 10만~50만 행만 추출해
   KDE/GMM 학습에 사용. 메모리는 O(k) 고정.
 - **병렬화 = 멀티프로세스 (스레드 아님)**: CPython 의 GIL 때문에 pandas CSV 파싱 / KDE 스코어링 같은

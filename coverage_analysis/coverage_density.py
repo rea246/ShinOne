@@ -23,17 +23,18 @@ Reference 분포의 PDF 를 학습하고, 1,800 Sample 이 '고밀도 영역' �
 import os
 
 import numpy as np
-import pandas as pd
 from sklearn.mixture import GaussianMixture
 from sklearn.neighbors import KernelDensity
 
 from common import (
-    DummyDataGenerator, FEATURE_COLS, N_WORKERS,
-    fit_scaler, reservoir_sample_reference, parallel_score,
+    DummyDataGenerator, N_WORKERS,
+    fit_scaler, read_feature_matrix, reservoir_sample_reference, parallel_score,
 )
 
 # =============================================================================
 # CONFIG  ── 실행 파라미터를 여기서 직접 정의한다 (argparse 미사용)
+#   ※ '읽을 컬럼 범위'(FEATURE_COL_IDX)와 헤더 유무(HAS_HEADER)는 common.py 상단에서 설정한다.
+#     (Sample/Reference/모든 스크립트가 동일 컬럼 선택을 공유해야 하므로 한 곳에 둔다)
 # =============================================================================
 SAMPLE_PATH   = "dummy_sample.csv"
 REF_PATH      = "dummy_reference.csv"
@@ -73,10 +74,10 @@ def fit_model(samples):
 # 2. 메인 파이프라인
 # =============================================================================
 def run():
-    # (1) Sample 로드 → (2) Sample 기준 스케일러 학습
-    sample_df = pd.read_csv(SAMPLE_PATH)
-    scaler = fit_scaler(sample_df, SCALE_METHOD)
-    sample_scaled = scaler.transform(sample_df[FEATURE_COLS].values)
+    # (1) Sample 로드(위치 기준 열 선택) → (2) Sample 기준 스케일러 학습
+    sample = read_feature_matrix(SAMPLE_PATH, fmt="csv")
+    scaler = fit_scaler(sample, SCALE_METHOD)
+    sample_scaled = scaler.transform(sample)
 
     # (3) Reference Downsampling → (4) 밀도 모델 학습
     ref_samples = reservoir_sample_reference(REF_PATH, scaler, DOWNSAMPLE_K, CHUNKSIZE, FMT)
