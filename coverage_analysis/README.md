@@ -34,8 +34,13 @@ HAS_HEADER      = True                  # CSV 에 헤더 행이 있으면 True, 
 - **메모리 안전**: Reference(50GB)는 절대 한 번에 로드하지 않는다.
   - CSV → `pandas.read_csv(chunksize=...)`, Parquet → `pyarrow.iter_batches(batch_size=...)`
 - **정규화 기준은 Sample Set**: Sample 으로 스케일러를 `fit` 한 뒤, 동일 스케일러를 Reference 에 `transform`.
-- **차원의 저주 대응 (알고리즘 A)**: 축당 Bin 을 3~5개로 거칠게 이산화하고, 전체 격자 배열(Bin^차원) 대신
-  "실제로 점유된 격자 좌표의 `set`"만 관리(Sparse).
+- **차원의 저주 대응 (알고리즘 A) — PCA 축소**: N차원 전체 축을 그대로 격자화하면 고차원 Sparsity 로
+  교집합이 0 이 되어 Coverage 가 0% 로 수렴한다. 이를 막기 위해 **Sample 로 PCA 를 학습해 누적 설명분산이
+  90%(`VAR_THRESHOLD`)를 넘는 최소 주성분 수 K 만 남기고**(그 PCA 를 Reference 에도 공유), 축소된 PC 공간에서
+  격자화한다. PC 축마다 스케일이 다르므로 **Sample PC 좌표의 축별 [min,max] 로 축마다 개별 Bin 경계**를 만든다.
+  격자 배열(Bin^K) 대신 "실제 점유 격자의 `set`"만 관리(Sparse). 선택된 K 는 실행 로그에 출력된다.
+  - 검증용으로 상위 2개 주성분(2D) 커버리지도 함께 계산하고 `coverage_plots/bincount_2d_coverage.png` 로
+    2D 격자 점유(Reference 칸 / Sample∩Ref 칸)를 그려 저장한다. (K차원·2차원 집계는 스트리밍 **한 패스**로 동시 수행)
 - **Downsampling (알고리즘 B)**: 단일 스트리밍 패스에서 **Reservoir Sampling**으로 균일하게 10만~50만 행만 추출해
   KDE/GMM 학습에 사용. 메모리는 O(k) 고정.
 - **병렬화 = 멀티프로세스 (스레드 아님)**: CPython 의 GIL 때문에 pandas CSV 파싱 / KDE 스코어링 같은
@@ -65,11 +70,11 @@ python coverage_visualize.py    # 필요 시 pip install matplotlib seaborn
 
 ### 시각화 (`coverage_visualize.py`)
 
-- **Plot 1 — `coverage_plots/pca_2d_overlap.png`**: 15D → PCA 2D 투영 후 Reference(모집단 표본)와
+- **Plot 1 — `coverage_plots/pca_2d_overlap.png`**: N차원 → PCA 2D 투영 후 Reference(모집단 표본)와
   Sample 을 seaborn 산점도 + 각 집단 2D KDE 등고선으로 겹쳐 그린다. → 두 분포가 **겹치는 영역**과
   Sample 이 Reference 를 **벗어난 영역**을 눈으로 구분.
-- **Plot 2 — `coverage_plots/per_dimension/factor_fNN.png` (15장)**: 차원 `d` 를 그대로 x축에 두고
-  **나머지 14차원을 PCA 로 1D 압축**해 y축에 둔 산점도를 차원마다 한 장씩 저장. → 각 Factor 축을 따라
+- **Plot 2 — `coverage_plots/per_dimension/factor_fNN.png` (N_FEATURES 장)**: 차원 `d` 를 그대로 x축에 두고
+  **나머지 (N-1)차원을 PCA 로 1D 압축**해 y축에 둔 산점도를 차원마다 한 장씩 저장. → 각 Factor 축을 따라
   Sample/Reference 의 분포·이탈을 개별 확인.
 - Reference(50GB)는 `reservoir_sample_reference` 로 `PLOT_DOWNSAMPLE` 개만 균일 추출해 그린다.
 - 그림 텍스트는 폰트 호환을 위해 ASCII(영문) 로 표기(한글 폰트 미설치 환경에서도 안 깨짐).
@@ -80,6 +85,7 @@ python coverage_visualize.py    # 필요 시 pip install matplotlib seaborn
 
 ## 지표
 
-- **알고리즘 A**: `Coverage = |Set_sam ∩ Set_ref| / |Set_ref|`
+- **알고리즘 A**: `Coverage = |Set_sam ∩ Set_ref| / |Set_ref|` (PCA 90% 축소된 K차원 PC 격자 위에서 계산;
+  검증용 2차원 커버리지도 함께 출력).
 - **알고리즘 B**: Sample 평균 log-likelihood + Reference 분포에서 데이터 기반으로 정한
   Threshold(하위 `threshold_pct`% 분위수) 이상을 만족하는 Sample 비율.
