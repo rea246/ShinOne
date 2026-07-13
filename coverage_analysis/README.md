@@ -11,7 +11,8 @@ N차원 반도체/EDA Feature Vector 데이터셋에 대해, 대용량(약 50GB)
 | `common.py` | 공통 유틸: 더미 데이터 생성기, Sample 기준 스케일러 학습, 대용량 파일 chunk 스트리밍 |
 | `coverage_bincount.py` | **알고리즘 A** — BIN COUNT 기반 격자 점유 커버리지 (Grid-based Occupancy) |
 | `coverage_density.py` | **알고리즘 B** — 확률 밀도(KDE/GMM) 기반 커버리지 |
-| `coverage_visualize.py` | **시각화** — PCA 2D 겹침 그림 + 차원별 Factor 영향력 그림(15장) |
+| `coverage_domain.py` | **Domain Coverage** — 물리 스펙(Spec Bounds) 기준 커버리지 + UMAP/PCA 시각화 |
+| `coverage_visualize.py` | **시각화** — PCA 2D 겹침 그림 + 차원별 Factor 영향력 그림(N_FEATURES 장) |
 
 ## 입력 컬럼 설정 (중요)
 
@@ -91,9 +92,28 @@ python coverage_visualize.py    # 필요 시 pip install matplotlib seaborn
 `GEN_DUMMY = False` 로 둔다. 주요 CONFIG: `SCALE_METHOD`('minmax'|'standard'), `CHUNKSIZE`,
 `N_BINS`(A), `MODEL_TYPE`/`DOWNSAMPLE_K`/`THRESHOLD_PCT`(B), `N_WORKERS`(공통, 기본 CPU 수).
 
+## Domain Coverage (`coverage_domain.py`)
+
+데이터 분포가 아니라 **물리적 설계 스펙(Spec Bounds)**을 기준으로 삼는다. 각 피처의 Lower/Upper Spec 이
+이루는 N차원 초입방체를 `N_BINS` 로 균등 분할해 **가상의 도메인 격자 `Set_domain`(= `N_BINS^N_FEATURES`,
+데이터가 없어도 분모에 포함)**을 정의하고:
+
+- `Reference Domain Coverage = |Set_ref ∩ Set_domain| / |Set_domain|` (스펙 대비 Reference 밀집도)
+- `Sample Domain Coverage    = |Set_sam ∩ Set_domain| / |Set_domain|` (스펙 대비 Sample 검증 영역)
+- 스펙 경계를 벗어난 점은 Out-of-Spec 으로 격자에서 제외(비율도 함께 출력).
+
+스펙 경계는 `SPEC_LOWER`/`SPEC_UPPER` 에 물리값을 직접 넣거나, `None` 이면 `SPEC_MODE`('minmax'|'4sigma')로
+Sample 분포에서 자동 정의. 도메인 격자 집계는 `parallel_reduce_reference` 로 **한 스트리밍 패스**(스펙초과 카운트 포함).
+- 시각화: Sample + Reference 하이라이트 표본만으로 **UMAP·PCA 2D** 를 각각 임베딩해
+  `domain_coverage_umap.png` / `domain_coverage_pca.png` 저장. 격자 영역을 (회색=스펙 공백 / 연파랑=Reference only /
+  주황=Sample∩Ref 검증완료)로 칠하고 공간 테두리를 그린다. (UMAP 미설치 시 PCA 만 생성)
+- 주의: 21차원 스펙 격자라 절대 Domain Coverage 값은 매우 작다(예 ~1e-8). 실무 해석은
+  "Sample 이 Reference footprint 를 검증한 비율" 과 "Out-of-Spec 비율" 을 함께 본다.
+
 ## 지표
 
 - **알고리즘 A**: `Coverage = |Set_sam ∩ Set_ref| / |Set_ref|` (PCA 90% 축소된 K차원 PC 격자 위에서 계산;
-  검증용 2차원 커버리지도 함께 출력).
+  검증용 2차원·커스텀 2D·축별 1D 커버리지도 함께 출력).
 - **알고리즘 B**: Sample 평균 log-likelihood + Reference 분포에서 데이터 기반으로 정한
   Threshold(하위 `threshold_pct`% 분위수) 이상을 만족하는 Sample 비율.
+- **Domain Coverage**: 위 물리 스펙 기준 두 커버리지 + Out-of-Spec 비율.
