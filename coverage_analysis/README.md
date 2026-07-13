@@ -20,27 +20,31 @@
   "실제로 점유된 격자 좌표 tuple 의 `set`"만 관리(Sparse).
 - **Downsampling (알고리즘 B)**: 단일 스트리밍 패스에서 **Reservoir Sampling**으로 균일하게 10만~50만 행만 추출해
   KDE/GMM 학습에 사용. 메모리는 O(k) 고정.
+- **병렬화 = 멀티프로세스 (스레드 아님)**: CPython 의 GIL 때문에 pandas CSV 파싱 / KDE 스코어링 같은
+  CPU 작업은 스레드로는 거의 안 빨라진다(실측 ~1.0x). `ProcessPoolExecutor` 로 각 프로세스가 독립 GIL 을
+  가질 때에만 멀티코어로 실제 단축된다(실측 2~4x).
+  - 알고리즘 A: **Parquet** Reference 는 row group 을 프로세스에 분배해 병렬 집계. (CSV 는 분할이 어려워 단일 패스)
+  - 알고리즘 B: KDE `score_samples` 를 프로세스로 분할 병렬.
+  - → **50GB 급 데이터는 Parquet 포맷을 권장** (병렬 + 빠른 파싱).
 
 ## 실행
+
+파라미터는 CLI 인자가 아니라 각 스크립트 상단의 `# CONFIG` 블록 변수로 지정한다 (argparse 미사용).
+값을 바꾸려면 해당 변수를 직접 편집한다.
 
 ```bash
 pip install numpy pandas scikit-learn pyarrow
 
-# 알고리즘 A (더미 데이터 자동 생성)
-python coverage_bincount.py --gen --n_bins 4
+# 알고리즘 A — 상단 CONFIG(N_BINS, FMT, N_WORKERS_A ...) 편집 후:
+python coverage_bincount.py
 
-# 알고리즘 B — KDE
-python coverage_density.py --gen --model kde --downsample_k 200000
-
-# 알고리즘 B — GMM
-python coverage_density.py --gen --model gmm --n_components 32
-
-# 실제 데이터 사용 (Parquet 예시)
-python coverage_bincount.py --sample sample.csv --ref reference.parquet --fmt parquet
+# 알고리즘 B — 상단 CONFIG(MODEL_TYPE='kde'|'gmm', DOWNSAMPLE_K ...) 편집 후:
+python coverage_density.py
 ```
 
-주요 옵션: `--fmt {csv,parquet}`, `--chunksize`, `--scale {minmax,standard}`,
-`--ref_rows`(더미 크기), `--threshold_pct`(알고리즘 B 고밀도 컷오프 분위수).
+실제 데이터를 쓰려면 `SAMPLE_PATH`, `REF_PATH`, `FMT`('csv'|'parquet') 를 실제 경로로 바꾸고
+`GEN_DUMMY = False` 로 둔다. 주요 CONFIG: `SCALE_METHOD`('minmax'|'standard'), `CHUNKSIZE`,
+`N_BINS`(A), `MODEL_TYPE`/`DOWNSAMPLE_K`/`THRESHOLD_PCT`(B), `N_WORKERS`(공통, 기본 CPU 수).
 
 ## 지표
 
