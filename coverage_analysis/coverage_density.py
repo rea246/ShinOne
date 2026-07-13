@@ -29,7 +29,7 @@ from sklearn.neighbors import KernelDensity
 
 from common import (
     DummyDataGenerator, FEATURE_COLS, N_WORKERS,
-    fit_scaler, iter_reference_chunks, parallel_score,
+    fit_scaler, reservoir_sample_reference, parallel_score,
 )
 
 # =============================================================================
@@ -53,36 +53,8 @@ REF_ROWS      = 2_000_000
 
 
 # =============================================================================
-# 1. Reservoir Sampling — 단일 스트리밍 패스로 균일 k개 추출 (메모리 O(k))
-# =============================================================================
-def reservoir_sample(ref_path, scaler, k, seed=0):
-    """Reference 를 chunk 스트리밍하며 전체에서 균일하게 k개 행을 추출한다."""
-    rng = np.random.default_rng(seed)
-    reservoir = np.empty((k, len(FEATURE_COLS)), dtype=np.float32)
-    filled = seen = 0
-    for chunk in iter_reference_chunks(ref_path, scaler, CHUNKSIZE, FMT):
-        # (A) reservoir 가 아직 안 찼으면 우선 채운다
-        if filled < k:
-            take = min(k - filled, len(chunk))
-            reservoir[filled:filled + take] = chunk[:take]
-            filled += take
-            seen += take
-            chunk = chunk[take:]
-            if len(chunk) == 0:
-                continue
-        # (B) 가득 찬 상태: t번째 행을 확률 k/t 로 임의 슬롯과 교체 (Algorithm R)
-        t = seen + np.arange(1, len(chunk) + 1)
-        accept = rng.random(len(chunk)) < (k / t)
-        if accept.any():
-            reservoir[rng.integers(0, k, accept.sum())] = chunk[accept]
-        seen += len(chunk)
-    reservoir = reservoir[:filled]
-    print(f"[Density] Reservoir Sampling: 전체 {seen:,} rows → {len(reservoir):,} rows 추출.")
-    return reservoir
-
-
-# =============================================================================
-# 2. 밀도 모델 학습 (KDE / GMM) — 둘 다 score_samples = log-likelihood 로 통일
+# 1. 밀도 모델 학습 (KDE / GMM) — 둘 다 score_samples = log-likelihood 로 통일
+#    (Reference Downsampling 은 common.reservoir_sample_reference 를 공용 사용)
 # =============================================================================
 def fit_model(samples):
     if MODEL_TYPE == "kde":
@@ -98,7 +70,7 @@ def fit_model(samples):
 
 
 # =============================================================================
-# 3. 메인 파이프라인
+# 2. 메인 파이프라인
 # =============================================================================
 def run():
     # (1) Sample 로드 → (2) Sample 기준 스케일러 학습
@@ -107,7 +79,7 @@ def run():
     sample_scaled = scaler.transform(sample_df[FEATURE_COLS].values)
 
     # (3) Reference Downsampling → (4) 밀도 모델 학습
-    ref_samples = reservoir_sample(REF_PATH, scaler, DOWNSAMPLE_K)
+    ref_samples = reservoir_sample_reference(REF_PATH, scaler, DOWNSAMPLE_K, CHUNKSIZE, FMT)
     model = fit_model(ref_samples)
 
     # (5) Threshold: Reference 서브샘플의 log-likelihood 하위 THRESHOLD_PCT% 지점

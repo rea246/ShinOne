@@ -13,3 +13,8 @@ __pycache__/
 # Verification plot outputs
 preproc_check/
 synth/
+
+# Coverage analysis generated artifacts
+coverage_analysis/coverage_plots/
+coverage_analysis/dummy_sample.csv
+coverage_analysis/dummy_reference.*

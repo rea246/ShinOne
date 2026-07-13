@@ -10,6 +10,7 @@
 | `common.py` | 공통 유틸: 더미 데이터 생성기, Sample 기준 스케일러 학습, 대용량 파일 chunk 스트리밍 |
 | `coverage_bincount.py` | **알고리즘 A** — BIN COUNT 기반 격자 점유 커버리지 (Grid-based Occupancy) |
 | `coverage_density.py` | **알고리즘 B** — 확률 밀도(KDE/GMM) 기반 커버리지 |
+| `coverage_visualize.py` | **시각화** — PCA 2D 겹침 그림 + 차원별 Factor 영향력 그림(15장) |
 
 ## 핵심 설계
 
@@ -40,7 +41,21 @@ python coverage_bincount.py
 
 # 알고리즘 B — 상단 CONFIG(MODEL_TYPE='kde'|'gmm', DOWNSAMPLE_K ...) 편집 후:
 python coverage_density.py
+
+# 시각화 — 상단 CONFIG(PLOT_DOWNSAMPLE, OUTPUT_DIR ...) 편집 후:
+python coverage_visualize.py    # 필요 시 pip install matplotlib seaborn
 ```
+
+### 시각화 (`coverage_visualize.py`)
+
+- **Plot 1 — `coverage_plots/pca_2d_overlap.png`**: 15D → PCA 2D 투영 후 Reference(모집단 표본)와
+  Sample 을 seaborn 산점도 + 각 집단 2D KDE 등고선으로 겹쳐 그린다. → 두 분포가 **겹치는 영역**과
+  Sample 이 Reference 를 **벗어난 영역**을 눈으로 구분.
+- **Plot 2 — `coverage_plots/per_dimension/factor_fNN.png` (15장)**: 차원 `d` 를 그대로 x축에 두고
+  **나머지 14차원을 PCA 로 1D 압축**해 y축에 둔 산점도를 차원마다 한 장씩 저장. → 각 Factor 축을 따라
+  Sample/Reference 의 분포·이탈을 개별 확인.
+- Reference(50GB)는 `reservoir_sample_reference` 로 `PLOT_DOWNSAMPLE` 개만 균일 추출해 그린다.
+- 그림 텍스트는 폰트 호환을 위해 ASCII(영문) 로 표기(한글 폰트 미설치 환경에서도 안 깨짐).
 
 실제 데이터를 쓰려면 `SAMPLE_PATH`, `REF_PATH`, `FMT`('csv'|'parquet') 를 실제 경로로 바꾸고
 `GEN_DUMMY = False` 로 둔다. 주요 CONFIG: `SCALE_METHOD`('minmax'|'standard'), `CHUNKSIZE`,

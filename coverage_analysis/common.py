@@ -112,6 +112,36 @@ def iter_reference_chunks(ref_path, scaler, chunksize=200_000, fmt=None):
 
 
 # =============================================================================
+# 3-b. Reservoir Sampling — 단일 스트리밍 패스로 균일 k개 추출 (메모리 O(k))
+#      밀도 모델 학습(알고리즘 B)과 시각화(PCA)에서 공용으로 쓴다.
+# =============================================================================
+def reservoir_sample_reference(ref_path, scaler, k, chunksize=200_000, fmt=None, seed=0):
+    """Reference 를 chunk 스트리밍하며 전체에서 균일하게 k개 행을 추출한다 (Algorithm R)."""
+    rng = np.random.default_rng(seed)
+    reservoir = np.empty((k, N_FEATURES), dtype=np.float32)
+    filled = seen = 0
+    for chunk in iter_reference_chunks(ref_path, scaler, chunksize, fmt):
+        # (A) reservoir 가 아직 안 찼으면 우선 채운다
+        if filled < k:
+            take = min(k - filled, len(chunk))
+            reservoir[filled:filled + take] = chunk[:take]
+            filled += take
+            seen += take
+            chunk = chunk[take:]
+            if len(chunk) == 0:
+                continue
+        # (B) 가득 찬 상태: t번째 행을 확률 k/t 로 임의 슬롯과 교체
+        t = seen + np.arange(1, len(chunk) + 1)
+        accept = rng.random(len(chunk)) < (k / t)
+        if accept.any():
+            reservoir[rng.integers(0, k, accept.sum())] = chunk[accept]
+        seen += len(chunk)
+    reservoir = reservoir[:filled]
+    print(f"[Reservoir] 전체 {seen:,} rows → {len(reservoir):,} rows 추출.")
+    return reservoir
+
+
+# =============================================================================
 # 4. Reference map→reduce 집계 (Parquet 는 프로세스 병렬)
 #    map_fn / reduce_fn / init_factory 는 반드시 '모듈 최상위 함수' 여야 pickle 가능.
 #    - map_fn(X)           : 스케일링된 chunk(np.ndarray) → 부분 결과
