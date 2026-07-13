@@ -39,8 +39,16 @@ HAS_HEADER      = True                  # CSV 에 헤더 행이 있으면 True, 
   90%(`VAR_THRESHOLD`)를 넘는 최소 주성분 수 K 만 남기고**(그 PCA 를 Reference 에도 공유), 축소된 PC 공간에서
   격자화한다. PC 축마다 스케일이 다르므로 **Sample PC 좌표의 축별 [min,max] 로 축마다 개별 Bin 경계**를 만든다.
   격자 배열(Bin^K) 대신 "실제 점유 격자의 `set`"만 관리(Sparse). 선택된 K 는 실행 로그에 출력된다.
-  - 검증용으로 상위 2개 주성분(2D) 커버리지도 함께 계산하고 `coverage_plots/bincount_2d_coverage.png` 로
-    2D 격자 점유(Reference 칸 / Sample∩Ref 칸)를 그려 저장한다. (K차원·2차원 집계는 스트리밍 **한 패스**로 동시 수행)
+  - **한 번의 스트리밍 패스**로 아래 4종을 동시 집계한다 (map 이 4종 부분결과 반환 → reduce 가 각각 합침;
+    `parallel_reduce_reference` 구조 유지):
+    1. `bincount_2d_coverage.png` — 전통적 2D PCA(PC1 vs PC2) 격자 커버리지.
+    2. `custom_2d_coverage.png` — **원본 핵심 피처 1개(`RAW_FEATURE_IDX`)를 X축에 그대로 살리고**,
+       나머지 (N-1)차원을 `PCA(n=1)`로 압축해 Y축에 둔 커버리지. 축의 물리적 의미를 보존하며,
+       "나머지 차원을 1D로 압축했을 때의 설명 분산 비율(EVR)"을 로그·타이틀에 명시.
+    3. `per_axis_coverage.png` — **축(피처)별 완전 독립 1D bin-count 커버리지** (Bin=`PER_AXIS_BINS`).
+       21개 피처 각각 `|sam_bins ∩ ref_bins| / |ref_bins|` 를 구해, 취약 축 오름차순으로 터미널 출력 +
+       가로 막대 차트로 저장. → 어느 Feature 축에 Sample 공백(구멍)이 있는지 진단.
+    (1D 축별 커버리지는 차원의 저주가 없어 `N_BINS` 보다 촘촘한 `PER_AXIS_BINS` 를 쓴다.)
 - **Downsampling (알고리즘 B)**: 단일 스트리밍 패스에서 **Reservoir Sampling**으로 균일하게 10만~50만 행만 추출해
   KDE/GMM 학습에 사용. 메모리는 O(k) 고정.
 - **병렬화 = 멀티프로세스 (스레드 아님)**: CPython 의 GIL 때문에 pandas CSV 파싱 / KDE 스코어링 같은
