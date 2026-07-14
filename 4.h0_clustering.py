@@ -22,6 +22,7 @@ argv 없음 — 아래 CONFIG 만 고쳐서 실행. 대표패턴 렌더는 원�
 
 import os
 import csv
+import glob
 import time
 
 import numpy as np
@@ -42,7 +43,11 @@ from sklearn.decomposition import PCA
 _here       = os.path.dirname(os.path.abspath(__file__))
 CACHE_PATH  = os.path.join(_here, "hkeys_features.pt")
 FOLDER_PATH = "C:/Users/rea24/Documents/shinwon_note/pattern/2.Pattern_Classification/3.CODE/pythonProject2/dummy_dataset"
-OUT_DIR     = os.path.join(_here, "h0_clustering_ver2_out")
+OUT_DIR     = os.path.join(_here, "h0_clustering_out")   # 5.h0_cluster_analyze.py 가 읽는 경로와 일치
+
+# feature 캐시(CACHE_PATH)가 없을 때만 3.train_GAE best 인코더로 추출 (구 claasify_tree.py 의 [A] 이식).
+CKPT_GLOB     = "best_gae_v4_cov_*.pt"   # 3.train_GAE.py 가 저장한 best 전체 GAE 파일 glob
+EXTRACT_BATCH = 8192                     # 캐시 추출 시 추론 배치 (학습과 동일 규모)
 
 SAMPLE      = 300_000    # 군집화에 쓸 표본 수
 REDUCE_DIM  = 4          # 표준화 후 PCA 축소 차원 (h0 effective rank ≈ 4)
@@ -81,12 +86,139 @@ SURFACE, INK, INK2, GRID, NOISEC = "#fcfcfb", "#0b0b0b", "#52514e", "#e1e0d9", "
 
 
 # ══════════════════════════════════════════════════════════════════
+# 0. feature 캐시 생성 — 없을 때만 3.train_GAE 인코더로 추출 (3→4 직접 연결)
+#    구 claasify_tree.py 의 [A] 단계 이식. 캐시가 있으면 이 경로는 전부 건너뛴다.
+#    torch_geometric / 모델 import 는 추출할 때만 lazy 로 불러온다(캐시만 있으면 불필요).
+# ══════════════════════════════════════════════════════════════════
+def _load_best_gae(device):
+    """3.train_GAE.py 의 LayoutGAE 클래스를 파일에서 로드 → best 체크포인트 주입."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "train_gae", os.path.join(_here, "3.train_GAE.py"))
+    tg = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tg)                               # main() 은 __main__ 가드라 안 돎
+
+    cands = sorted(glob.glob(os.path.join(_here, CKPT_GLOB)))
+    if not cands:
+        raise FileNotFoundError(f"best 체크포인트 없음: {os.path.join(_here, CKPT_GLOB)}")
+    ckpt_path = cands[-1]                                     # 파일명 timestamp → sorted 마지막 = 최신
+    print(f"  [Model] 로드: {ckpt_path}")
+    model = tg.LayoutGAE(num_node_features=4, num_edge_features=4,
+                         embedding_dim=tg.EMBEDDING_DIM).to(device)   # 학습 아키텍처 그대로 재현
+    model.load_state_dict(torch.load(ckpt_path, map_location=device, weights_only=False))
+    model.eval()
+    return model
+
+
+def _load_chunk_as_data_list(path):
+    """PREPROCESSED_*part*.pt 청크 하나 → (Data 리스트, keys). x/edge_attr 는 fp16 slice 유지."""
+    from torch_geometric.data import Data
+    d = torch.load(path, map_location="cpu", weights_only=False)
+    x_all, ei_all, ea_all = d["x"], d["edge_index"], d["edge_attr"]
+    hp_all, meta, keys = d["hop_packed"], d["meta"], d["keys"]
+
+    data_list = []
+    for x0, x1, e0, e1 in meta.tolist():
+        packed = hp_all[x0:x1]
+        data_list.append(Data(
+            x=x_all[x0:x1],
+            edge_index=ei_all[:, e0:e1].long(),              # 그래프-로컬 인덱스
+            edge_attr=ea_all[e0:e1],
+            hop0_mask=(packed & 1).bool(),
+            hop1_mask=((packed >> 1) & 1).bool(),
+            hop2_mask=((packed >> 2) & 1).bool(),
+            hop3_mask=((packed >> 3) & 1).bool(),
+        ))
+    return data_list, list(keys)
+
+
+def _extract_block_features(model, data_list, device):
+    """청크 하나 → 블록별 (G, D) CPU float32 텐서 dict.
+    h0/h1/h2/h3 = z_node 를 hop mask 별 mean-pool(각 8d), edge = z_edge mean-pool(8d),
+    h0_raw = 중심 raw [w,h](2d), edge_raw = edge_attr mean+std(8d)."""
+    from torch_geometric.loader import DataLoader
+    from torch_geometric.utils import scatter
+
+    def mpool(z, mask, bi, G):
+        return scatter(z[mask], bi[mask], dim=0, dim_size=G, reduce="mean")
+
+    loader = DataLoader(data_list, batch_size=EXTRACT_BATCH, shuffle=False)
+    acc = {k: [] for k in ("h0", "h1", "h2", "h3", "edge", "h0_raw", "edge_raw")}
+
+    with torch.no_grad():
+        for batch in loader:
+            batch = batch.to(device)
+            batch.x         = batch.x.float()                # fp16 → fp32 (GPU 에서 1회)
+            batch.edge_attr = batch.edge_attr.float()
+            G = batch.num_graphs
+            z_node, z_edge = model.encoder(batch)            # clean 입력, 결정적
+
+            bi = batch.batch
+            acc["h0"].append(mpool(z_node, batch.hop0_mask, bi, G).cpu())
+            acc["h1"].append(mpool(z_node, batch.hop1_mask, bi, G).cpu())
+            acc["h2"].append(mpool(z_node, batch.hop2_mask, bi, G).cpu())
+            acc["h3"].append(mpool(z_node, batch.hop3_mask, bi, G).cpu())
+
+            eb = bi[batch.edge_index[0]]
+            acc["edge"].append(scatter(z_edge, eb, dim=0, dim_size=G, reduce="mean").cpu())
+
+            # raw 블록 — 인코더를 거치지 않은 순수 기하
+            acc["h0_raw"].append(mpool(batch.x[:, 2:4], batch.hop0_mask, bi, G).cpu())
+            e_mean = scatter(batch.edge_attr, eb, dim=0, dim_size=G, reduce="mean")
+            e_sq   = scatter(batch.edge_attr ** 2, eb, dim=0, dim_size=G, reduce="mean")
+            acc["edge_raw"].append(
+                torch.cat([e_mean, (e_sq - e_mean ** 2).clamp_min(0).sqrt()], dim=1).cpu())
+
+    return {k: torch.cat(v, dim=0).float() for k, v in acc.items()}
+
+
+def ensure_features():
+    """캐시가 있으면 로드(추출 생략), 없으면 3.train_GAE best 인코더로 추출 후 저장.
+    반환 (features_dict, keys, chunks) — 포맷은 구 claasify_tree.py 캐시와 동일."""
+    if os.path.exists(CACHE_PATH):                           # ← feature 있으면 실행 안 함
+        print(f"[Cache] feature 캐시 로드: {CACHE_PATH}")
+        d = torch.load(CACHE_PATH, map_location="cpu", weights_only=False)
+        return d["features"], d["keys"], d["chunks"]
+
+    print(f"[Cache] '{CACHE_PATH}' 없음 → 3.train_GAE best 인코더로 feature 추출")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"  Device: {device}")
+    model = _load_best_gae(device)
+
+    files = sorted(glob.glob(os.path.join(FOLDER_PATH, "PREPROCESSED_*part*.pt")))
+    if not files:
+        raise FileNotFoundError(f"청크 파일 없음: {FOLDER_PATH}")
+
+    block_parts, all_keys, chunks = None, [], []
+    for i, f in enumerate(files):
+        t = time.time()
+        data_list, keys = _load_chunk_as_data_list(f)
+        feats = _extract_block_features(model, data_list, device)
+        if block_parts is None:
+            block_parts = {k: [] for k in feats}
+        for k, v in feats.items():
+            block_parts[k].append(v.half())                  # fp16 누적 — 캐시/RAM 절반
+        all_keys.extend(keys)
+        chunks.append((os.path.basename(f), len(keys)))
+        print(f"  [{i+1}/{len(files)}] {os.path.basename(f)}  graphs={len(keys)}  "
+              f"({time.time()-t:.1f}s)")
+        del data_list, feats
+
+    features = {k: torch.cat(v, dim=0) for k, v in block_parts.items()}
+    tmp = CACHE_PATH + ".tmp"
+    torch.save({"features": features, "keys": all_keys, "chunks": chunks}, tmp)
+    os.replace(tmp, CACHE_PATH)                              # 원자적 교체
+    print(f"[Saved] feature 캐시: {CACHE_PATH}")
+    return features, all_keys, chunks
+
+
+# ══════════════════════════════════════════════════════════════════
 # 1. 임베딩 로드 + 표본 → 표준화 → PCA (군집화 4d / 시각화 2d)
 # ══════════════════════════════════════════════════════════════════
 def load_and_prepare():
-    d = torch.load(CACHE_PATH, map_location="cpu", weights_only=False)
-    h0, all_keys, chunks = d["features"]["h0"], d["keys"], d["chunks"]
-    h0_raw = d["features"].get("h0_raw")                     # 중심 raw [w,h] (없으면 None)
+    features, all_keys, chunks = ensure_features()           # 캐시 있으면 로드, 없으면 3→4 추출
+    h0 = features["h0"]
+    h0_raw = features.get("h0_raw")                          # 중심 raw [w,h] (없으면 None)
     valid = np.where((h0.abs().sum(1) != 0).numpy())[0]      # 빈 hop 제외
     print(f"h0 임베딩: 전체 {h0.shape[0]:,}  유효 {len(valid):,}")
 

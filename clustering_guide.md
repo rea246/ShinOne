@@ -32,6 +32,27 @@ graph TD
     style E fill:#fff3e0,stroke:#e65100,stroke-width:2px
 
 
+### 1.1 임베딩 벡터의 실제 산출 구조 (`3.train_GAE.py` 인코더 기준)
+
+위 flow 의 "40차원 임베딩 벡터"는 학습 시 손실 계산에 쓰이는 `graph_emb` 와는 **다른 벡터**다. (이름만 둘 다 40d 라 혼동하기 쉬우므로 산출 경로를 명확히 한다.) 클러스터링 입력은 `claasify_tree.py` 가 학습된 인코더로 clean 입력을 1-pass 추론해 만든 **hop 분해 블록**이다.
+
+- **인코더 출력**: `3.train_GAE.py` 의 `LayoutGATEncoder`(`EMBEDDING_DIM = 8`, `train_GAE.py:81, 350-360`)는 그래프마다 노드 임베딩 `z_node`(노드당 8d)와 엣지 임베딩 `z_edge`(엣지당 8d)를 낸다.
+
+- **클러스터링용 40차원 = hop 분해 5블록 × 8d** (`claasify_tree.py:extract_block_features`): `z_node`/`z_edge` 를 hop mask 별 mean-pool 한다.
+    - `h0`(8d) = `z_node` 를 `hop0_mask`(POI 중심 노드)로 mean-pool → **Step 1** 입력
+    - `h1`, `h2`, `h3`(각 8d) = `z_node` 를 각 hop mask 로 mean-pool
+    - `edge`(8d) = `z_edge` mean-pool
+    - → `h1 + h2 + h3 + edge = 32d` = **Step 2** 입력
+    - 즉 flow 의 "h0 8차원 / h1~h3·edge 32차원" 분해는 이 hop-pool 블록 구조와 정확히 대응한다.
+
+- **학습 시 `graph_emb` 와의 구분 (중요)**: `train_GAE.py:413` 의
+  `graph_emb = concat[max_emb, mean_emb, center_emb, emean, emax]` 도 8d × 5 = 40d 지만,
+  이는 hop 분해가 아니라 **pooling 종류별**(노드 max/mean, 중심 center, 엣지 mean/max) 블록이며
+  **VICReg·재구성 손실 전용**이다. 클러스터링은 이 벡터를 사용하지 않는다.
+    - 특히 클러스터링의 `h0` 는 순수 `hop0` mean-pool 이라, `graph_emb` 의 `center_emb`
+      (= `center_proj` MLP 통과 + 중심 노드가 없을 때 `mean_emb` 로 fallback, `train_GAE.py:405-407`)
+      와는 값이 다르다. 둘 다 "POI 중심"을 뜻하지만 동일 벡터가 아니라는 점에 유의한다.
+
 ## 2. 세부 단계별 핵심 디테일 및 보완 가이드
 
 ### 2.1. [Step 1] HDBSCAN (h0 기준 1차 분할)
