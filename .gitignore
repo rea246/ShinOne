@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 학습/분류 산출물 (대용량 — 재생성 가능하므로 커밋 제외)
+*.pt
+*.csv
+hkeys_*.json
+global_scales*.pt
+checkpoint_*.pt
+best_gae_*.pt
+
+# 시각화 결과 PNG
+viz/
+*.png
+
+# 로컬 데이터/청크
+PREPROCESSED_*.pt
+dummy_dataset/
+
+# Claude Code 로컬 설정 (개인 권한 허용목록 — 공유 대상 아님)
+.claude/settings.local.json
+
+# 에디터/OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
