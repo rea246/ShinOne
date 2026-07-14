@@ -53,6 +53,10 @@ SEED        = 42
 
 RESIDUALIZE = "per_var"   # 'per_var'(B) | 'both'(A) | 'none'
 
+# scatter 가시성 개선. 'contour' = 군집별 밀도 등고선(+옅은 배경 점구름) → 겹침/분리
+#   또렷. 'points' = 기존 원점 산점. 'facet' = 군집별 소분할(별도 파일, 겹침 0).
+SCATTER_STYLE = "contour"
+
 # 축 범위 — None = 자동(0.5~99.5 분위, 이상치 무시). 보고 (min,max) 로 조정.
 W_RANGE   = None
 H_RANGE   = None
@@ -176,6 +180,33 @@ def _pc_label(xcol, yvar):
     return pc
 
 
+def _legend_handles(cl, pal):
+    return [plt.Line2D([0], [0], marker="o", ls="", mfc=pal[c], mec="none",
+                       ms=9, label=c) for c in cl]
+
+
+def _draw_2d(ax, df, xc, yv, cl, pal):
+    """SCATTER_STYLE 에 따라 한 축쌍을 그린다.
+    contour = 옅은 배경 점구름 + 군집별 밀도 등고선(겹침 덜함)."""
+    if SCATTER_STYLE != "points":                            # contour/facet 공용 오버레이
+        ax.scatter(df[xc], df[yv], s=2, c="#dcdcdc", alpha=0.10,
+                   linewidths=0, zorder=1)                    # 전체 점구름(옅게)
+        for c in cl:
+            dd = df[df["cluster"] == c]
+            if len(dd) < 10:
+                continue
+            try:
+                sns.kdeplot(x=dd[xc], y=dd[yv], ax=ax, color=pal[c], levels=4,
+                            thresh=0.15, linewidths=1.4, alpha=0.95, zorder=2)
+            except Exception:
+                pass
+    else:
+        for c in cl:
+            dd = df[df["cluster"] == c]
+            ax.scatter(dd[xc], dd[yv], s=4, color=pal[c], alpha=0.4,
+                       linewidths=0, zorder=2)
+
+
 # ══════════════════════════════════════════════════════════════════
 # 플롯들
 # ══════════════════════════════════════════════════════════════════
@@ -223,17 +254,15 @@ def plot_pca_wh(df, R):
     pairs = [("PC1_w", "w"), ("PC1_h", "h"), ("PC2_w", "w"), ("PC2_h", "h")]
     fig, axes = plt.subplots(2, 2, figsize=(14, 12))
     for ax, (xc, yv) in zip(axes.flat, pairs):
-        for c in cl:
-            dd = df[df["cluster"] == c]
-            ax.scatter(dd[xc], dd[yv], s=4, color=pal[c], alpha=0.4,
-                       linewidths=0, label=c)
+        _draw_2d(ax, df, xc, yv, cl, pal)
         ax.set_xlim(R["PC1" if xc.startswith("PC1") else "PC2"])
         ax.set_ylim(R[yv])
         ax.set_xlabel(_pc_label(xc, yv)); ax.set_ylabel(yv)
         ax.set_title(f"{_pc_label(xc, yv)} vs {yv}"); sns.despine(ax=ax)
-    axes.flat[0].legend(markerscale=3, fontsize=9, frameon=False, title="cluster")
-    fig.suptitle(f"PCA (residualize={RESIDUALIZE}) vs center geometry by cluster",
-                 fontsize=15, weight="bold")
+    axes.flat[0].legend(handles=_legend_handles(cl, pal), fontsize=9,
+                        frameon=False, title="cluster")
+    fig.suptitle(f"PCA (residualize={RESIDUALIZE}) vs center geometry "
+                 f"[{SCATTER_STYLE}]", fontsize=15, weight="bold")
     fig.tight_layout()
     p = os.path.join(OUT_DIR, "h0_pca_wh_scatter.png")
     fig.savefig(p, dpi=130); plt.close(fig); print(f"  [pca-wh] {p}")
@@ -243,18 +272,40 @@ def plot_wh_scatter(df, R):
     cl, pal = _order_pal(df)
     sns.set_theme(style="white", context="talk")
     fig, ax = plt.subplots(figsize=(9, 8))
-    for c in cl:
-        dd = df[df["cluster"] == c]
-        ax.scatter(dd["w"], dd["h"], s=4, color=pal[c], alpha=0.4,
-                   linewidths=0, label=c)
+    _draw_2d(ax, df, "w", "h", cl, pal)
     ax.set_xlim(R["w"]); ax.set_ylim(R["h"])
     ax.set_xlabel("w"); ax.set_ylabel("h")
-    ax.set_title("center geometry: w vs h by cluster")
-    ax.legend(markerscale=3, fontsize=10, frameon=False, title="cluster")
+    ax.set_title(f"center geometry: w vs h by cluster [{SCATTER_STYLE}]")
+    ax.legend(handles=_legend_handles(cl, pal), fontsize=10, frameon=False,
+              title="cluster")
     sns.despine(ax=ax)
     fig.tight_layout()
     p = os.path.join(OUT_DIR, "h0_wh_scatter.png")
     fig.savefig(p, dpi=130); plt.close(fig); print(f"  [w-h] {p}")
+
+
+def plot_facet_wh(df, R):
+    """군집별 소분할(facet) — 겹침 0. 각 패널: 해당 군집(색) + 전체(회색 배경)."""
+    cl, pal = _order_pal(df)
+    sns.set_theme(style="white", context="talk")
+    ncol = min(len(cl), 3); nrow = (len(cl) + ncol - 1) // ncol
+    fig, axes = plt.subplots(nrow, ncol, figsize=(4.8 * ncol, 4.5 * nrow),
+                             squeeze=False)
+    flat = axes.flat
+    for i, c in enumerate(cl):
+        ax = flat[i]
+        ax.scatter(df["w"], df["h"], s=2, c="#e2e2e2", alpha=0.25, linewidths=0)
+        dd = df[df["cluster"] == c]
+        ax.scatter(dd["w"], dd["h"], s=4, color=pal[c], alpha=0.5, linewidths=0)
+        ax.set_xlim(R["w"]); ax.set_ylim(R["h"])
+        ax.set_title(f"{c}  (n={len(dd):,})"); ax.set_xlabel("w"); ax.set_ylabel("h")
+        sns.despine(ax=ax)
+    for j in range(len(cl), nrow * ncol):
+        flat[j].axis("off")
+    fig.suptitle("w vs h — per-cluster facet (grey = all)", fontsize=14, weight="bold")
+    fig.tight_layout()
+    p = os.path.join(OUT_DIR, "h0_wh_facet.png")
+    fig.savefig(p, dpi=130); plt.close(fig); print(f"  [w-h facet] {p}")
 
 
 def main():
@@ -267,12 +318,15 @@ def main():
               "center geometry (w, h) density by cluster")
     plot_pca_wh(df, R)
     plot_wh_scatter(df, R)
+    if SCATTER_STYLE == "facet":
+        plot_facet_wh(df, R)
     if "e_box" in df.columns:
         _kde_grid(df, EDGE_PLOTS, 2, "h0_edge_kde.png",
                   "edge geometry density by cluster (edge_raw)")
 
     print(f"완료. 산출물: {OUT_DIR}/  (h0_wh_hist / h0_wh_kde / "
           "h0_pca_wh_scatter / h0_wh_scatter"
+          + (" / h0_wh_facet" if SCATTER_STYLE == "facet" else "")
           + (" / h0_edge_kde" if "e_box" in df.columns else "") + ")")
 
 
