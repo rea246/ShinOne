@@ -46,15 +46,20 @@ random 모드는 시드+워커 수가 같으면 재현된다.
 
 ## match_nearest_gauge.py (B.csv → C.csv 최근접 게이지 매칭)
 
-`extract_cluster_samples_fast.py` 의 결과물(B.csv)의 각 행에 대해,
-`preprocessor.py` 가 읽는 것과 같은 포맷의 게이지 리스트
-(`input.pkl`, `[[gauge_name, cx, cy], ...]` 를 pickle.dump 한 파일)에서
-가장 가까운 게이지를 찾아 `gauge_name, gauge_x, gauge_y, dist` 컬럼을
-붙인 C.csv 를 만든다.
+`extract_cluster_samples_fast.py` 의 결과물(B.csv)의 각 행에 대해
+게이지 파일에서 가장 가까운 게이지를 찾아
+`gauge_name, gauge_x, gauge_y, dist` 컬럼을 붙인 C.csv 를 만든다.
 
-B.csv 의 X, Y 와 input.pkl 의 좌표는 단위가 달라서, B.csv 좌표를
-`--scale`(기본 20000)로 나눠 input.pkl 좌표계로 맞춘 뒤 비교한다.
-`dist` 는 input.pkl 좌표계 기준 유클리드 거리다.
+게이지 파일은 확장자로 자동 판별한다:
+
+- `.pkl`: `[[gauge_name, cx, cy], ...]` 를 pickle.dump 한 파일
+  (`preprocessor.py` 의 load_gauge_list 와 같은 포맷)
+- `.txt`: `name, X, Y, ScanDirection, CD` 컬럼의 텍스트 파일
+  (쉼표/공백 구분 모두 지원, 헤더 행 자동 스킵, name/X/Y 만 사용)
+
+B.csv 의 X, Y 와 게이지 파일의 좌표는 단위가 달라서, B.csv 좌표를
+`scale`(기본 20000)로 나눠 게이지 좌표계로 맞춘 뒤 비교한다.
+`dist` 는 게이지 좌표계 기준 유클리드 거리다.
 
 다음 두 경우의 행은 C.csv 에서 제외된다:
 
@@ -67,9 +72,9 @@ B.csv 의 X, Y 와 input.pkl 의 좌표는 단위가 달라서, B.csv 좌표를
 ```python
 def main():
     b_csv = "B.csv"
-    input_pkl = "input.pkl"
+    gauge_path = "input.pkl"  # .pkl 또는 .txt
     output = "C.csv"
-    scale = 20000.0   # B.csv 좌표를 pkl 좌표계로 맞추는 나눗셈 값
+    scale = 20000.0   # B.csv 좌표를 게이지 좌표계로 맞추는 나눗셈 값
     max_dist = 0.1    # 이 거리 이상 떨어진 행은 제외
     inspect = None    # cluster_id 를 넣으면 그 행의 top-5 최근접만 출력 (검증용)
 ```
