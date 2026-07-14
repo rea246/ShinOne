@@ -38,7 +38,6 @@ import seaborn as sns
 
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
-from scipy.stats import gaussian_kde
 
 # ══════════════════════════════════════════════════════════════════
 # CONFIG
@@ -48,20 +47,21 @@ CACHE_PATH = os.path.join(_here, "hkeys_features.pt")
 LABELS_NPZ = os.path.join(_here, "h0_clustering_out", "h0_labels_full.npz")
 OUT_DIR    = os.path.join(_here, "h0_clustering_out")
 
-CLUSTERS    = None        # None = 전체 군집, 또는 [0, 1, 2, 3, 4]
-PER_CLUSTER = 40_000      # 군집당 플롯 표본 상한 (큰 군집이 분포 압도 안 하게)
-SEED        = 42
+CLUSTERS     = None       # None = 전체 군집, 또는 [0, 1, 2, 3, 4]
+INCLUDE_NOISE = True      # noise(-1) 그룹도 회색으로 함께 플랏
+PER_CLUSTER  = 40_000     # 그룹당 플롯 표본 상한 (큰 군집이 분포 압도 안 하게)
+SEED         = 42
 
 RESIDUALIZE = "per_var"   # 'per_var'(B) | 'both'(A) | 'none'
 
-# scatter 가시성 개선. 'contour' = 군집별 밀도 등고선(+옅은 배경 점구름) → 겹침/분리
-#   또렷. 'points' = 기존 원점 산점. 'facet' = 군집별 소분할(별도 파일, 겹침 0).
+# scatter 가시성. 'contour' = 군집별 밀도 등고선(채움) | 'points' = 원점 산점
+#   | 'facet' = 군집별 소분할(별도 파일). noise 는 항상 회색 점으로 표기.
 SCATTER_STYLE = "contour"
 
-# 등고선이 감싸는 확률질량(HDR: 최고밀도영역). 임의 밀도% 가 아니라 "안에 데이터가
-#   몇 % 있나" 로 그린다. 1σ/2σ(1D 관례)=0.68/0.95, 2D 마할라노비스 σ=[0.393,0.865].
-CONTOUR_MASS    = [0.68, 0.95]
-CONTOUR_KDE_FIT = 5000          # 등고선 KDE fit 표본 상한(비용 조절)
+# 등고선(seaborn KDE): 최고밀도의 thresh% 부터 levels 분할, 내부 fill_alpha 로 채움.
+CONTOUR_THRESH     = 0.15    # 최고밀도의 15% 미만 꼬리는 안 그림
+CONTOUR_LEVELS     = 4       # 4 분할
+CONTOUR_FILL_ALPHA = 0.2     # 등고선 내부 채움 투명도
 
 # 축 범위 — None = 자동(0.5~99.5 분위, 이상치 무시). 보고 (min,max) 로 조정.
 W_RANGE   = None
@@ -78,8 +78,10 @@ PALETTES = {
     "jewel":     ["#1b6ca8", "#158a6b", "#d98b1e", "#c1440e",
                   "#6a3fb0", "#c42348", "#2f8f4e", "#b0731f"],
 }
-PALETTE_NAME = "jewel"
-PALETTE = PALETTES[PALETTE_NAME]
+PALETTE_NAME = "reference"
+PALETTE = list(PALETTES[PALETTE_NAME])
+PALETTE[3] = "#e34948"    # C3: 초록(#008300) → 빨강 (사용자 지정; C5 와 같은 빨강)
+NOISE_COLOR = "#9a9a9a"   # noise 그룹 회색
 
 # edge 분포로 그릴 4개 (해석 가능한 것 위주). (df컬럼, 표시라벨)
 EDGE_PLOTS = [("e_box",   "box_dist mean (nm)"),
@@ -121,10 +123,12 @@ def load_df():
         raise SystemExit("캐시에 h0_raw([w,h]) 없음 — 분석 불가")
 
     rng = np.random.default_rng(SEED)
-    clusters = (np.unique(labels[labels >= 0]) if CLUSTERS is None
-                else np.asarray(CLUSTERS))
+    groups = list(np.unique(labels[labels >= 0]) if CLUSTERS is None
+                  else np.asarray(CLUSTERS))
+    if INCLUDE_NOISE and (labels < 0).any():
+        groups.append(-1)                               # noise 그룹 포함
     sel = []
-    for c in clusters:
+    for c in groups:
         idx = np.where(labels == c)[0]
         sel.append(idx if len(idx) <= PER_CLUSTER
                    else rng.choice(idx, PER_CLUSTER, replace=False))
@@ -134,7 +138,7 @@ def load_df():
     wh = h0_raw[torch.from_numpy(r)].numpy().astype(np.float64)
     Xs = StandardScaler().fit_transform(
         h0[torch.from_numpy(r)].numpy().astype(np.float32))
-    data = dict(cluster=[f"c{int(v)}" for v in labels[sel]],
+    data = dict(cluster=["noise" if v < 0 else f"c{int(v)}" for v in labels[sel]],
                 w=wh[:, 0], h=wh[:, 1])
     data.update(_pcas(Xs, wh[:, 0], wh[:, 1]))
 
@@ -148,14 +152,20 @@ def load_df():
         print("  ⚠ 캐시에 edge_raw 없음 → edge 분석 생략")
 
     df = pd.DataFrame(data)
-    print(f"플롯 표본 {len(df):,}  (군집 {len(clusters)}개, 군집당 ≤{PER_CLUSTER:,}) "
+    print(f"플롯 표본 {len(df):,}  (그룹 {len(groups)}개, 그룹당 ≤{PER_CLUSTER:,}) "
           f"| PCA residualize={RESIDUALIZE} | palette={PALETTE_NAME}")
     return df
 
 
 def _order_pal(df):
-    cl = sorted(df["cluster"].unique(), key=lambda s: int(s[1:]))
-    return cl, {c: PALETTE[i % len(PALETTE)] for i, c in enumerate(cl)}
+    """군집(팔레트 색, 번호순) + noise(회색, 맨 뒤)."""
+    names = df["cluster"].unique().tolist()
+    cl = sorted([x for x in names if x != "noise"], key=lambda s: int(s[1:]))
+    pal = {c: PALETTE[i % len(PALETTE)] for i, c in enumerate(cl)}
+    if "noise" in names:
+        cl = cl + ["noise"]
+        pal["noise"] = NOISE_COLOR
+    return cl, pal
 
 
 def _lim(s, cfg=None):
@@ -194,49 +204,26 @@ def _legend_handles(cl, pal):
 def _style_tag():
     if SCATTER_STYLE == "points":
         return "points"
-    return "HDR " + "/".join(f"{int(round(m*100))}%" for m in CONTOUR_MASS)
-
-
-def _hdr_contours(ax, x, y, color, rng):
-    """CONTOUR_MASS(예 68/95%)를 감싸는 밀도 등고선(HDR).
-    HDR: mass m 을 감싸는 밀도 문턱 t = KDE 밀도의 (1-m) 분위수 → contour(t)."""
-    x, y = np.asarray(x), np.asarray(y)
-    xy = np.vstack([x, y])
-    if xy.shape[1] < 30:
-        return
-    fit = (xy if xy.shape[1] <= CONTOUR_KDE_FIT
-           else xy[:, rng.choice(xy.shape[1], CONTOUR_KDE_FIT, replace=False)])
-    try:
-        kde = gaussian_kde(fit)
-    except Exception:
-        return
-    dens = kde(fit)
-    levels = np.unique(np.quantile(dens, [1 - m for m in CONTOUR_MASS]))   # 오름차순
-    if levels.size == 0:
-        return
-    gx = np.linspace(x.min(), x.max(), 100)
-    gy = np.linspace(y.min(), y.max(), 100)
-    GX, GY = np.meshgrid(gx, gy)
-    Z = kde(np.vstack([GX.ravel(), GY.ravel()])).reshape(GX.shape)
-    ax.contour(GX, GY, Z, levels=levels, colors=[color], linewidths=1.4,
-               alpha=0.95, zorder=2)
+    return f"contour thr{CONTOUR_THRESH:g}/{CONTOUR_LEVELS}lv"
 
 
 def _draw_2d(ax, df, xc, yv, cl, pal):
-    """SCATTER_STYLE 에 따라 한 축쌍을 그린다.
-    contour = 옅은 배경 점구름 + 군집별 HDR 등고선(CONTOUR_MASS 질량 감쌈)."""
-    if SCATTER_STYLE != "points":                            # contour/facet 공용 오버레이
-        ax.scatter(df[xc], df[yv], s=2, c="#dcdcdc", alpha=0.10,
-                   linewidths=0, zorder=1)                    # 전체 점구름(옅게)
-        rng = np.random.default_rng(SEED)
-        for c in cl:
-            dd = df[df["cluster"] == c]
-            _hdr_contours(ax, dd[xc], dd[yv], pal[c], rng)
-    else:
-        for c in cl:
-            dd = df[df["cluster"] == c]
+    """한 축쌍 렌더. noise = 회색 점(α0.5). 군집: contour(채움) 또는 점."""
+    for c in cl:
+        dd = df[df["cluster"] == c]
+        if c == "noise":                                     # noise 는 항상 회색 점
+            ax.scatter(dd[xc], dd[yv], s=4, c=NOISE_COLOR, alpha=0.5,
+                       linewidths=0, zorder=1)
+        elif SCATTER_STYLE == "points":
             ax.scatter(dd[xc], dd[yv], s=4, color=pal[c], alpha=0.4,
                        linewidths=0, zorder=2)
+        else:                                                # 밀도 등고선(채움)
+            try:
+                sns.kdeplot(x=dd[xc], y=dd[yv], ax=ax, color=pal[c],
+                            fill=True, thresh=CONTOUR_THRESH, levels=CONTOUR_LEVELS,
+                            alpha=CONTOUR_FILL_ALPHA, zorder=2)
+            except Exception:
+                pass
 
 
 # ══════════════════════════════════════════════════════════════════
