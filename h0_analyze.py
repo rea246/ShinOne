@@ -38,6 +38,7 @@ import seaborn as sns
 
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
+from scipy.stats import gaussian_kde
 
 # ══════════════════════════════════════════════════════════════════
 # CONFIG
@@ -56,6 +57,11 @@ RESIDUALIZE = "per_var"   # 'per_var'(B) | 'both'(A) | 'none'
 # scatter 가시성 개선. 'contour' = 군집별 밀도 등고선(+옅은 배경 점구름) → 겹침/분리
 #   또렷. 'points' = 기존 원점 산점. 'facet' = 군집별 소분할(별도 파일, 겹침 0).
 SCATTER_STYLE = "contour"
+
+# 등고선이 감싸는 확률질량(HDR: 최고밀도영역). 임의 밀도% 가 아니라 "안에 데이터가
+#   몇 % 있나" 로 그린다. 1σ/2σ(1D 관례)=0.68/0.95, 2D 마할라노비스 σ=[0.393,0.865].
+CONTOUR_MASS    = [0.68, 0.95]
+CONTOUR_KDE_FIT = 5000          # 등고선 KDE fit 표본 상한(비용 조절)
 
 # 축 범위 — None = 자동(0.5~99.5 분위, 이상치 무시). 보고 (min,max) 로 조정.
 W_RANGE   = None
@@ -185,21 +191,47 @@ def _legend_handles(cl, pal):
                        ms=9, label=c) for c in cl]
 
 
+def _style_tag():
+    if SCATTER_STYLE == "points":
+        return "points"
+    return "HDR " + "/".join(f"{int(round(m*100))}%" for m in CONTOUR_MASS)
+
+
+def _hdr_contours(ax, x, y, color, rng):
+    """CONTOUR_MASS(예 68/95%)를 감싸는 밀도 등고선(HDR).
+    HDR: mass m 을 감싸는 밀도 문턱 t = KDE 밀도의 (1-m) 분위수 → contour(t)."""
+    x, y = np.asarray(x), np.asarray(y)
+    xy = np.vstack([x, y])
+    if xy.shape[1] < 30:
+        return
+    fit = (xy if xy.shape[1] <= CONTOUR_KDE_FIT
+           else xy[:, rng.choice(xy.shape[1], CONTOUR_KDE_FIT, replace=False)])
+    try:
+        kde = gaussian_kde(fit)
+    except Exception:
+        return
+    dens = kde(fit)
+    levels = np.unique(np.quantile(dens, [1 - m for m in CONTOUR_MASS]))   # 오름차순
+    if levels.size == 0:
+        return
+    gx = np.linspace(x.min(), x.max(), 100)
+    gy = np.linspace(y.min(), y.max(), 100)
+    GX, GY = np.meshgrid(gx, gy)
+    Z = kde(np.vstack([GX.ravel(), GY.ravel()])).reshape(GX.shape)
+    ax.contour(GX, GY, Z, levels=levels, colors=[color], linewidths=1.4,
+               alpha=0.95, zorder=2)
+
+
 def _draw_2d(ax, df, xc, yv, cl, pal):
     """SCATTER_STYLE 에 따라 한 축쌍을 그린다.
-    contour = 옅은 배경 점구름 + 군집별 밀도 등고선(겹침 덜함)."""
+    contour = 옅은 배경 점구름 + 군집별 HDR 등고선(CONTOUR_MASS 질량 감쌈)."""
     if SCATTER_STYLE != "points":                            # contour/facet 공용 오버레이
         ax.scatter(df[xc], df[yv], s=2, c="#dcdcdc", alpha=0.10,
                    linewidths=0, zorder=1)                    # 전체 점구름(옅게)
+        rng = np.random.default_rng(SEED)
         for c in cl:
             dd = df[df["cluster"] == c]
-            if len(dd) < 10:
-                continue
-            try:
-                sns.kdeplot(x=dd[xc], y=dd[yv], ax=ax, color=pal[c], levels=4,
-                            thresh=0.15, linewidths=1.4, alpha=0.95, zorder=2)
-            except Exception:
-                pass
+            _hdr_contours(ax, dd[xc], dd[yv], pal[c], rng)
     else:
         for c in cl:
             dd = df[df["cluster"] == c]
@@ -262,7 +294,7 @@ def plot_pca_wh(df, R):
     axes.flat[0].legend(handles=_legend_handles(cl, pal), fontsize=9,
                         frameon=False, title="cluster")
     fig.suptitle(f"PCA (residualize={RESIDUALIZE}) vs center geometry "
-                 f"[{SCATTER_STYLE}]", fontsize=15, weight="bold")
+                 f"[{_style_tag()}]", fontsize=15, weight="bold")
     fig.tight_layout()
     p = os.path.join(OUT_DIR, "h0_pca_wh_scatter.png")
     fig.savefig(p, dpi=130); plt.close(fig); print(f"  [pca-wh] {p}")
@@ -275,7 +307,7 @@ def plot_wh_scatter(df, R):
     _draw_2d(ax, df, "w", "h", cl, pal)
     ax.set_xlim(R["w"]); ax.set_ylim(R["h"])
     ax.set_xlabel("w"); ax.set_ylabel("h")
-    ax.set_title(f"center geometry: w vs h by cluster [{SCATTER_STYLE}]")
+    ax.set_title(f"center geometry: w vs h by cluster [{_style_tag()}]")
     ax.legend(handles=_legend_handles(cl, pal), fontsize=10, frameon=False,
               title="cluster")
     sns.despine(ax=ax)
