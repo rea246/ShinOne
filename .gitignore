@@ -13,3 +13,9 @@ __pycache__/
 # Verification plot outputs
 preproc_check/
 synth/
+
+# Coverage analysis generated artifacts (dummy data & plots — never committed)
+coverage_analysis/coverage_plots/
+dummy_sample.csv
+dummy_reference.csv
+*.parquet
