@@ -74,7 +74,14 @@ OUTPUT_DIR      = "coverage_plots"
 PLOT_DOWNSAMPLE = 20_000       # 시각화/Gap 근사용 Reference reservoir 표본 수
 OOD_HEATMAP_TOPN = 25          # 히트맵에 표시할 극단 OOD 포인트 수
 
-sns.set_theme(style="whitegrid", context="talk")
+sns.set_theme(style="white", context="talk")   # 내부 격자(gridline) 없음
+
+# ---- 색상 팔레트 ----
+C_SAMPLE = "#2CA02C"           # sample scatter (초록, 일괄)
+C_REF    = "#8C8C8C"           # reference scatter (회색)
+C_COVER  = "#A1D99B"           # covered 셀 (연초록)
+C_GAP    = "#F4A15A"           # gap 셀 (주황)
+C_EMPTY  = "#F0F0F0"           # 빈 도메인 셀
 
 N_FEATURES = None              # run() 에서 feature 수로 설정되는 모듈 전역
 
@@ -377,9 +384,9 @@ def gap_feature_diff(ref_pts, p, sam_cells):
 
 
 # =============================================================================
-# 시각화 ① whitened top-2 격자 커버리지 + Cat 산점
+# 시각화 ① whitened top-2 격자 커버리지 (covered=초록 / gap=주황) + 산점
 # =============================================================================
-def plot_coverage_2d(u_s, u_r, cat_s, ref_cells, sam_cells, p, sam_cov, out_path):
+def plot_coverage_2d(u_s, u_r, ref_cells, sam_cells, p, sam_cov, out_path):
     from matplotlib.colors import BoundaryNorm, ListedColormap
     from matplotlib.patches import Circle, Patch
     dom = p["domain_set"]
@@ -393,33 +400,43 @@ def plot_coverage_2d(u_s, u_r, cat_s, ref_cells, sam_cells, p, sam_cov, out_path
             in_r, in_s = key in ref_cells, key in sam_cells
             M[i, j] = 2 if (in_r and in_s) else (1 if in_r else 0)
 
-    cmap = ListedColormap(["#F0F0F0", "#AEC7E8", "#FFD92F"])
+    cmap = ListedColormap([C_EMPTY, C_GAP, C_COVER])    # 빈/gap(주황)/covered(초록)
     norm = BoundaryNorm([-0.5, 0.5, 1.5, 2.5], cmap.N)
     fig, ax = plt.subplots(figsize=(9, 8.5))
     ax.pcolormesh(edges, edges, np.ma.masked_invalid(M).T, cmap=cmap, norm=norm,
-                  alpha=0.55, edgecolors="#DDD", linewidth=0.4)
+                  edgecolors="none")                     # 내부 격자선 제거
+    # 원 = Reference 의 Mahalanobis 도메인 경계(반경 √Tk = √χ²(q,2))
     ax.add_patch(Circle((0, 0), p["Rk"], fill=False, edgecolor="#333", linewidth=1.6))
-    ax.scatter(u_r[:, 0], u_r[:, 1], s=6, c="#999999", alpha=0.20, linewidths=0, label="Reference")
-    csel = {0: ("#2CA02C", "Sample: Verified"),
-            1: ("#7F7F7F", "Sample: In-domain (no ref)"),
-            2: ("#D62728", "Sample: OOD")}
-    for cval, (color, lab) in csel.items():
-        m = cat_s == cval
-        if m.any():
-            ax.scatter(u_s[m, 0], u_s[m, 1], s=14, c=color, alpha=0.7, linewidths=0, label=lab)
+    ax.scatter(u_r[:, 0], u_r[:, 1], s=6, c=C_REF, alpha=0.10, linewidths=0, label="Reference")
+    ax.scatter(u_s[:, 0], u_s[:, 1], s=14, c=C_SAMPLE, alpha=0.10, linewidths=0, label="Sample")
 
-    handles = [Patch(facecolor="#F0F0F0", edgecolor="#BBB", label="Empty domain (no ref)"),
-               Patch(facecolor="#AEC7E8", edgecolor="#BBB", label="Gap (ref only, uncovered)"),
-               Patch(facecolor="#FFD92F", edgecolor="#BBB", label="Covered (sample)")]
+    handles = [Patch(facecolor=C_EMPTY, edgecolor="#BBB", label="Empty domain (no ref)"),
+               Patch(facecolor=C_GAP, edgecolor="#BBB", label="Gap (ref only, uncovered)"),
+               Patch(facecolor=C_COVER, edgecolor="#BBB", label="Covered (sample)")]
     leg1 = ax.legend(handles=handles, loc="upper left", fontsize=9, framealpha=0.9, title="Cell state")
     ax.add_artist(leg1)
     ax.legend(loc="lower right", fontsize=9, framealpha=0.9, title="Points")
     ax.set_xlabel("whitened PC1"); ax.set_ylabel("whitened PC2")
-    ax.set_title(f"Mahalanobis Domain Coverage (q={MAHAL_Q})\n"
-                 f"Sample Coverage = {sam_cov*100:.2f}%   (sqrt_Tk={p['Rk']:.2f})")
+    ax.set_title(f"Mahalanobis Domain Coverage (q={MAHAL_Q})  |  "
+                 f"Sample Coverage = {sam_cov*100:.2f}%\n"
+                 f"circle = Ref Mahalanobis boundary (R={p['Rk']:.2f})", fontsize=13)
     ax.set_aspect("equal")
     fig.tight_layout(); fig.savefig(out_path, dpi=130); plt.close(fig)
     print(f"[Plot] (1) coverage-2d 저장: {out_path}")
+
+
+# =============================================================================
+# 시각화 ①' Reference vs Sample 산점만 (whitened top-2, alpha=0.7)
+# =============================================================================
+def plot_scatter_ref_sample(u_s, u_r, p, out_path):
+    fig, ax = plt.subplots(figsize=(9, 8.5))
+    ax.scatter(u_r[:, 0], u_r[:, 1], s=8, c=C_REF, alpha=0.7, linewidths=0, label="Reference")
+    ax.scatter(u_s[:, 0], u_s[:, 1], s=14, c=C_SAMPLE, alpha=0.7, linewidths=0, label="Sample")
+    ax.set_xlabel("whitened PC1"); ax.set_ylabel("whitened PC2")
+    ax.set_title("Reference vs Sample scatter (whitened top-2)")
+    ax.set_aspect("equal"); ax.legend(fontsize=10, loc="lower right")
+    fig.tight_layout(); fig.savefig(out_path, dpi=130); plt.close(fig)
+    print(f"[Plot] (1') ref-sample scatter 저장: {out_path}")
 
 
 # =============================================================================
@@ -431,7 +448,7 @@ def plot_distribution(d2_ref, d2_sam, p, out_path):
     bins = np.linspace(0, hi, 60)
     sns.histplot(d2_ref, bins=bins, stat="density", color="#999999", alpha=0.45,
                  label="Reference", ax=ax, edgecolor=None)
-    sns.histplot(d2_sam, bins=bins, stat="density", color="#D62728", alpha=0.40,
+    sns.histplot(d2_sam, bins=bins, stat="density", color=C_SAMPLE, alpha=0.45,
                  label="Sample", ax=ax, edgecolor=None)
     xs = np.linspace(1e-6, hi, 400)
     ax.plot(xs, chi2.pdf(xs, N_FEATURES), color="#1F77B4", lw=2.2,
@@ -449,27 +466,29 @@ def plot_distribution(d2_ref, d2_sam, p, out_path):
 # =============================================================================
 # 시각화 ③ 로딩 Biplot (PC1·PC2 평면의 원본 feature 방향)
 # =============================================================================
-def plot_biplot(p, u_s, cat_s, names, out_path):
-    load = p["Vk"] * p["sqrt_lamk"]                     # (d, 2) 상관 스케일 로딩
-    scale = 0.9 * p["Rk"] / (np.abs(load).max() + 1e-9)
-    fig, ax = plt.subplots(figsize=(9, 8.5))
-    m = cat_s == 2
-    ax.scatter(u_s[~m, 0], u_s[~m, 1], s=10, c="#BBBBBB", alpha=0.35, linewidths=0,
-               label="Sample (in-domain)")
-    if m.any():
-        ax.scatter(u_s[m, 0], u_s[m, 1], s=16, c="#D62728", alpha=0.6, linewidths=0,
-                   label="Sample (OOD)")
+def plot_biplot(p, names, out_path):
+    # 로딩(상관 스케일) = v_j * √λ_j 를 단위원 기준으로 정규화 → 방향·상대크기 강조
+    load = p["Vk"] * p["sqrt_lamk"]                     # (d, 2)
+    L = load / (np.abs(load).max() + 1e-9)             # 최대 성분이 1 이 되도록 스케일
+    colors = sns.color_palette("husl", N_FEATURES)     # feature 별 고유 색(겹쳐도 구분)
+    fig, ax = plt.subplots(figsize=(10, 9))
+    from matplotlib.patches import Circle
+    ax.add_patch(Circle((0, 0), 1.0, fill=False, edgecolor="#DDD", ls="--", lw=1.0))
+    ax.axhline(0, color="#EEE", lw=0.8); ax.axvline(0, color="#EEE", lw=0.8)
     for j in range(N_FEATURES):
-        dx, dy = load[j, 0] * scale, load[j, 1] * scale
-        ax.arrow(0, 0, dx, dy, color="#1F77B4", alpha=0.8,
-                 head_width=0.06 * p["Rk"], length_includes_head=True, linewidth=1.3)
-        ax.text(dx * 1.08, dy * 1.08, names[j], color="#0B3D66", fontsize=9,
-                ha="center", va="center")
-    ax.axhline(0, color="#CCC", lw=0.8); ax.axvline(0, color="#CCC", lw=0.8)
+        dx, dy = L[j, 0], L[j, 1]
+        ax.annotate("", xy=(dx, dy), xytext=(0, 0),
+                    arrowprops=dict(arrowstyle="-|>", color=colors[j], lw=1.8, alpha=0.9))
+        # 라벨을 화살표 끝보다 살짝 바깥, 같은 색 + 흰 배경 박스로 겹침 가독성↑
+        r = np.hypot(dx, dy) + 1e-9
+        ax.text(dx + 0.09 * dx / r, dy + 0.09 * dy / r, names[j], color=colors[j],
+                fontsize=9, fontweight="bold", ha="center", va="center",
+                bbox=dict(boxstyle="round,pad=0.12", fc="white", ec="none", alpha=0.75))
+    ax.set_xlim(-1.35, 1.35); ax.set_ylim(-1.35, 1.35)
     ax.set_xlabel("whitened PC1"); ax.set_ylabel("whitened PC2")
     ax.set_title(f"Loading biplot - feature directions (top-2 EVR={p['evr_k']*100:.1f}%)\n"
-                 "Arrows point toward the features driving deviation")
-    ax.set_aspect("equal"); ax.legend(fontsize=10, loc="lower right")
+                 "Arrows: original features projected on PC1-PC2 (normalized)")
+    ax.set_aspect("equal")
     fig.tight_layout(); fig.savefig(out_path, dpi=130); plt.close(fig)
     print(f"[Plot] (3) biplot 저장: {out_path}")
 
@@ -597,11 +616,12 @@ def run():
     # (4) Gap 원인(C) — reservoir 근사
     gap_diff, n_gap_r, n_cov_r = gap_feature_diff(ref_pts, p, sam_cells)
 
-    # 시각화 6종
+    # 시각화
     j = lambda f: os.path.join(OUTPUT_DIR, f)
-    plot_coverage_2d(u_s, u_r, cat, ref_cells, sam_cells, p, sam_cov, j("domain_mahalanobis_2d.png"))
+    plot_coverage_2d(u_s, u_r, ref_cells, sam_cells, p, sam_cov, j("domain_mahalanobis_2d.png"))
+    plot_scatter_ref_sample(u_s, u_r, p, j("domain_scatter_ref_sample.png"))
     plot_distribution(d2_ref, cls["d2"], p, j("domain_mahal_distribution.png"))
-    plot_biplot(p, u_s, cat, names, j("domain_loadings_biplot.png"))
+    plot_biplot(p, names, j("domain_loadings_biplot.png"))
     top_ood = plot_ood_attribution(cls, names, j("domain_ood_attribution.png"))
     plot_gap_attribution(gap_diff, n_gap_r, n_cov_r, names, j("domain_gap_attribution.png"))
     plot_ood_heatmap(cls, names, j("domain_ood_heatmap.png"))
