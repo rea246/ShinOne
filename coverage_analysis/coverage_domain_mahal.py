@@ -105,31 +105,38 @@ def _numeric_columns(path, fmt):
 
 def resolve_feature_names(sample_path, ref_path, fmt):
     """
-    '공통 feature 이름 목록'을 확정한다.
-    - FEATURE_COLS 지정 시 그 목록·순서를 그대로 사용.
-    - None 이면 Sample 의 '수치형 컬럼'만 자동 선택(뒤쪽 문자열 열 등은 버림).
-    - 선택된 feature 는 양쪽에 모두 존재해야 하며, 없거나 중복되면 명확히 에러.
+    '공통 feature 이름 목록'을 확정한다(양쪽에 모두 있는 컬럼만 사용).
+    - FEATURE_COLS 지정 시 그 목록·순서, None 이면 Sample 의 '수치형 컬럼'만 자동 선택.
+    - 한쪽에 없거나 중복된 컬럼은 '경고만 하고 제외'하고 계속 진행(exit 하지 않음).
+      → 사용할 공통 feature 가 하나도 없을 때만 에러.
     """
     s_cols, r_cols = _header(sample_path, fmt), _header(ref_path, fmt)
     wanted = _numeric_columns(sample_path, fmt) if FEATURE_COLS is None \
         else [str(c).strip() for c in FEATURE_COLS]
 
-    for label, cols in (("Sample", s_cols), ("Reference", r_cols)):
-        dup = {c for c in cols if cols.count(c) > 1}
-        if dup:
-            raise ValueError(f"{label} 에 중복 컬럼명 존재(이름 매칭 불가): {sorted(dup)}")
-    miss_s = [c for c in wanted if c not in s_cols]
-    miss_r = [c for c in wanted if c not in r_cols]
-    if miss_s or miss_r:
-        raise ValueError(
-            "feature 컬럼 매칭 실패.\n"
-            f"  Sample 에 없음   : {miss_s}\n"
-            f"  Reference 에 없음: {miss_r}\n"
-            f"  (Sample 컬럼={s_cols}\n   Reference 컬럼={r_cols})")
-    if not wanted:
-        raise ValueError("선택된 feature 컬럼이 없습니다.")
-    print(f"[IO] feature {len(wanted)}개 매칭(이름 기준): {wanted}")
-    return wanted
+    s_set, r_set = set(s_cols), set(r_cols)
+    s_dup = {c for c in s_cols if s_cols.count(c) > 1}
+    r_dup = {c for c in r_cols if r_cols.count(c) > 1}
+
+    names, dropped = [], []
+    for c in wanted:
+        if c not in s_set:
+            dropped.append((c, "Sample 에 없음"))
+        elif c not in r_set:
+            dropped.append((c, "Reference 에 없음"))
+        elif c in s_dup or c in r_dup:
+            dropped.append((c, "중복 컬럼명(매칭 불가)"))
+        else:
+            names.append(c)
+
+    if dropped:
+        print("[IO] 경고: 아래 컬럼은 feature 에서 제외하고 계속 진행합니다:")
+        for c, why in dropped:
+            print(f"        - {c}: {why}")
+    if not names:
+        raise ValueError("사용할 공통 feature 컬럼이 하나도 없습니다. (경로/헤더 확인)")
+    print(f"[IO] feature {len(names)}개 사용(이름 기준): {names}")
+    return names
 
 
 def _select(df, names):
