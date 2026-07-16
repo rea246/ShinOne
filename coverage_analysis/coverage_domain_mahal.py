@@ -26,7 +26,8 @@ coverage_domain_mahal.py
     c_j 가 큰 feature = 그 포인트가 도메인 밖으로 벗어난 '주범'.
 
 데이터 입출력
-    * Feature 는 '컬럼 이름' 기준으로 선택·정렬한다(Sample/Reference 열 순서가 달라도 매칭).
+    * Feature 는 CONFIG(위치 FEATURE_COL_IDX 또는 이름 FEATURE_COLS)로 직접 지정한다.
+      위치로 골라도 Reference 는 '이름'으로 매칭하므로 두 파일 열 순서가 달라도 안전.
     * plot 라벨의 feature 이름 = CSV 컬럼 이름.
     * Reference(대용량)는 chunk 스트리밍(μ·Σ 1패스 + 커버리지 1패스).
     * 비유한(NaN/Inf) 행은 읽는 즉시 제거하고 개수를 보고한다.
@@ -54,10 +55,13 @@ SAMPLE_PATH   = "sample.csv"
 REF_PATH      = "reference.csv"
 FMT           = "csv"          # 'csv' 또는 'parquet'
 
-# Feature 컬럼 선택 (이름 기준).
-#   None      → Sample 의 '수치형' 컬럼만 자동 선택(문자열 ID/라벨 등 뒤쪽 열은 버림).
-#   [이름...] → 지정한 컬럼만 그 순서로 feature 로 사용(가장 안전·명시적).
-FEATURE_COLS  = None
+# Feature 컬럼 선택 ── CSV 에 feature + 좌표/hash/name 이 섞여 있으므로 '직접' 지정한다.
+#   (우선순위: FEATURE_COLS 가 있으면 그것, 없으면 FEATURE_COL_IDX 사용)
+#   FEATURE_COLS    : 이름으로 지정. 예) ["f0","f1",...]   (헤더 이름 기준)
+#   FEATURE_COL_IDX : 위치로 지정. Sample 헤더의 0-based 열 위치.  예) list(range(0,21)) = 앞 21개
+# ※ 위치로 골라도 Reference 에서는 '이름'으로 매칭하므로 두 파일의 열 순서가 달라도 안전.
+FEATURE_COLS    = None
+FEATURE_COL_IDX = list(range(0, 21))
 
 SCALE_METHOD  = "standard"     # 'standard' | 'minmax' (Mahalanobis 는 standard 권장)
 
@@ -88,31 +92,32 @@ def _header(path, fmt):
     return [str(c).strip() for c in cols]
 
 
-def _numeric_columns(path, fmt):
-    """Sample 에서 '수치형' 컬럼 이름만 골라낸다(문자열 ID/라벨 등 비-feature 열은 버림)."""
-    if fmt == "csv":
-        df = pd.read_csv(path)
-    else:
-        import pyarrow.parquet as pq
-        df = pq.read_table(path).to_pandas()
-    df.columns = [str(c).strip() for c in df.columns]
-    num = list(df.select_dtypes(include=[np.number]).columns)
-    dropped = [c for c in df.columns if c not in num]
-    if dropped:
-        print(f"[IO] 비수치 컬럼 {len(dropped)}개 자동 제외(feature 아님): {dropped}")
-    return num
+def _wanted_from_config(s_cols):
+    """CONFIG(FEATURE_COLS 우선, 없으면 FEATURE_COL_IDX)로 '사용할 feature 이름'을 정한다."""
+    if FEATURE_COLS is not None:
+        return [str(c).strip() for c in FEATURE_COLS]
+    if FEATURE_COL_IDX is not None:
+        bad = [i for i in FEATURE_COL_IDX if i < 0 or i >= len(s_cols)]
+        if bad:
+            raise ValueError(
+                f"FEATURE_COL_IDX 위치가 Sample 열 범위를 벗어남: {bad} "
+                f"(Sample 열 {len(s_cols)}개: {s_cols})")
+        wanted = [s_cols[i] for i in FEATURE_COL_IDX]
+        print(f"[IO] 위치 기준 feature 선택(Sample idx {FEATURE_COL_IDX[0]}..{FEATURE_COL_IDX[-1]}, "
+              f"{len(wanted)}개): {wanted}")
+        return wanted
+    raise ValueError("feature 컬럼을 지정하세요: FEATURE_COLS(이름) 또는 FEATURE_COL_IDX(위치).")
 
 
 def resolve_feature_names(sample_path, ref_path, fmt):
     """
     '공통 feature 이름 목록'을 확정한다(양쪽에 모두 있는 컬럼만 사용).
-    - FEATURE_COLS 지정 시 그 목록·순서, None 이면 Sample 의 '수치형 컬럼'만 자동 선택.
+    - 위치(FEATURE_COL_IDX)로 골라도 Reference 에서는 '이름'으로 매칭한다(열 순서 무관).
     - 한쪽에 없거나 중복된 컬럼은 '경고만 하고 제외'하고 계속 진행(exit 하지 않음).
       → 사용할 공통 feature 가 하나도 없을 때만 에러.
     """
     s_cols, r_cols = _header(sample_path, fmt), _header(ref_path, fmt)
-    wanted = _numeric_columns(sample_path, fmt) if FEATURE_COLS is None \
-        else [str(c).strip() for c in FEATURE_COLS]
+    wanted = _wanted_from_config(s_cols)
 
     s_set, r_set = set(s_cols), set(r_cols)
     s_dup = {c for c in s_cols if s_cols.count(c) > 1}
