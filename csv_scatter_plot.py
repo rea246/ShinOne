@@ -5,7 +5,6 @@ import matplotlib.pyplot as plt
 # ==================== 설정 ====================
 CSV_PATH = "data.csv"      # 읽을 csv 파일 경로
 DELIMITER = ","             # 구분자
-HAS_HEADER = True           # 첫 번째 행이 컬럼명이면 True
 
 X_LIM = None                # 예: (0, 100) / None 이면 자동
 Y_LIM = None                # 예: (0, 100) / None 이면 자동
@@ -30,7 +29,7 @@ PALETTE = [
 def main():
     sns.set_theme(style="whitegrid", context="talk")
 
-    df = pd.read_csv(CSV_PATH, sep=DELIMITER, header=0 if HAS_HEADER else None)
+    df = pd.read_csv(CSV_PATH, sep=DELIMITER, header=0)  # 첫 번째 행 = 컬럼명
 
     x_col = df.columns[0]
     y_cols = list(df.columns[1:])
