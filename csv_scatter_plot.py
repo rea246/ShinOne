@@ -1,6 +1,7 @@
 import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 
 # ==================== 설정 ====================
 CSV_PATH = "data.csv"      # 읽을 csv 파일 경로
@@ -11,6 +12,9 @@ Y_LIM = None                # 예: (0, 100) / None 이면 자동
 
 MARKER_SIZE = 60
 ALPHA = 0.75
+
+HIGH_VALUE_THRESHOLD = 2.2   # 이 값보다 큰 y값은 회색으로 표기
+HIGH_VALUE_COLOR = "#898781"  # 회색
 # ================================================
 
 # 카테고리 구분용 고정 팔레트 (최대 8개 컬럼까지 색이 뚜렷하게 구분됨)
@@ -40,27 +44,26 @@ def main():
             "PALETTE를 늘리거나 컬럼 수를 줄이세요."
         )
 
-    long_df = df.melt(id_vars=x_col, value_vars=y_cols, var_name="series", value_name="value")
-
     fig, ax = plt.subplots(figsize=(9, 6))
 
-    sns.scatterplot(
-        data=long_df,
-        x=x_col,
-        y="value",
-        hue="series",
-        hue_order=y_cols,
-        palette=PALETTE[: len(y_cols)],
-        s=MARKER_SIZE,
-        alpha=ALPHA,
-        edgecolor="white",
-        linewidth=0.5,
-        ax=ax,
-    )
+    scatter_kwargs = dict(s=MARKER_SIZE, alpha=ALPHA, edgecolor="white", linewidth=0.5)
+
+    for col, color in zip(y_cols, PALETTE):
+        is_high = df[col] > HIGH_VALUE_THRESHOLD
+        ax.scatter(df.loc[~is_high, x_col], df.loc[~is_high, col], color=color, **scatter_kwargs)
+        ax.scatter(df.loc[is_high, x_col], df.loc[is_high, col], color=HIGH_VALUE_COLOR, **scatter_kwargs)
 
     ax.set_xlabel(str(x_col))
     ax.set_ylabel("value")
-    ax.legend(title=None, frameon=False, loc="best")
+
+    legend_handles = [
+        Line2D([0], [0], marker="o", linestyle="", color=color, label=str(col))
+        for col, color in zip(y_cols, PALETTE)
+    ]
+    legend_handles.append(
+        Line2D([0], [0], marker="o", linestyle="", color=HIGH_VALUE_COLOR, label=f"> {HIGH_VALUE_THRESHOLD}")
+    )
+    ax.legend(handles=legend_handles, title=None, frameon=False, loc="best")
     sns.despine(fig=fig, ax=ax)
 
     if X_LIM is not None:
