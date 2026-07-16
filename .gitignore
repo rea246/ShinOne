@@ -19,3 +19,7 @@ coverage_analysis/coverage_plots/
 dummy_sample.csv
 dummy_reference.csv
 *.parquet
+
+# Coverage analysis local input/outputs
+sample.csv
+reference.csv
