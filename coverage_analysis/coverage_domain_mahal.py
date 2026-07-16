@@ -54,8 +54,9 @@ SAMPLE_PATH   = "sample.csv"
 REF_PATH      = "reference.csv"
 FMT           = "csv"          # 'csv' 또는 'parquet'
 
-# Feature 컬럼 선택 (이름 기준). None → Sample CSV 의 모든 컬럼을 feature 로 사용.
-#   ※ ID/라벨 등 비-feature 열이 있으면 여기에 실제 feature 이름만 나열할 것.
+# Feature 컬럼 선택 (이름 기준).
+#   None      → Sample 의 '수치형' 컬럼만 자동 선택(문자열 ID/라벨 등 뒤쪽 열은 버림).
+#   [이름...] → 지정한 컬럼만 그 순서로 feature 로 사용(가장 안전·명시적).
 FEATURE_COLS  = None
 
 SCALE_METHOD  = "standard"     # 'standard' | 'minmax' (Mahalanobis 는 standard 권장)
@@ -87,14 +88,31 @@ def _header(path, fmt):
     return [str(c).strip() for c in cols]
 
 
+def _numeric_columns(path, fmt):
+    """Sample 에서 '수치형' 컬럼 이름만 골라낸다(문자열 ID/라벨 등 비-feature 열은 버림)."""
+    if fmt == "csv":
+        df = pd.read_csv(path)
+    else:
+        import pyarrow.parquet as pq
+        df = pq.read_table(path).to_pandas()
+    df.columns = [str(c).strip() for c in df.columns]
+    num = list(df.select_dtypes(include=[np.number]).columns)
+    dropped = [c for c in df.columns if c not in num]
+    if dropped:
+        print(f"[IO] 비수치 컬럼 {len(dropped)}개 자동 제외(feature 아님): {dropped}")
+    return num
+
+
 def resolve_feature_names(sample_path, ref_path, fmt):
     """
-    Sample/Reference 헤더에서 '공통 feature 이름 목록'을 확정한다.
-    - FEATURE_COLS 지정 시 그 순서, None 이면 Sample 컬럼 순서를 기준 순서로 삼는다.
-    - 양쪽에 모두 존재해야 하며, 없거나 중복되면 명확히 에러.
+    '공통 feature 이름 목록'을 확정한다.
+    - FEATURE_COLS 지정 시 그 목록·순서를 그대로 사용.
+    - None 이면 Sample 의 '수치형 컬럼'만 자동 선택(뒤쪽 문자열 열 등은 버림).
+    - 선택된 feature 는 양쪽에 모두 존재해야 하며, 없거나 중복되면 명확히 에러.
     """
     s_cols, r_cols = _header(sample_path, fmt), _header(ref_path, fmt)
-    wanted = list(s_cols) if FEATURE_COLS is None else [str(c).strip() for c in FEATURE_COLS]
+    wanted = _numeric_columns(sample_path, fmt) if FEATURE_COLS is None \
+        else [str(c).strip() for c in FEATURE_COLS]
 
     for label, cols in (("Sample", s_cols), ("Reference", r_cols)):
         dup = {c for c in cols if cols.count(c) > 1}
@@ -126,12 +144,14 @@ def _select(df, names):
 
 
 def read_matrix_by_name(path, names, fmt):
-    """작은 파일(Sample) 전체를 (n, d) float64 로 읽는다(이름 선택 + 정제)."""
+    """작은 파일(Sample) 전체를 (n, d) float64 로 읽는다(feature 열만 선택 + 정제)."""
+    want = set(names)
     if fmt == "csv":
-        df = pd.read_csv(path)
+        df = pd.read_csv(path, usecols=lambda c: str(c).strip() in want)  # feature 열만 파싱
     else:
         import pyarrow.parquet as pq
-        df = pq.read_table(path).to_pandas()
+        raw = [c for c in pq.ParquetFile(path).schema_arrow.names if str(c).strip() in want]
+        df = pq.read_table(path, columns=raw).to_pandas()
     X, dropped = _select(df, names)
     if dropped:
         print(f"[IO] Sample 비유한(NaN/Inf) 행 {dropped:,}개 제거")
@@ -143,8 +163,11 @@ def read_matrix_by_name(path, names, fmt):
 def iter_ref_chunks(path, names, scaler, chunksize, fmt):
     """Reference 를 chunk 스트리밍 → 이름 선택·정렬 → 정제 → 스케일링한 배열 yield."""
     dropped_total = [0]
+    want = set(names)
     if fmt == "csv":
-        for chunk in pd.read_csv(path, chunksize=chunksize):
+        # feature 열만 파싱(뒤쪽 미사용/문자열 열은 아예 읽지 않음)
+        for chunk in pd.read_csv(path, usecols=lambda c: str(c).strip() in want,
+                                 chunksize=chunksize):
             X, dropped = _select(chunk, names)
             dropped_total[0] += dropped
             if len(X):
