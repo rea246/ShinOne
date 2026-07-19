@@ -564,6 +564,62 @@ def plot_ood_heatmap(cls, names, out_path, topn=OOD_HEATMAP_TOPN):
 
 
 # =============================================================================
+# 결과 저장 (행 데이터 + PC1/PC2 + cover 상태)
+# =============================================================================
+_COVER_LABEL = np.array(["covered", "in_domain_no_ref", "out_of_domain"])   # cat 0/1/2
+
+
+def export_sample(sample_path, names, cls, fmt, out_path):
+    """
+    읽었던 Sample 원본(모든 컬럼)에 PC1·PC2(whitened top-2)·cover 상태를 붙여 저장한다.
+    (분석에서 제외된 NaN/Inf 행은 PC/상태가 비어있음)
+    """
+    if fmt == "csv":
+        df = pd.read_csv(sample_path)
+    else:
+        import pyarrow.parquet as pq
+        df = pq.read_table(sample_path).to_pandas()
+    df.columns = [str(c).strip() for c in df.columns]
+    X = df.loc[:, names].to_numpy(dtype=np.float64)
+    finite = np.isfinite(X).all(axis=1)                    # 분석에 쓰인 행 마스크(순서 동일)
+
+    pc1 = np.full(len(df), np.nan); pc2 = np.full(len(df), np.nan)
+    status = np.array([""] * len(df), dtype=object)
+    covered = np.zeros(len(df), dtype=bool)
+    pc1[finite] = cls["u2"][:, 0]
+    pc2[finite] = cls["u2"][:, 1]
+    status[finite] = _COVER_LABEL[cls["cat"]]
+    covered[finite] = (cls["cat"] == 0)
+
+    df["PC1"], df["PC2"] = pc1, pc2
+    df["cover_status"], df["covered"] = status, covered
+    df.to_csv(out_path, index=False)
+    print(f"[Save] Sample+PC+cover 저장: {out_path}  (rows={len(df):,}, covered={int(covered.sum()):,})")
+
+
+def export_uncovered_ref(ref_pts, p, sam_cells, scaler, names, out_path):
+    """
+    scatter 에 쓰인 Reference(reservoir) 중 'cover 안 되는(gap)' 포인트만 추출해 저장한다.
+    = top-2 타원 안이지만 Sample 이 밟지 않은 셀에 속한 ref 행 + PC1·PC2.
+    feature 값은 원본 스케일로 복원(scaler.inverse_transform).
+    """
+    u = whiten_topk(ref_pts, p)                            # (n, K)
+    in_ell = (u ** 2).sum(axis=1) <= p["Tk"]
+    idx = np.empty(u.shape, dtype=np.int16)
+    for a in range(u.shape[1]):
+        idx[:, a] = np.digitize(u[:, a], p["internalK"])
+    keys = [row.tobytes() for row in idx]
+    uncovered = np.array([in_ell[i] and (keys[i] not in sam_cells) for i in range(len(ref_pts))])
+
+    feats = scaler.inverse_transform(ref_pts[uncovered])   # 원본 스케일 복원
+    out = pd.DataFrame(feats, columns=names)
+    out["PC1"], out["PC2"] = u[uncovered, 0], u[uncovered, 1]
+    out.to_csv(out_path, index=False)
+    print(f"[Save] Uncovered Reference 저장: {out_path}  "
+          f"(uncovered={int(uncovered.sum()):,} / scatter ref={len(ref_pts):,})")
+
+
+# =============================================================================
 # 메인
 # =============================================================================
 def run():
@@ -625,6 +681,10 @@ def run():
     top_ood = plot_ood_attribution(cls, names, j("domain_ood_attribution.png"))
     plot_gap_attribution(gap_diff, n_gap_r, n_cov_r, names, j("domain_gap_attribution.png"))
     plot_ood_heatmap(cls, names, j("domain_ood_heatmap.png"))
+
+    # 결과 저장 (행 데이터 + PC1/PC2)
+    export_sample(SAMPLE_PATH, names, cls, FMT, j("sample_pc_cover.csv"))
+    export_uncovered_ref(ref_pts, p, sam_cells, scaler, names, j("reference_uncovered_pc.csv"))
 
     # 리포트
     print("\n" + "=" * 68)
