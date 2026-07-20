@@ -56,6 +56,11 @@ MAHAL_GRID_DIMS = 2            # top-2 격자 시각화 차원(K)
 N_BINS_MAHAL  = 10             # top-2 격자 해상도
 N_BINS_1D     = 20             # per-feature 1D 격자 해상도
 
+# 유효차원(effective dimension): full-d(21) Mahalanobis 는 노이즈 축까지 세어 가혹·무의미.
+#   K_eff 로 줄여 OOD/MYT 를 상위 부분공간에서 계산한다.
+EFF_DIM_OVERRIDE = None        # None → participation ratio 자동, 정수면 강제 지정
+PAIR_MAX      = 6              # 유효차원 교차 스캐터에 그릴 최대 차원 수
+
 CHUNKSIZE     = 200_000
 OUTPUT_DIR      = "coverage_plots"
 PLOT_DOWNSAMPLE = 20_000       # 시각화/Gap 근사용 Reference reservoir 표본 수
@@ -222,6 +227,15 @@ def build_frame(mean_raw, cov_raw, mn, mx, method, q, K):
     edges1d = np.linspace(-R1, R1, N_BINS_1D + 1)
     evr_k = float(lamk.sum() / w.sum())
 
+    # ── 유효차원 K_eff (participation ratio) → 부분공간 Mahalanobis(=Hotelling T²) ──
+    eff_dim = float((w.sum() ** 2) / (w ** 2).sum())        # participation ratio
+    K_eff = int(EFF_DIM_OVERRIDE) if EFF_DIM_OVERRIDE else int(np.clip(round(eff_dim), 2, d))
+    Veff, lam_eff = V[:, :K_eff], w[:K_eff]
+    sqrt_lam_eff = np.sqrt(lam_eff)
+    Peff = Veff @ np.diag(1.0 / lam_eff) @ Veff.T           # rank-K_eff 정밀행렬
+    T_eff = float(chi2.ppf(q, K_eff))                        # K_eff 차원 χ² 임계
+    evr_eff = float(lam_eff.sum() / w.sum())
+
     edges = np.linspace(-Rk, Rk, N_BINS_MAHAL + 1)
     centers = (edges[:-1] + edges[1:]) / 2
     domain_set = set()
@@ -234,7 +248,10 @@ def build_frame(mean_raw, cov_raw, mn, mx, method, q, K):
             "internalK": internalK, "edges1d": edges1d, "evr_k": evr_k,
             "domain_set": domain_set, "diagP": np.diag(Sinv).copy(),
             "diagS": np.diag(Sig).copy(), "mean_raw": mean_raw,
-            "std_raw": np.sqrt(np.diag(cov_raw))}
+            "std_raw": np.sqrt(np.diag(cov_raw)),
+            "eff_dim": eff_dim, "K_eff": K_eff, "Veff": Veff,
+            "sqrt_lam_eff": sqrt_lam_eff, "Peff": Peff, "T_eff": T_eff,
+            "diagPeff": np.diag(Peff).copy(), "evr_eff": evr_eff}
 
 
 # =============================================================================
@@ -279,8 +296,8 @@ def ref_pass2(path, names, p, k, chunksize, fmt, seed=RESERVOIR_SEED):
 
     for X in iter_ref_chunks_raw(path, names, chunksize, fmt):
         z = standardize(X, p); e = z - p["mu"]
-        d2 = np.einsum("ij,jk,ik->i", e, p["Sinv"], e)
-        n_out += int((d2 > p["T"]).sum()); n_tot += len(z)
+        d2 = np.einsum("ij,jk,ik->i", e, p["Peff"], e)   # 유효차원 D²_eff
+        n_out += int((d2 > p["T_eff"]).sum()); n_tot += len(z)
         u = (e @ p["Vk"]) / p["sqrt_lamk"]
         uu = u[(u ** 2).sum(1) <= p["Tk"]]
         if len(uu):
@@ -302,7 +319,7 @@ def ref_pass2(path, names, p, k, chunksize, fmt, seed=RESERVOIR_SEED):
         seen += len(zt)
 
     ref_pts = reservoir[:filled]
-    d2_ref = np.einsum("ij,jk,ik->i", ref_pts - p["mu"], p["Sinv"], ref_pts - p["mu"])
+    d2_ref = np.einsum("ij,jk,ik->i", ref_pts - p["mu"], p["Peff"], ref_pts - p["mu"])
     print(f"[Ref] pass2 완료: ref 셀={len(cells)}, reservoir={filled:,}, OOD={n_out/max(n_tot,1)*100:.2f}%")
     return {"ref_cells": cells, "ref_out": n_out, "ref_tot": n_tot,
             "ref_pts": ref_pts, "d2_ref": d2_ref, "feat_bins": feat_bins}
@@ -316,7 +333,7 @@ def _cache_key(ref_path, names, fmt):
     key = {"ref": os.path.abspath(ref_path), "size": st.st_size, "mtime": int(st.st_mtime),
            "names": names, "fmt": fmt, "scale": SCALE_METHOD, "q": MAHAL_Q,
            "K": MAHAL_GRID_DIMS, "nb": N_BINS_MAHAL, "nb1d": N_BINS_1D,
-           "ds": PLOT_DOWNSAMPLE, "seed": RESERVOIR_SEED}
+           "ds": PLOT_DOWNSAMPLE, "seed": RESERVOIR_SEED, "effov": EFF_DIM_OVERRIDE}
     return hashlib.sha1(json.dumps(key, sort_keys=True).encode()).hexdigest()[:16]
 
 
@@ -333,8 +350,9 @@ def load_or_build_reference(ref_path, names, fmt):
     print("[Cache] 캐시 없음 → Reference 스트리밍(2 passes)")
     n_ref, mean_raw, cov_raw, mn, mx = ref_raw_moments(ref_path, names, CHUNKSIZE, fmt)
     p = build_frame(mean_raw, cov_raw, mn, mx, SCALE_METHOD, MAHAL_Q, MAHAL_GRID_DIMS)
-    print(f"[Frame] Reference 고정 프레임({n_ref:,} rows); top-{MAHAL_GRID_DIMS} EVR={p['evr_k']*100:.1f}%, "
-          f"|G_total|={len(p['domain_set']):,}")
+    print(f"[Frame] Reference 고정 프레임({n_ref:,} rows); 유효차원 K_eff={p['K_eff']} "
+          f"(participation ratio={p['eff_dim']:.2f}, EVR={p['evr_eff']*100:.1f}%); "
+          f"top-{MAHAL_GRID_DIMS} EVR={p['evr_k']*100:.1f}%, |G_total|={len(p['domain_set']):,}")
     r2 = ref_pass2(ref_path, names, p, PLOT_DOWNSAMPLE, CHUNKSIZE, fmt)
     obj = {"p": p, "n_ref": n_ref, **r2}
     if USE_CACHE:
@@ -350,13 +368,13 @@ def load_or_build_reference(ref_path, names, fmt):
 # =============================================================================
 def classify_points(z, p, ref_cells):
     e = z - p["mu"]
-    g = e @ p["Sinv"]
-    d2 = np.einsum("ij,ij->i", e, g)
-    c = g ** 2 / p["diagP"]
-    uu_ = e ** 2 / p["diagS"]
-    u2 = e @ p["Vk"] / p["sqrt_lamk"]
+    g = e @ p["Peff"]                               # 유효차원 부분공간 정밀행렬
+    d2 = np.einsum("ij,ij->i", e, g)                # D²_eff = eᵀ P_eff e (=Σ top-K_eff u²)
+    c = g ** 2 / p["diagPeff"]                      # MYT 조건부 기여(부분공간)
+    uu_ = e ** 2 / p["diagS"]                       # 무조건부 기여(변수 단독)
+    u2 = e @ p["Vk"] / p["sqrt_lamk"]               # top-2 (격자/시각화용)
     cat = np.empty(len(z), dtype=np.int8)
-    ood = d2 > p["T"]; cat[ood] = 2
+    ood = d2 > p["T_eff"]; cat[ood] = 2
     ind = ~ood
     in_ell = ind & ((u2 ** 2).sum(1) <= p["Tk"])
     for i in np.where(ind)[0]:
@@ -441,6 +459,37 @@ def plot_scatter_ref_sample(u_s, u_r, out_path):
     print(f"[Plot] ref-sample scatter 저장: {out_path}")
 
 
+def plot_effective_pairscatter(u_eff_s, u_eff_r, K_eff, out_path):
+    """유효차원(whitened top-K_eff) 간 교차 산점 행렬. 대각=분포, 비대각=PC_i vs PC_j."""
+    Kp = min(K_eff, PAIR_MAX)
+    Rk2 = float(np.sqrt(chi2.ppf(MAHAL_Q, 2)))     # 2D 마진 참고 원(대략적 가이드)
+    from matplotlib.patches import Circle
+    fig, axes = plt.subplots(Kp, Kp, figsize=(2.3 * Kp, 2.3 * Kp), squeeze=False)
+    lim = max(4.0, Rk2 + 1)
+    for i in range(Kp):
+        for jj in range(Kp):
+            ax = axes[i][jj]
+            if i == jj:
+                b = np.linspace(-lim, lim, 40)
+                ax.hist(u_eff_r[:, i], bins=b, density=True, color=C_REF, alpha=0.5)
+                ax.hist(u_eff_s[:, i], bins=b, density=True, color=C_SAMPLE, alpha=0.5)
+                ax.set_yticks([])
+            else:
+                ax.scatter(u_eff_r[:, jj], u_eff_r[:, i], s=4, c=C_REF, alpha=0.15, linewidths=0)
+                ax.scatter(u_eff_s[:, jj], u_eff_s[:, i], s=6, c=C_SAMPLE, alpha=0.30, linewidths=0)
+                ax.add_patch(Circle((0, 0), Rk2, fill=False, edgecolor="#CCC", ls=":", lw=0.8))
+                ax.set_xlim(-lim, lim); ax.set_ylim(-lim, lim)
+            if i == Kp - 1:
+                ax.set_xlabel(f"PC{jj+1}", fontsize=8)
+            if jj == 0:
+                ax.set_ylabel(f"PC{i+1}", fontsize=8)
+            ax.tick_params(labelsize=6)
+    fig.suptitle(f"Effective-dim cross scatter (whitened top-{Kp} of K_eff={K_eff})  "
+                 "Ref(gray) vs Sample(green)", fontsize=12)
+    fig.tight_layout(rect=[0, 0, 1, 0.97]); fig.savefig(out_path, dpi=120); plt.close(fig)
+    print(f"[Plot] effective-dim pairscatter 저장: {out_path}")
+
+
 def plot_perfeature_coverage(cov, names, out_path):
     order = np.argsort(cov)                         # 낮은 것부터(부족 축이 위/아래로 눈에)
     y = np.arange(len(order))
@@ -486,10 +535,13 @@ def plot_distribution(d2_ref, d2_sam, p, out_path):
     sns.histplot(d2_ref, bins=bins, stat="density", color=C_REF, alpha=0.45, label="Reference", ax=ax, edgecolor=None)
     sns.histplot(d2_sam, bins=bins, stat="density", color=C_SAMPLE, alpha=0.45, label="Sample", ax=ax, edgecolor=None)
     xs = np.linspace(1e-6, hi, 400)
-    ax.plot(xs, chi2.pdf(xs, N_FEATURES), color="#1F77B4", lw=2.2, label=f"chi2(d={N_FEATURES}) theoretical")
-    ax.axvline(p["T"], color="#333", ls="--", lw=1.6, label=f"Domain bound T=chi2({MAHAL_Q},d)={p['T']:.1f}")
-    ax.set_xlabel("Mahalanobis D^2 (full-d)"); ax.set_ylabel("density")
-    ax.set_title("Mahalanobis distance: Reference vs Sample\n(Sample shifted right = larger deviation)")
+    ax.plot(xs, chi2.pdf(xs, p["K_eff"]), color="#1F77B4", lw=2.2,
+            label=f"chi2(K_eff={p['K_eff']}) theoretical")
+    ax.axvline(p["T_eff"], color="#333", ls="--", lw=1.6,
+               label=f"Domain bound T=chi2({MAHAL_Q},K_eff)={p['T_eff']:.1f}")
+    ax.set_xlabel(f"Mahalanobis D^2 (effective {p['K_eff']}-d)"); ax.set_ylabel("density")
+    ax.set_title("Mahalanobis distance (effective dim): Reference vs Sample\n"
+                 "(Sample shifted right = larger deviation)")
     ax.legend(fontsize=10)
     fig.tight_layout(); fig.savefig(out_path, dpi=130); plt.close(fig)
     print(f"[Plot] distribution 저장: {out_path}")
@@ -667,16 +719,19 @@ def run():
     headline = float(feat_cov.mean())
     cat = cls["cat"]
     n_ver, n_ind, n_ood = (cat == 0).sum(), (cat == 1).sum(), (cat == 2).sum()
-    sam_out = int((cls["d2"] > p["T"]).sum())
+    sam_out = int((cls["d2"] > p["T_eff"]).sum())
 
-    # per-feature ref 분포(reservoir) — small-multiples 용
+    # per-feature ref 분포(reservoir) + 유효차원 whitened 좌표
     w_r = (ref_pts - p["mu"]) / np.sqrt(p["diagS"])
     u_s, u_r = cls["u2"][:, :2], whiten_topk(ref_pts, p)[:, :2]
+    ueff_s = (z_s - p["mu"]) @ p["Veff"] / p["sqrt_lam_eff"]
+    ueff_r = (ref_pts - p["mu"]) @ p["Veff"] / p["sqrt_lam_eff"]
     gap_diff, n_gap_r, n_cov_r = gap_feature_diff(ref_pts, p, sam_cells)
 
     # 시각화
     plot_perfeature_coverage(feat_cov, names, j("per_feature_coverage_bars.png"))
     plot_perfeature_dist(w_s, w_r, names, p, j("per_feature_distributions.png"))
+    plot_effective_pairscatter(ueff_s, ueff_r, p["K_eff"], j("effective_dims_pairscatter.png"))
     plot_coverage_2d(u_s, u_r, ref_cells, sam_cells, p, sam_cov, j("domain_mahalanobis_2d.png"))
     plot_scatter_ref_sample(u_s, u_r, j("domain_scatter_ref_sample.png"))
     plot_distribution(d2_ref, cls["d2"], p, j("domain_mahal_distribution.png"))
@@ -698,7 +753,8 @@ def run():
     print(f"  (보조) top-2 격자 Sample coverage        : {sam_cov*100:8.4f}%   (분모=G_total {len(dom)})")
     print(f"  (보조) Ref-footprint coverage            : {cov_of_ref*100:8.4f}%   (분모=ref셀 {denom_ref})")
     print(f"  [셀] Cat1 대변={verified:,}  Cat2 gap={gap:,}  (of ref {denom_ref:,})")
-    print(f"  [진단] Sample full-d OOD                 : {sam_out/max(len(z_s),1)*100:.2f}%  "
+    print(f"  [진단] 유효차원 K_eff={p['K_eff']} (PR={p['eff_dim']:.2f}, EVR={p['evr_eff']*100:.1f}%)")
+    print(f"  [진단] Sample OOD (eff {p['K_eff']}-d)          : {sam_out/max(len(z_s),1)*100:.2f}%  "
           f"(Ref OOD={R['ref_out']/max(R['ref_tot'],1)*100:.2f}%)")
     print(f"  [Sample 포인트] 대변={n_ver:,}  도메인내={n_ind:,}  OOD={n_ood:,}  (총 {len(z_s):,})")
     if top_ood:
