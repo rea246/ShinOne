@@ -690,10 +690,14 @@ def run():
     print("\n" + "=" * 68)
     print("  [Mahalanobis Domain Coverage & Attribution]")
     print("=" * 68)
+    denom_ref = len(ref_cells & dom)
+    cov_of_ref = verified / denom_ref if denom_ref else 0.0     # (A) Ref footprint 기준
     print(f"  |G_total| (도메인 셀)              : {len(dom):,}")
-    print(f"  Reference Domain Coverage          : {ref_cov*100:8.4f}%")
-    print(f"  Sample    Domain Coverage          : {sam_cov*100:8.4f}%")
-    print(f"  [셀] Cat1 대변={verified:,}  Cat2 gap(미대변)={gap:,}  (of ref {len(ref_cells & dom):,})")
+    print(f"  Reference Domain Coverage          : {ref_cov*100:8.4f}%   (분모=G_total)")
+    print(f"  Sample    Domain Coverage          : {sam_cov*100:8.4f}%   (분모=G_total)")
+    print(f"  >>> Sample Coverage of REF footprint: {cov_of_ref*100:8.4f}%   "
+          f"(분모=ref 점유셀 {denom_ref:,}, ref 안 다니는 빈 도메인 제외)")
+    print(f"  [셀] Cat1 대변={verified:,}  Cat2 gap(미대변)={gap:,}  (of ref {denom_ref:,})")
     print(f"  [Sample 포인트] 대변={n_ver:,}  도메인내={n_ind:,}  OOD(무관)={n_ood:,}  "
           f"(총 {len(sample_scaled):,})")
     print(f"  Out-of-Domain 비율  Ref={ref_out/max(ref_tot,1)*100:.2f}%  "
@@ -702,8 +706,8 @@ def run():
         print("  OOD 근원 항 top-5 (조건부 c_j)     : "
               + ", ".join(f"{nm}={v:.1f}" for nm, v in top_ood))
     print("=" * 68)
-    return {"ref_cov": ref_cov, "sam_cov": sam_cov, "verified": verified, "gap": gap,
-            "n_ood": int(n_ood), "top_ood": top_ood}
+    return {"ref_cov": ref_cov, "sam_cov": sam_cov, "cov_of_ref": cov_of_ref,
+            "verified": verified, "gap": gap, "n_ood": int(n_ood), "top_ood": top_ood}
 
 
 if __name__ == "__main__":
