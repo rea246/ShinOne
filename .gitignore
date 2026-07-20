@@ -23,3 +23,6 @@ dummy_reference.csv
 # Coverage analysis local input/outputs
 sample.csv
 reference.csv
+
+# Coverage analysis reference cache
+coverage_analysis/.refcache/

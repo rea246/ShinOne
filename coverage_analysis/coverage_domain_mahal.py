@@ -2,95 +2,81 @@
 """
 coverage_domain_mahal.py
 ========================
-[Mahalanobis Domain Coverage + 근원 항(Attribution)] 전용 분석 (self-contained)
+[Mahalanobis Domain Coverage + Attribution] — Reference 고정 프레임 / per-feature 직관 / 캐시
 
-목적
-    Sample 이 Reference 의
-        (1) 어느 영역을 '대변'하는가          (Cat1 Verified)
-        (2) 어느 영역을 '대변하지 못'하는가    (Cat2 Gap)
-        (3) Reference 와 '무관'한 포인트는 어디인가 (Cat3 Out-of-Domain)
-    를 분류하고, 각 분류의 '근원 항'(원인 feature) 을 MYT 분해로 찾는다.
+핵심 설계
+    * Reference 고정 프레임: 스케일러·μ·Σ·PCA(V,λ)를 'Reference' 에서만 학습해 고정하고,
+      Sample 은 그 프레임에 투영만 한다. → 같은 Reference 면 sample1/sample2 를 따로 돌려도
+      저장 파일(PC1/PC2·커버리지·per-feature)이 동일 좌표계라 서로 비교 가능.
+    * 21차원 가혹함 완화: 헤드라인 커버리지는 'per-feature(1D) 커버리지 평균'.
+      full-d Mahalanobis OOD·MYT 는 '진단용'으로 항상 함께 표기(데이터 이상 은폐 방지).
+    * 캐시: Reference 파생물(프레임·ref 셀·per-feature bin·reservoir)을 파일 캐시.
+      두 번째 실행부터 Reference 스트리밍을 건너뜀(같은 ref+config 이면 재사용).
 
-도메인 정의 (Mahalanobis)
-    Reference 의 μ·Σ 로 상관구조를 반영한 타원체
-        { x : (x−μ)ᵀ Σ⁻¹ (x−μ) ≤ χ²(q, d) }
-    를 도메인으로 삼는다. Σ 고유분해 → 상위 K=2 주성분 백색화(whitening)로 타원을
-    반경 √χ²(q,K) 원으로 만들고, 저차원 격자로 커버리지를 잰다.
-        Coverage = |G_active ∩ G_total| / |G_total|
+지표
+    per-feature coverage_j = |sam_bins_j ∩ ref_bins_j| / |ref_bins_j|   (feature 마다)
+    headline = mean_j coverage_j
+    (보조) top-2 격자 커버리지, Ref-footprint 커버리지, full-d Sample OOD%
 
-근원 항 (MYT / Mason–Young–Tracy 분해)
-    정밀행렬 P=Σ⁻¹, 잔차 e=x−μ 에 대해
-        D²  = eᵀ P e              (full-d Mahalanobis², Cat3 판정)
-        c_j = (P e)_j² / P_jj     (조건부 기여 = D² − D²_(−j), leave-one-out)
-        u_j = e_j² / Σ_jj         (무조건부 기여, 변수 단독)
-    c_j 가 큰 feature = 그 포인트가 도메인 밖으로 벗어난 '주범'.
+근원 항 (MYT):  D²=eᵀPe,  c_j=(Pe)_j²/P_jj,  u_j=e_j²/Σ_jj   (P=Σ⁻¹, e=z−μ)
 
-데이터 입출력
-    * Feature 는 CONFIG(위치 FEATURE_COL_IDX 또는 이름 FEATURE_COLS)로 직접 지정한다.
-      위치로 골라도 Reference 는 '이름'으로 매칭하므로 두 파일 열 순서가 달라도 안전.
-    * plot 라벨의 feature 이름 = CSV 컬럼 이름.
-    * Reference(대용량)는 chunk 스트리밍(μ·Σ 1패스 + 커버리지 1패스).
-    * 비유한(NaN/Inf) 행은 읽는 즉시 제거하고 개수를 보고한다.
-
-실행:  python coverage_domain_mahal.py   (필요 시: pip install seaborn scipy scikit-learn matplotlib pandas)
+실행:  python coverage_domain_mahal.py   (pip install seaborn scipy matplotlib pandas)
 """
 
 import functools
+import hashlib
 import itertools
+import json
 import os
+import pickle
 
 import matplotlib
-matplotlib.use("Agg")                 # 헤드리스 백엔드
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
 from scipy.stats import chi2
-from sklearn.preprocessing import MinMaxScaler, StandardScaler
 
 # =============================================================================
-# CONFIG  ── 실행 파라미터를 여기서 직접 정의한다 (argparse 미사용)
+# CONFIG
 # =============================================================================
 SAMPLE_PATH   = "sample.csv"
 REF_PATH      = "reference.csv"
 FMT           = "csv"          # 'csv' 또는 'parquet'
 
-# Feature 컬럼 선택 ── CSV 에 feature + 좌표/hash/name 이 섞여 있으므로 '직접' 지정한다.
-#   (우선순위: FEATURE_COLS 가 있으면 그것, 없으면 FEATURE_COL_IDX 사용)
-#   FEATURE_COLS    : 이름으로 지정. 예) ["f0","f1",...]   (헤더 이름 기준)
-#   FEATURE_COL_IDX : 위치로 지정. Sample 헤더의 0-based 열 위치.  예) list(range(0,21)) = 앞 21개
-# ※ 위치로 골라도 Reference 에서는 '이름'으로 매칭하므로 두 파일의 열 순서가 달라도 안전.
+# Feature 선택 (직접 지정). FEATURE_COLS(이름) 우선, 없으면 FEATURE_COL_IDX(Sample 위치).
+#   ※ 최종 feature 순서는 'Reference 헤더 순서'로 고정 → sample 순서 무관하게 비교 가능.
 FEATURE_COLS    = None
 FEATURE_COL_IDX = list(range(0, 21))
 
-SCALE_METHOD  = "standard"     # 'standard' | 'minmax' (Mahalanobis 는 standard 권장)
-
-MAHAL_Q       = 0.99           # 타원체 도메인 경계 분위수 (χ² quantile)
-MAHAL_GRID_DIMS = 2            # 커버리지 격자를 칠 whitened 주성분 수 (K, 2 권장)
-N_BINS_MAHAL  = 10             # whitened 축당 Bin 수 (격자 해상도)
+SCALE_METHOD  = "standard"     # 'standard' | 'minmax'
+MAHAL_Q       = 0.99           # χ² quantile (도메인 경계)
+MAHAL_GRID_DIMS = 2            # top-2 격자 시각화 차원(K)
+N_BINS_MAHAL  = 10             # top-2 격자 해상도
+N_BINS_1D     = 20             # per-feature 1D 격자 해상도
 
 CHUNKSIZE     = 200_000
 OUTPUT_DIR      = "coverage_plots"
 PLOT_DOWNSAMPLE = 20_000       # 시각화/Gap 근사용 Reference reservoir 표본 수
-OOD_HEATMAP_TOPN = 25          # 히트맵에 표시할 극단 OOD 포인트 수
+OOD_HEATMAP_TOPN = 25
 
-sns.set_theme(style="white", context="talk")   # 내부 격자(gridline) 없음
+USE_CACHE     = True           # Reference 파생물 캐시 사용
+CACHE_DIR     = ".refcache"
+RESERVOIR_SEED = 0
 
-# ---- 색상 팔레트 ----
-C_SAMPLE = "#2CA02C"           # sample scatter (초록, 일괄)
-C_REF    = "#8C8C8C"           # reference scatter (회색)
-C_COVER  = "#A1D99B"           # covered 셀 (연초록)
-C_GAP    = "#F4A15A"           # gap 셀 (주황)
-C_EMPTY  = "#F0F0F0"           # 빈 도메인 셀
+sns.set_theme(style="white", context="talk")
 
-N_FEATURES = None              # run() 에서 feature 수로 설정되는 모듈 전역
+C_SAMPLE = "#2CA02C"; C_REF = "#8C8C8C"
+C_COVER  = "#A1D99B"; C_GAP = "#F4A15A"; C_EMPTY = "#F0F0F0"
+
+N_FEATURES = None
 
 
 # =============================================================================
-# 데이터 I/O ── 컬럼 이름 기준 선택/정렬 + 비유한 행 제거
+# 데이터 I/O ── 컬럼 이름 기준 선택/정렬(Reference 순서 고정) + 비유한 행 제거
 # =============================================================================
 def _header(path, fmt):
-    """파일 헤더의 컬럼 이름 목록(공백 strip)."""
     if fmt == "csv":
         cols = list(pd.read_csv(path, nrows=0).columns)
     else:
@@ -100,62 +86,55 @@ def _header(path, fmt):
 
 
 def _wanted_from_config(s_cols):
-    """CONFIG(FEATURE_COLS 우선, 없으면 FEATURE_COL_IDX)로 '사용할 feature 이름'을 정한다."""
     if FEATURE_COLS is not None:
         return [str(c).strip() for c in FEATURE_COLS]
     if FEATURE_COL_IDX is not None:
         bad = [i for i in FEATURE_COL_IDX if i < 0 or i >= len(s_cols)]
         if bad:
-            raise ValueError(
-                f"FEATURE_COL_IDX 위치가 Sample 열 범위를 벗어남: {bad} "
-                f"(Sample 열 {len(s_cols)}개: {s_cols})")
-        wanted = [s_cols[i] for i in FEATURE_COL_IDX]
-        print(f"[IO] 위치 기준 feature 선택(Sample idx {FEATURE_COL_IDX[0]}..{FEATURE_COL_IDX[-1]}, "
-              f"{len(wanted)}개): {wanted}")
-        return wanted
+            raise ValueError(f"FEATURE_COL_IDX 가 Sample 열 범위를 벗어남: {bad} (열 {len(s_cols)}개)")
+        return [s_cols[i] for i in FEATURE_COL_IDX]
     raise ValueError("feature 컬럼을 지정하세요: FEATURE_COLS(이름) 또는 FEATURE_COL_IDX(위치).")
 
 
 def resolve_feature_names(sample_path, ref_path, fmt):
     """
-    '공통 feature 이름 목록'을 확정한다(양쪽에 모두 있는 컬럼만 사용).
-    - 위치(FEATURE_COL_IDX)로 골라도 Reference 에서는 '이름'으로 매칭한다(열 순서 무관).
-    - 한쪽에 없거나 중복된 컬럼은 '경고만 하고 제외'하고 계속 진행(exit 하지 않음).
-      → 사용할 공통 feature 가 하나도 없을 때만 에러.
+    공통 feature 를 확정하되, 최종 '순서는 Reference 헤더 기준'으로 고정한다.
+    (sample 열 순서가 달라도 동일 프레임 → 비교 가능). 없거나 중복은 경고 후 제외.
     """
     s_cols, r_cols = _header(sample_path, fmt), _header(ref_path, fmt)
-    wanted = _wanted_from_config(s_cols)
-
+    wanted = set(_wanted_from_config(s_cols))
     s_set, r_set = set(s_cols), set(r_cols)
     s_dup = {c for c in s_cols if s_cols.count(c) > 1}
     r_dup = {c for c in r_cols if r_cols.count(c) > 1}
 
     names, dropped = [], []
-    for c in wanted:
+    for c in r_cols:                       # Reference 순서로 확정
+        if c not in wanted:
+            continue
         if c not in s_set:
             dropped.append((c, "Sample 에 없음"))
-        elif c not in r_set:
-            dropped.append((c, "Reference 에 없음"))
         elif c in s_dup or c in r_dup:
             dropped.append((c, "중복 컬럼명(매칭 불가)"))
         else:
             names.append(c)
-
+    only_ref_missing = [c for c in wanted if c not in r_set]
+    for c in only_ref_missing:
+        dropped.append((c, "Reference 에 없음"))
     if dropped:
         print("[IO] 경고: 아래 컬럼은 feature 에서 제외하고 계속 진행합니다:")
         for c, why in dropped:
             print(f"        - {c}: {why}")
     if not names:
-        raise ValueError("사용할 공통 feature 컬럼이 하나도 없습니다. (경로/헤더 확인)")
-    print(f"[IO] feature {len(names)}개 사용(이름 기준): {names}")
+        raise ValueError("사용할 공통 feature 컬럼이 하나도 없습니다.")
+    print(f"[IO] feature {len(names)}개 사용(Reference 순서 고정): {names}")
     return names
 
 
-def _select(df, names):
-    """DataFrame 에서 names 컬럼만 그 순서로 뽑아 float ndarray + 비유한 행 제거."""
+def _select_raw(df, names):
+    """DataFrame → names 컬럼만 그 순서로 float ndarray + 비유한 행 제거."""
     df.columns = [str(c).strip() for c in df.columns]
     try:
-        X = df.loc[:, names].to_numpy(dtype=np.float64)   # ★ 이름으로 선택·정렬
+        X = df.loc[:, names].to_numpy(dtype=np.float64)
     except (ValueError, TypeError) as e:
         raise ValueError(f"feature 컬럼을 수치로 변환 실패(비수치 값 포함?): {e}")
     finite = np.isfinite(X).all(axis=1)
@@ -163,215 +142,246 @@ def _select(df, names):
 
 
 def read_matrix_by_name(path, names, fmt):
-    """작은 파일(Sample) 전체를 (n, d) float64 로 읽는다(feature 열만 선택 + 정제)."""
+    """작은 파일(Sample) 전체를 (n,d) float64 로(feature 열만, 정제)."""
     want = set(names)
     if fmt == "csv":
-        df = pd.read_csv(path, usecols=lambda c: str(c).strip() in want)  # feature 열만 파싱
+        df = pd.read_csv(path, usecols=lambda c: str(c).strip() in want)
     else:
         import pyarrow.parquet as pq
         raw = [c for c in pq.ParquetFile(path).schema_arrow.names if str(c).strip() in want]
         df = pq.read_table(path, columns=raw).to_pandas()
-    X, dropped = _select(df, names)
+    X, dropped = _select_raw(df, names)
     if dropped:
-        print(f"[IO] Sample 비유한(NaN/Inf) 행 {dropped:,}개 제거")
+        print(f"[IO] Sample 비유한 행 {dropped:,}개 제거")
     if len(X) == 0:
-        raise ValueError("Sample 에 유효한 행이 없습니다(전부 NaN/Inf?).")
+        raise ValueError("Sample 에 유효한 행이 없습니다.")
     return X
 
 
-def iter_ref_chunks(path, names, scaler, chunksize, fmt):
-    """Reference 를 chunk 스트리밍 → 이름 선택·정렬 → 정제 → 스케일링한 배열 yield."""
-    dropped_total = [0]
+def iter_ref_chunks_raw(path, names, chunksize, fmt):
+    """Reference 를 chunk 스트리밍 → feature 열만, 원시(raw) float ndarray yield."""
     want = set(names)
+    dropped = 0
     if fmt == "csv":
-        # feature 열만 파싱(뒤쪽 미사용/문자열 열은 아예 읽지 않음)
-        for chunk in pd.read_csv(path, usecols=lambda c: str(c).strip() in want,
-                                 chunksize=chunksize):
-            X, dropped = _select(chunk, names)
-            dropped_total[0] += dropped
+        for chunk in pd.read_csv(path, usecols=lambda c: str(c).strip() in want, chunksize=chunksize):
+            X, dd = _select_raw(chunk, names); dropped += dd
             if len(X):
-                yield scaler.transform(X)
+                yield X
     else:
         import pyarrow.parquet as pq
         pf = pq.ParquetFile(path)
-        raw = [c for c in pf.schema_arrow.names if str(c).strip() in set(names)]
+        raw = [c for c in pf.schema_arrow.names if str(c).strip() in want]
         for batch in pf.iter_batches(batch_size=chunksize, columns=raw):
-            X, dropped = _select(batch.to_pandas(), names)
-            dropped_total[0] += dropped
+            X, dd = _select_raw(batch.to_pandas(), names); dropped += dd
             if len(X):
-                yield scaler.transform(X)
-    if dropped_total[0]:
-        print(f"[IO] Reference 비유한 행 누적 {dropped_total[0]:,}개 제거")
-
-
-def stream_reduce(path, names, scaler, map_fn, reduce_fn, init, chunksize, fmt):
-    """Reference 전체를 map→reduce 로 1패스 집계(단일 스트리밍)."""
-    acc = init()
-    for X in iter_ref_chunks(path, names, scaler, chunksize, fmt):
-        acc = reduce_fn(acc, map_fn(X))
-    return acc
-
-
-def reservoir_sample(path, names, scaler, k, chunksize, fmt, seed=0):
-    """Reference 를 스트리밍하며 균일하게 k개 행 추출(Algorithm R), 스케일링된 배열 반환."""
-    rng = np.random.default_rng(seed)
-    reservoir = np.empty((k, len(names)), dtype=np.float32)
-    filled = seen = 0
-    for chunk in iter_ref_chunks(path, names, scaler, chunksize, fmt):
-        if filled < k:
-            take = min(k - filled, len(chunk))
-            reservoir[filled:filled + take] = chunk[:take]
-            filled += take; seen += take
-            chunk = chunk[take:]
-            if len(chunk) == 0:
-                continue
-        t = seen + np.arange(1, len(chunk) + 1)
-        accept = rng.random(len(chunk)) < (k / t)
-        if accept.any():
-            reservoir[rng.integers(0, k, accept.sum())] = chunk[accept]
-        seen += len(chunk)
-    print(f"[Reservoir] 전체 {seen:,} rows → {filled:,} rows 추출.")
-    return reservoir[:filled]
-
-
-def fit_scaler(X, method):
-    """Sample 배열로 스케일러 학습(standard|minmax). 상수열은 sklearn 이 scale=1 처리."""
-    scaler = MinMaxScaler() if method == "minmax" else StandardScaler()
-    scaler.fit(X)
-    zero_var = np.isclose(getattr(scaler, "var_", np.ones(X.shape[1])), 0).sum() \
-        if method == "standard" else 0
-    if zero_var:
-        print(f"[Scaler] 경고: 분산 0 인 feature {zero_var}개(정보 없음, scale=1 로 처리됨)")
-    print(f"[Scaler] Sample 기준 '{method}' 스케일러 학습 (dim={X.shape[1]})")
-    return scaler
+                yield X
+    if dropped:
+        print(f"[IO] Reference 비유한 행 누적 {dropped:,}개 제거")
 
 
 # =============================================================================
-# [MAHALANOBIS] 스트리밍 모멘트(μ, Σ) 추정
+# Reference 고정 프레임 (pass 1: 원시 모멘트 → 스케일러·μ·Σ·PCA·격자)
 # =============================================================================
-def _moments_map(block):
-    """한 chunk 의 [n, Σx, ΣxxᵀT] (μ·Σ 스트리밍 추정용)."""
-    return [block.shape[0], block.sum(axis=0), block.T @ block]
+def ref_raw_moments(path, names, chunksize, fmt):
+    """pass1: Reference 원시 [n, Σx, ΣxxᵀT, min, max]."""
+    d = len(names)
+    n = 0; s = np.zeros(d); ss = np.zeros((d, d))
+    mn = np.full(d, np.inf); mx = np.full(d, -np.inf)
+    for X in iter_ref_chunks_raw(path, names, chunksize, fmt):
+        n += len(X); s += X.sum(0); ss += X.T @ X
+        mn = np.minimum(mn, X.min(0)); mx = np.maximum(mx, X.max(0))
+    if n < d + 1:
+        raise ValueError(f"Reference 유효행 {n} < 차원 {d}+1: 공분산 추정 불가.")
+    mean = s / n
+    cov = ss / n - np.outer(mean, mean)
+    return n, mean, cov, mn, mx
 
 
-def _moments_init():
-    return [0, np.zeros(N_FEATURES), np.zeros((N_FEATURES, N_FEATURES))]
+def build_frame(mean_raw, cov_raw, mn, mx, method, q, K):
+    """원시 모멘트에서 스케일러(center/scale)와 표준화공간 μ·Σ·PCA·격자·per-feature 축을 만든다."""
+    d = len(mean_raw)
+    if method == "minmax":
+        center = mn.copy(); scale = (mx - mn).astype(float)
+    else:
+        center = mean_raw.copy(); scale = np.sqrt(np.diag(cov_raw))
+    scale[scale == 0] = 1.0
+    mu = (mean_raw - center) / scale
+    Sigma = cov_raw / np.outer(scale, scale)
 
-
-def _moments_reduce(acc, part):
-    acc[0] += part[0]; acc[1] += part[1]; acc[2] += part[2]
-    return acc
-
-
-def build_mahalanobis(mu, Sigma, q, K):
-    """
-    μ·Σ 로 타원체 도메인 + whitened top-K 격자 도메인을 구성한다.
-    반환 dict: mu, Sinv(=P), T(full-d χ²), Vk, sqrt_lamk, Tk, Rk, internalK,
-               evr_k, domain_set(=G_total), diagP, diagS.
-    """
-    d = len(mu)
-    ridge = 1e-6 * (np.trace(Sigma) / d)               # 수치 안정화(특이 방지)
+    ridge = 1e-6 * (np.trace(Sigma) / d)
     Sig = Sigma + ridge * np.eye(d)
     Sinv = np.linalg.inv(Sig)
-    w, V = np.linalg.eigh(Sig)                          # 오름차순 고유값
-    order = np.argsort(w)[::-1]                         # 큰 고유값 순
+    w, V = np.linalg.eigh(Sig)
+    order = np.argsort(w)[::-1]
     w, V = w[order], V[:, order]
     Vk, lamk = V[:, :K], w[:K]
     sqrt_lamk = np.sqrt(lamk)
     T, Tk = float(chi2.ppf(q, d)), float(chi2.ppf(q, K))
-    Rk = float(np.sqrt(Tk))
+    Rk, R1 = float(np.sqrt(Tk)), float(np.sqrt(chi2.ppf(q, 1)))
     internalK = np.linspace(-Rk, Rk, N_BINS_MAHAL + 1)[1:-1]
+    edges1d = np.linspace(-R1, R1, N_BINS_1D + 1)
     evr_k = float(lamk.sum() / w.sum())
 
-    edges = np.linspace(-Rk, Rk, N_BINS_MAHAL + 1)     # 타원 안 격자셀만 = G_total
+    edges = np.linspace(-Rk, Rk, N_BINS_MAHAL + 1)
     centers = (edges[:-1] + edges[1:]) / 2
     domain_set = set()
     for combo in itertools.product(range(N_BINS_MAHAL), repeat=K):
         if (centers[list(combo)] ** 2).sum() <= Tk:
             domain_set.add(np.array(combo, dtype=np.int16).tobytes())
 
-    return {"mu": mu, "Sinv": Sinv, "T": T, "Vk": Vk, "sqrt_lamk": sqrt_lamk,
-            "Tk": Tk, "Rk": Rk, "internalK": internalK, "evr_k": evr_k,
+    return {"center": center, "scale": scale, "mu": mu, "Sinv": Sinv, "T": T,
+            "Vk": Vk, "sqrt_lamk": sqrt_lamk, "Tk": Tk, "Rk": Rk, "R1": R1,
+            "internalK": internalK, "edges1d": edges1d, "evr_k": evr_k,
             "domain_set": domain_set, "diagP": np.diag(Sinv).copy(),
-            "diagS": np.diag(Sig).copy()}
+            "diagS": np.diag(Sig).copy(), "mean_raw": mean_raw,
+            "std_raw": np.sqrt(np.diag(cov_raw))}
 
 
 # =============================================================================
-# 커버리지 격자 (map→reduce)
+# 격자/whiten 헬퍼
 # =============================================================================
+def standardize(X, p):
+    return (X - p["center"]) / p["scale"]
+
+
+def whiten_topk(z, p):
+    return ((z - p["mu"]) @ p["Vk"]) / p["sqrt_lamk"]
+
+
 def _cells_of(u, internalK, K):
-    """whitened 좌표 u(타원 안 점) → 점유 격자셀 집합(bytes key)."""
     idx = np.empty(u.shape, dtype=np.int16)
     for a in range(K):
         idx[:, a] = np.digitize(u[:, a], internalK)
     return {row.tobytes() for row in np.unique(idx, axis=0)}
 
 
-def mahal_cover_map(block, p):
-    """한 block → [top-K 타원 안 점유 셀, full-d 타원밖 카운트, 전체 카운트]."""
-    n = block.shape[0]
-    if n == 0:
-        return [set(), 0, 0]
-    Xc = block - p["mu"]
-    d2_full = np.einsum("ij,jk,ik->i", Xc, p["Sinv"], Xc)   # full-d Mahalanobis²
-    n_out = int((d2_full > p["T"]).sum())
-    u = (Xc @ p["Vk"]) / p["sqrt_lamk"]                     # whitened top-K
-    uu = u[(u ** 2).sum(axis=1) <= p["Tk"]]                 # top-K 타원 안
-    if uu.shape[0] == 0:
-        return [set(), n_out, n]
-    return [_cells_of(uu, p["internalK"], p["Vk"].shape[1]), n_out, n]
-
-
-def _domain_init():
-    return [set(), 0, 0]
-
-
-def _domain_reduce(acc, part):
-    acc[0].update(part[0]); acc[1] += part[1]; acc[2] += part[2]
-    return acc
+def _feature_bins(w, p):
+    """per-feature 표준화좌표 w(=(z−μ)/√Σ_jj) → feature 별 점유 bin 집합 리스트."""
+    d = w.shape[1]; R1 = p["R1"]; edg = p["edges1d"][1:-1]
+    out = [set() for _ in range(d)]
+    for jf in range(d):
+        wj = w[:, jf]; inb = np.abs(wj) <= R1
+        if inb.any():
+            out[jf].update(np.unique(np.digitize(wj[inb], edg)).tolist())
+    return out
 
 
 # =============================================================================
-# 포인트별 분류(A) + 근원 항 MYT 분해(B)
+# Reference 커버리지 (pass 2: ref 셀 + per-feature bin + OOD + reservoir)
 # =============================================================================
-def whiten_topk(X, p):
-    """X → whitened 상위 K 좌표 u. u_i = vᵢ·(x−μ)/√λᵢ."""
-    return ((X - p["mu"]) @ p["Vk"]) / p["sqrt_lamk"]
+def ref_pass2(path, names, p, k, chunksize, fmt, seed=RESERVOIR_SEED):
+    K = p["Vk"].shape[1]; d = len(names)
+    cells = set(); n_out = 0; n_tot = 0
+    feat_bins = [set() for _ in range(d)]
+    sd = np.sqrt(p["diagS"])
+    rng = np.random.default_rng(seed)
+    reservoir = np.empty((k, d), dtype=np.float32); filled = seen = 0
+
+    for X in iter_ref_chunks_raw(path, names, chunksize, fmt):
+        z = standardize(X, p); e = z - p["mu"]
+        d2 = np.einsum("ij,jk,ik->i", e, p["Sinv"], e)
+        n_out += int((d2 > p["T"]).sum()); n_tot += len(z)
+        u = (e @ p["Vk"]) / p["sqrt_lamk"]
+        uu = u[(u ** 2).sum(1) <= p["Tk"]]
+        if len(uu):
+            cells |= _cells_of(uu, p["internalK"], K)
+        fb = _feature_bins(e / sd, p)
+        for jf in range(d):
+            feat_bins[jf] |= fb[jf]
+        zt = z.astype(np.float32)          # reservoir (scaled)
+        if filled < k:
+            take = min(k - filled, len(zt))
+            reservoir[filled:filled + take] = zt[:take]
+            filled += take; seen += take; zt = zt[take:]
+            if len(zt) == 0:
+                continue
+        t = seen + np.arange(1, len(zt) + 1)
+        acc = rng.random(len(zt)) < (k / t)
+        if acc.any():
+            reservoir[rng.integers(0, k, acc.sum())] = zt[acc]
+        seen += len(zt)
+
+    ref_pts = reservoir[:filled]
+    d2_ref = np.einsum("ij,jk,ik->i", ref_pts - p["mu"], p["Sinv"], ref_pts - p["mu"])
+    print(f"[Ref] pass2 완료: ref 셀={len(cells)}, reservoir={filled:,}, OOD={n_out/max(n_tot,1)*100:.2f}%")
+    return {"ref_cells": cells, "ref_out": n_out, "ref_tot": n_tot,
+            "ref_pts": ref_pts, "d2_ref": d2_ref, "feat_bins": feat_bins}
 
 
-def classify_points(X, p, ref_cells):
-    """
-    각 포인트를 Cat 로 분류 + 근원 항(MYT) 계산.
-    반환: cat(0=대변,1=도메인내,2=OOD), d2, c(조건부), uu(무조건부), u2(whitened topK).
-    """
-    e = X - p["mu"]
-    g = e @ p["Sinv"]                                    # P·e
-    d2 = np.einsum("ij,ij->i", e, g)                     # eᵀPe = full-d D²
-    c = g ** 2 / p["diagP"]                              # MYT 조건부 기여
-    uu = e ** 2 / p["diagS"]                             # 무조건부 기여
-    u2 = e @ p["Vk"] / p["sqrt_lamk"]                    # whitened top-K
+# =============================================================================
+# 캐시 (Reference 파생물: 프레임 + pass2). 같은 ref+config 면 스트리밍 생략.
+# =============================================================================
+def _cache_key(ref_path, names, fmt):
+    st = os.stat(ref_path)
+    key = {"ref": os.path.abspath(ref_path), "size": st.st_size, "mtime": int(st.st_mtime),
+           "names": names, "fmt": fmt, "scale": SCALE_METHOD, "q": MAHAL_Q,
+           "K": MAHAL_GRID_DIMS, "nb": N_BINS_MAHAL, "nb1d": N_BINS_1D,
+           "ds": PLOT_DOWNSAMPLE, "seed": RESERVOIR_SEED}
+    return hashlib.sha1(json.dumps(key, sort_keys=True).encode()).hexdigest()[:16]
 
-    cat = np.empty(len(X), dtype=np.int8)
-    ood = d2 > p["T"]                                    # Cat3: 타원체 밖
-    cat[ood] = 2
+
+def load_or_build_reference(ref_path, names, fmt):
+    """Reference 프레임 + pass2 결과를 반환(캐시 우선)."""
+    key = _cache_key(ref_path, names, fmt)
+    cpath = os.path.join(CACHE_DIR, f"ref_{key}.pkl")
+    if USE_CACHE and os.path.exists(cpath):
+        with open(cpath, "rb") as f:
+            obj = pickle.load(f)
+        print(f"[Cache] Reference 파생물 재사용: {cpath} (스트리밍 생략)")
+        return obj
+
+    print("[Cache] 캐시 없음 → Reference 스트리밍(2 passes)")
+    n_ref, mean_raw, cov_raw, mn, mx = ref_raw_moments(ref_path, names, CHUNKSIZE, fmt)
+    p = build_frame(mean_raw, cov_raw, mn, mx, SCALE_METHOD, MAHAL_Q, MAHAL_GRID_DIMS)
+    print(f"[Frame] Reference 고정 프레임({n_ref:,} rows); top-{MAHAL_GRID_DIMS} EVR={p['evr_k']*100:.1f}%, "
+          f"|G_total|={len(p['domain_set']):,}")
+    r2 = ref_pass2(ref_path, names, p, PLOT_DOWNSAMPLE, CHUNKSIZE, fmt)
+    obj = {"p": p, "n_ref": n_ref, **r2}
+    if USE_CACHE:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        with open(cpath, "wb") as f:
+            pickle.dump(obj, f)
+        print(f"[Cache] 저장: {cpath}")
+    return obj
+
+
+# =============================================================================
+# Sample 분류(A) + 근원 항(B) + per-feature 커버리지
+# =============================================================================
+def classify_points(z, p, ref_cells):
+    e = z - p["mu"]
+    g = e @ p["Sinv"]
+    d2 = np.einsum("ij,ij->i", e, g)
+    c = g ** 2 / p["diagP"]
+    uu_ = e ** 2 / p["diagS"]
+    u2 = e @ p["Vk"] / p["sqrt_lamk"]
+    cat = np.empty(len(z), dtype=np.int8)
+    ood = d2 > p["T"]; cat[ood] = 2
     ind = ~ood
-    in_ell = ind & ((u2 ** 2).sum(axis=1) <= p["Tk"])   # top-K 타원 안
+    in_ell = ind & ((u2 ** 2).sum(1) <= p["Tk"])
     for i in np.where(ind)[0]:
         if not in_ell[i]:
-            cat[i] = 1                                   # 타원체엔 있으나 top-K 격자 밖
-            continue
+            cat[i] = 1; continue
         key = _cells_of(u2[i:i + 1], p["internalK"], p["Vk"].shape[1]).pop()
         cat[i] = 0 if key in ref_cells else 1
-    return {"cat": cat, "d2": d2, "c": c, "uu": uu, "u2": u2}
+    return {"cat": cat, "d2": d2, "c": c, "uu": uu_, "u2": u2}
+
+
+def per_feature_coverage(w_s, p, ref_feat_bins):
+    """feature 별 coverage_j = |sam∩ref bins| / |ref bins|, 그리고 sample bins."""
+    d = w_s.shape[1]; R1 = p["R1"]; edg = p["edges1d"][1:-1]
+    cov = np.zeros(d)
+    for j in range(d):
+        wj = w_s[:, j]; inb = np.abs(wj) <= R1
+        sb = set(np.unique(np.digitize(wj[inb], edg)).tolist()) if inb.any() else set()
+        rb = ref_feat_bins[j]
+        cov[j] = len(sb & rb) / len(rb) if rb else 0.0
+    return cov
 
 
 def gap_feature_diff(ref_pts, p, sam_cells):
-    """
-    (C) Gap 원인: reservoir Reference 를 top-K 격자로 나눠, Sample 이 못 밟은 셀(gap) ref vs
-    대변 셀 ref 의 '원본 feature 평균차'. 반환: (diff(d,), n_gap, n_cov). diff>0=gap 쪽 큼.
-    """
     u = whiten_topk(ref_pts, p)
-    in_ell = (u ** 2).sum(axis=1) <= p["Tk"]
+    in_ell = (u ** 2).sum(1) <= p["Tk"]
     rp, u = ref_pts[in_ell], u[in_ell]
     idx = np.empty(u.shape, dtype=np.int16)
     for a in range(u.shape[1]):
@@ -379,19 +389,19 @@ def gap_feature_diff(ref_pts, p, sam_cells):
     is_gap = np.array([row.tobytes() not in sam_cells for row in idx])
     if is_gap.sum() == 0 or (~is_gap).sum() == 0:
         return np.zeros(N_FEATURES), int(is_gap.sum()), int((~is_gap).sum())
-    diff = rp[is_gap].mean(axis=0) - rp[~is_gap].mean(axis=0)
+    diff = rp[is_gap].mean(0) - rp[~is_gap].mean(0)
     return diff, int(is_gap.sum()), int((~is_gap).sum())
 
 
 # =============================================================================
-# 시각화 ① whitened top-2 격자 커버리지 (covered=초록 / gap=주황) + 산점
+# 시각화
 # =============================================================================
 def plot_coverage_2d(u_s, u_r, ref_cells, sam_cells, p, sam_cov, out_path):
     from matplotlib.colors import BoundaryNorm, ListedColormap
     from matplotlib.patches import Circle, Patch
     dom = p["domain_set"]
     edges = np.linspace(-p["Rk"], p["Rk"], N_BINS_MAHAL + 1)
-    M = np.full((N_BINS_MAHAL, N_BINS_MAHAL), np.nan)    # 0 빈/1 gap/2 대변
+    M = np.full((N_BINS_MAHAL, N_BINS_MAHAL), np.nan)
     for i in range(N_BINS_MAHAL):
         for j in range(N_BINS_MAHAL):
             key = np.array([i, j], dtype=np.int16).tobytes()
@@ -399,17 +409,13 @@ def plot_coverage_2d(u_s, u_r, ref_cells, sam_cells, p, sam_cov, out_path):
                 continue
             in_r, in_s = key in ref_cells, key in sam_cells
             M[i, j] = 2 if (in_r and in_s) else (1 if in_r else 0)
-
-    cmap = ListedColormap([C_EMPTY, C_GAP, C_COVER])    # 빈/gap(주황)/covered(초록)
+    cmap = ListedColormap([C_EMPTY, C_GAP, C_COVER])
     norm = BoundaryNorm([-0.5, 0.5, 1.5, 2.5], cmap.N)
     fig, ax = plt.subplots(figsize=(9, 8.5))
-    ax.pcolormesh(edges, edges, np.ma.masked_invalid(M).T, cmap=cmap, norm=norm,
-                  edgecolors="none")                     # 내부 격자선 제거
-    # 원 = Reference 의 Mahalanobis 도메인 경계(반경 √Tk = √χ²(q,2))
+    ax.pcolormesh(edges, edges, np.ma.masked_invalid(M).T, cmap=cmap, norm=norm, edgecolors="none")
     ax.add_patch(Circle((0, 0), p["Rk"], fill=False, edgecolor="#333", linewidth=1.6))
     ax.scatter(u_r[:, 0], u_r[:, 1], s=6, c=C_REF, alpha=0.10, linewidths=0, label="Reference")
     ax.scatter(u_s[:, 0], u_s[:, 1], s=14, c=C_SAMPLE, alpha=0.10, linewidths=0, label="Sample")
-
     handles = [Patch(facecolor=C_EMPTY, edgecolor="#BBB", label="Empty domain (no ref)"),
                Patch(facecolor=C_GAP, edgecolor="#BBB", label="Gap (ref only, uncovered)"),
                Patch(facecolor=C_COVER, edgecolor="#BBB", label="Covered (sample)")]
@@ -417,18 +423,14 @@ def plot_coverage_2d(u_s, u_r, ref_cells, sam_cells, p, sam_cov, out_path):
     ax.add_artist(leg1)
     ax.legend(loc="lower right", fontsize=9, framealpha=0.9, title="Points")
     ax.set_xlabel("whitened PC1"); ax.set_ylabel("whitened PC2")
-    ax.set_title(f"Mahalanobis Domain Coverage (q={MAHAL_Q})  |  "
-                 f"Sample Coverage = {sam_cov*100:.2f}%\n"
+    ax.set_title(f"Mahalanobis Domain Coverage (q={MAHAL_Q})  |  top-2 grid cov = {sam_cov*100:.1f}%\n"
                  f"circle = Ref Mahalanobis boundary (R={p['Rk']:.2f})", fontsize=13)
     ax.set_aspect("equal")
     fig.tight_layout(); fig.savefig(out_path, dpi=130); plt.close(fig)
-    print(f"[Plot] (1) coverage-2d 저장: {out_path}")
+    print(f"[Plot] coverage-2d 저장: {out_path}")
 
 
-# =============================================================================
-# 시각화 ①' Reference vs Sample 산점만 (whitened top-2, alpha=0.7)
-# =============================================================================
-def plot_scatter_ref_sample(u_s, u_r, p, out_path):
+def plot_scatter_ref_sample(u_s, u_r, out_path):
     fig, ax = plt.subplots(figsize=(9, 8.5))
     ax.scatter(u_r[:, 0], u_r[:, 1], s=8, c=C_REF, alpha=0.7, linewidths=0, label="Reference")
     ax.scatter(u_s[:, 0], u_s[:, 1], s=14, c=C_SAMPLE, alpha=0.7, linewidths=0, label="Sample")
@@ -436,50 +438,75 @@ def plot_scatter_ref_sample(u_s, u_r, p, out_path):
     ax.set_title("Reference vs Sample scatter (whitened top-2)")
     ax.set_aspect("equal"); ax.legend(fontsize=10, loc="lower right")
     fig.tight_layout(); fig.savefig(out_path, dpi=130); plt.close(fig)
-    print(f"[Plot] (1') ref-sample scatter 저장: {out_path}")
+    print(f"[Plot] ref-sample scatter 저장: {out_path}")
 
 
-# =============================================================================
-# 시각화 ② full-d Mahalanobis D² 분포 (Ref vs Sample) + χ²(d) 이론곡선
-# =============================================================================
+def plot_perfeature_coverage(cov, names, out_path):
+    order = np.argsort(cov)                         # 낮은 것부터(부족 축이 위/아래로 눈에)
+    y = np.arange(len(order))
+    fig, ax = plt.subplots(figsize=(9, max(5, 0.4 * len(order))))
+    colors = [C_GAP if cov[i] < 0.5 else C_SAMPLE for i in order]
+    ax.barh(y, cov[order] * 100, color=colors)
+    ax.axvline(np.mean(cov) * 100, color="#333", ls="--", lw=1.2,
+               label=f"mean = {np.mean(cov)*100:.1f}%")
+    ax.set_yticks(y); ax.set_yticklabels([names[i] for i in order])
+    ax.set_xlabel("per-feature coverage (%)"); ax.set_ylabel("feature")
+    ax.set_xlim(0, 100)
+    ax.set_title("Per-feature 1D coverage (Sample vs Reference)\n"
+                 "low bar = feature Sample fails to cover")
+    ax.legend(fontsize=10, loc="lower right")
+    fig.tight_layout(); fig.savefig(out_path, dpi=130); plt.close(fig)
+    print(f"[Plot] per-feature coverage 저장: {out_path}")
+
+
+def plot_perfeature_dist(w_s, w_r, names, p, out_path):
+    d = len(names); ncol = 5; nrow = int(np.ceil(d / ncol))
+    R1 = p["R1"]; bins = np.linspace(-max(R1, 4), max(R1, 4), 40)
+    fig, axes = plt.subplots(nrow, ncol, figsize=(3.0 * ncol, 2.4 * nrow), squeeze=False)
+    for j in range(nrow * ncol):
+        ax = axes[j // ncol][j % ncol]
+        if j >= d:
+            ax.axis("off"); continue
+        ax.hist(w_r[:, j], bins=bins, density=True, color=C_REF, alpha=0.5, label="Ref")
+        ax.hist(w_s[:, j], bins=bins, density=True, color=C_SAMPLE, alpha=0.5, label="Sample")
+        ax.axvline(-R1, color="#999", ls=":", lw=0.8); ax.axvline(R1, color="#999", ls=":", lw=0.8)
+        ax.set_title(names[j], fontsize=9); ax.set_yticks([]); ax.tick_params(labelsize=7)
+        if j == 0:
+            ax.legend(fontsize=7)
+    fig.suptitle("Per-feature distribution: Reference(gray) vs Sample(green)  "
+                 "(x = per-feature standardized, dotted = domain ±R1)", fontsize=12)
+    fig.tight_layout(rect=[0, 0, 1, 0.97]); fig.savefig(out_path, dpi=120); plt.close(fig)
+    print(f"[Plot] per-feature dist 저장: {out_path}")
+
+
 def plot_distribution(d2_ref, d2_sam, p, out_path):
     fig, ax = plt.subplots(figsize=(9.5, 6))
     hi = np.percentile(np.concatenate([d2_ref, d2_sam]), 99.5)
     bins = np.linspace(0, hi, 60)
-    sns.histplot(d2_ref, bins=bins, stat="density", color="#999999", alpha=0.45,
-                 label="Reference", ax=ax, edgecolor=None)
-    sns.histplot(d2_sam, bins=bins, stat="density", color=C_SAMPLE, alpha=0.45,
-                 label="Sample", ax=ax, edgecolor=None)
+    sns.histplot(d2_ref, bins=bins, stat="density", color=C_REF, alpha=0.45, label="Reference", ax=ax, edgecolor=None)
+    sns.histplot(d2_sam, bins=bins, stat="density", color=C_SAMPLE, alpha=0.45, label="Sample", ax=ax, edgecolor=None)
     xs = np.linspace(1e-6, hi, 400)
-    ax.plot(xs, chi2.pdf(xs, N_FEATURES), color="#1F77B4", lw=2.2,
-            label=f"chi2(d={N_FEATURES}) theoretical")
-    ax.axvline(p["T"], color="#333", ls="--", lw=1.6,
-               label=f"Domain bound T=chi2({MAHAL_Q},d)={p['T']:.1f}")
+    ax.plot(xs, chi2.pdf(xs, N_FEATURES), color="#1F77B4", lw=2.2, label=f"chi2(d={N_FEATURES}) theoretical")
+    ax.axvline(p["T"], color="#333", ls="--", lw=1.6, label=f"Domain bound T=chi2({MAHAL_Q},d)={p['T']:.1f}")
     ax.set_xlabel("Mahalanobis D^2 (full-d)"); ax.set_ylabel("density")
-    ax.set_title("Mahalanobis distance: Reference vs Sample\n"
-                 "(Sample shifted right = larger deviation from Reference)")
+    ax.set_title("Mahalanobis distance: Reference vs Sample\n(Sample shifted right = larger deviation)")
     ax.legend(fontsize=10)
     fig.tight_layout(); fig.savefig(out_path, dpi=130); plt.close(fig)
-    print(f"[Plot] (2) distribution 저장: {out_path}")
+    print(f"[Plot] distribution 저장: {out_path}")
 
 
-# =============================================================================
-# 시각화 ③ 로딩 Biplot (PC1·PC2 평면의 원본 feature 방향)
-# =============================================================================
 def plot_biplot(p, names, out_path):
-    # 로딩(상관 스케일) = v_j * √λ_j 를 단위원 기준으로 정규화 → 방향·상대크기 강조
-    load = p["Vk"] * p["sqrt_lamk"]                     # (d, 2)
-    L = load / (np.abs(load).max() + 1e-9)             # 최대 성분이 1 이 되도록 스케일
-    colors = sns.color_palette("husl", N_FEATURES)     # feature 별 고유 색(겹쳐도 구분)
-    fig, ax = plt.subplots(figsize=(10, 9))
+    load = p["Vk"] * p["sqrt_lamk"]
+    L = load / (np.abs(load).max() + 1e-9)
+    colors = sns.color_palette("husl", N_FEATURES)
     from matplotlib.patches import Circle
+    fig, ax = plt.subplots(figsize=(10, 9))
     ax.add_patch(Circle((0, 0), 1.0, fill=False, edgecolor="#DDD", ls="--", lw=1.0))
     ax.axhline(0, color="#EEE", lw=0.8); ax.axvline(0, color="#EEE", lw=0.8)
     for j in range(N_FEATURES):
         dx, dy = L[j, 0], L[j, 1]
         ax.annotate("", xy=(dx, dy), xytext=(0, 0),
                     arrowprops=dict(arrowstyle="-|>", color=colors[j], lw=1.8, alpha=0.9))
-        # 라벨을 화살표 끝보다 살짝 바깥, 같은 색 + 흰 배경 박스로 겹침 가독성↑
         r = np.hypot(dx, dy) + 1e-9
         ax.text(dx + 0.09 * dx / r, dy + 0.09 * dy / r, names[j], color=colors[j],
                 fontsize=9, fontweight="bold", ha="center", va="center",
@@ -490,68 +517,49 @@ def plot_biplot(p, names, out_path):
                  "Arrows: original features projected on PC1-PC2 (normalized)")
     ax.set_aspect("equal")
     fig.tight_layout(); fig.savefig(out_path, dpi=130); plt.close(fig)
-    print(f"[Plot] (3) biplot 저장: {out_path}")
+    print(f"[Plot] biplot 저장: {out_path}")
 
 
-# =============================================================================
-# 시각화 ④ OOD 근원 항 랭킹 (조건부 c_j vs 무조건부 u_j)
-# =============================================================================
 def plot_ood_attribution(cls, names, out_path, topn=15):
     ood = cls["cat"] == 2
     if ood.sum() == 0:
-        print("[Plot] (4) OOD 없음 → 근원 항 막대 생략")
-        return None
-    cond = cls["c"][ood].mean(axis=0)
-    uncond = cls["uu"][ood].mean(axis=0)
-    order = np.argsort(cond)[::-1][:topn]
-    y = np.arange(len(order))[::-1]
+        print("[Plot] OOD 없음 → attribution 생략"); return None
+    cond = cls["c"][ood].mean(0); uncond = cls["uu"][ood].mean(0)
+    order = np.argsort(cond)[::-1][:topn]; y = np.arange(len(order))[::-1]
     fig, ax = plt.subplots(figsize=(9.5, max(5, 0.42 * len(order))))
     ax.barh(y + 0.2, cond[order], height=0.4, color="#D62728", label="Conditional c_j (MYT)")
     ax.barh(y - 0.2, uncond[order], height=0.4, color="#F0A0A0", label="Unconditional u_j")
     ax.set_yticks(y); ax.set_yticklabels([names[i] for i in order])
     ax.set_xlabel("Mean Mahalanobis^2 contribution"); ax.set_ylabel("feature")
-    ax.set_title(f"OOD points ({int(ood.sum())}) attribution ranking\n"
-                 "High c_j = main driver of leaving the Reference domain")
+    ax.set_title(f"OOD points ({int(ood.sum())}) attribution ranking\nHigh c_j = main driver of leaving domain")
     ax.legend(fontsize=10)
     fig.tight_layout(); fig.savefig(out_path, dpi=130); plt.close(fig)
-    print(f"[Plot] (4) ood-attribution 저장: {out_path}")
+    print(f"[Plot] ood-attribution 저장: {out_path}")
     return [(names[i], float(cond[i])) for i in order[:5]]
 
 
-# =============================================================================
-# 시각화 ⑤ Gap 원인 feature 발산형 막대
-# =============================================================================
 def plot_gap_attribution(diff, n_gap, n_cov, names, out_path, topn=15):
     if n_gap == 0:
-        print("[Plot] (5) Gap 없음 → 생략")
-        return
+        print("[Plot] Gap 없음 → 생략"); return
     order = np.argsort(np.abs(diff))[::-1][:topn]
     order = order[np.argsort(diff[order])]
-    y = np.arange(len(order))
-    colors = ["#D62728" if diff[i] > 0 else "#1F77B4" for i in order]
+    y = np.arange(len(order)); colors = ["#D62728" if diff[i] > 0 else "#1F77B4" for i in order]
     fig, ax = plt.subplots(figsize=(9.5, max(5, 0.42 * len(order))))
-    ax.barh(y, diff[order], color=colors)
-    ax.axvline(0, color="#333", lw=1.0)
+    ax.barh(y, diff[order], color=colors); ax.axvline(0, color="#333", lw=1.0)
     ax.set_yticks(y); ax.set_yticklabels([names[i] for i in order])
     ax.set_xlabel("Gap-cell mean - Covered-cell mean (scaled)"); ax.set_ylabel("feature")
     ax.set_title(f"Gap region driver features (gap ref={n_gap}, cover ref={n_cov})\n"
                  "Red = higher in gap / Blue = higher in covered")
     fig.tight_layout(); fig.savefig(out_path, dpi=130); plt.close(fig)
-    print(f"[Plot] (5) gap-attribution 저장: {out_path}")
+    print(f"[Plot] gap-attribution 저장: {out_path}")
 
 
-# =============================================================================
-# 시각화 ⑥ 극단 OOD top-N × feature 조건부 기여 히트맵
-# =============================================================================
 def plot_ood_heatmap(cls, names, out_path, topn=OOD_HEATMAP_TOPN):
     ood = np.where(cls["cat"] == 2)[0]
     if len(ood) == 0:
-        print("[Plot] (6) OOD 없음 → 히트맵 생략")
-        return
+        print("[Plot] OOD 없음 → 히트맵 생략"); return
     ood = ood[np.argsort(cls["d2"][ood])[::-1][:topn]]
-    C = cls["c"][ood]
-    fcol = np.argsort(C.sum(axis=0))[::-1]
-    C = C[:, fcol]
+    C = cls["c"][ood]; fcol = np.argsort(C.sum(0))[::-1]; C = C[:, fcol]
     fig, ax = plt.subplots(figsize=(min(16, 0.5 * N_FEATURES + 3), max(6, 0.32 * len(ood))))
     sns.heatmap(C, cmap="Reds", ax=ax, cbar_kws={"label": "c_j (conditional contribution)"},
                 xticklabels=[names[i] for i in fcol],
@@ -560,20 +568,16 @@ def plot_ood_heatmap(cls, names, out_path, topn=OOD_HEATMAP_TOPN):
     ax.set_title(f"Top-{len(ood)} extreme OOD points: per-feature attribution (c_j)")
     plt.setp(ax.get_xticklabels(), rotation=45, ha="right", fontsize=8)
     fig.tight_layout(); fig.savefig(out_path, dpi=130); plt.close(fig)
-    print(f"[Plot] (6) ood-heatmap 저장: {out_path}")
+    print(f"[Plot] ood-heatmap 저장: {out_path}")
 
 
 # =============================================================================
-# 결과 저장 (행 데이터 + PC1/PC2 + cover 상태)
+# 결과 저장
 # =============================================================================
-_COVER_LABEL = np.array(["covered", "in_domain_no_ref", "out_of_domain"])   # cat 0/1/2
+_COVER_LABEL = np.array(["covered", "in_domain_no_ref", "out_of_domain"])
 
 
 def export_sample(sample_path, names, cls, fmt, out_path):
-    """
-    읽었던 Sample 원본(모든 컬럼)에 PC1·PC2(whitened top-2)·cover 상태를 붙여 저장한다.
-    (분석에서 제외된 NaN/Inf 행은 PC/상태가 비어있음)
-    """
     if fmt == "csv":
         df = pd.read_csv(sample_path)
     else:
@@ -581,42 +585,49 @@ def export_sample(sample_path, names, cls, fmt, out_path):
         df = pq.read_table(sample_path).to_pandas()
     df.columns = [str(c).strip() for c in df.columns]
     X = df.loc[:, names].to_numpy(dtype=np.float64)
-    finite = np.isfinite(X).all(axis=1)                    # 분석에 쓰인 행 마스크(순서 동일)
-
+    finite = np.isfinite(X).all(axis=1)
     pc1 = np.full(len(df), np.nan); pc2 = np.full(len(df), np.nan)
-    status = np.array([""] * len(df), dtype=object)
+    d2 = np.full(len(df), np.nan); status = np.array([""] * len(df), dtype=object)
     covered = np.zeros(len(df), dtype=bool)
-    pc1[finite] = cls["u2"][:, 0]
-    pc2[finite] = cls["u2"][:, 1]
-    status[finite] = _COVER_LABEL[cls["cat"]]
+    pc1[finite] = cls["u2"][:, 0]; pc2[finite] = cls["u2"][:, 1]
+    d2[finite] = cls["d2"]; status[finite] = _COVER_LABEL[cls["cat"]]
     covered[finite] = (cls["cat"] == 0)
-
-    df["PC1"], df["PC2"] = pc1, pc2
+    df["PC1"], df["PC2"], df["D2_full"] = pc1, pc2, d2
     df["cover_status"], df["covered"] = status, covered
     df.to_csv(out_path, index=False)
-    print(f"[Save] Sample+PC+cover 저장: {out_path}  (rows={len(df):,}, covered={int(covered.sum()):,})")
+    print(f"[Save] sample_pc_cover: {out_path} (rows={len(df):,}, covered={int(covered.sum()):,})")
 
 
-def export_uncovered_ref(ref_pts, p, sam_cells, scaler, names, out_path):
-    """
-    scatter 에 쓰인 Reference(reservoir) 중 'cover 안 되는(gap)' 포인트만 추출해 저장한다.
-    = top-2 타원 안이지만 Sample 이 밟지 않은 셀에 속한 ref 행 + PC1·PC2.
-    feature 값은 원본 스케일로 복원(scaler.inverse_transform).
-    """
-    u = whiten_topk(ref_pts, p)                            # (n, K)
-    in_ell = (u ** 2).sum(axis=1) <= p["Tk"]
+def export_uncovered_ref(ref_pts, p, sam_cells, names, out_path):
+    u = whiten_topk(ref_pts, p)
+    in_ell = (u ** 2).sum(1) <= p["Tk"]
     idx = np.empty(u.shape, dtype=np.int16)
     for a in range(u.shape[1]):
         idx[:, a] = np.digitize(u[:, a], p["internalK"])
     keys = [row.tobytes() for row in idx]
-    uncovered = np.array([in_ell[i] and (keys[i] not in sam_cells) for i in range(len(ref_pts))])
-
-    feats = scaler.inverse_transform(ref_pts[uncovered])   # 원본 스케일 복원
+    unc = np.array([in_ell[i] and (keys[i] not in sam_cells) for i in range(len(ref_pts))])
+    feats = ref_pts[unc] * p["scale"] + p["center"]        # 표준화 역변환 → 원본 스케일
     out = pd.DataFrame(feats, columns=names)
-    out["PC1"], out["PC2"] = u[uncovered, 0], u[uncovered, 1]
+    out["PC1"], out["PC2"] = u[unc, 0], u[unc, 1]
     out.to_csv(out_path, index=False)
-    print(f"[Save] Uncovered Reference 저장: {out_path}  "
-          f"(uncovered={int(uncovered.sum()):,} / scatter ref={len(ref_pts):,})")
+    print(f"[Save] reference_uncovered: {out_path} (uncovered={int(unc.sum()):,}/{len(ref_pts):,})")
+
+
+def export_per_feature(cov, w_s, cls, sample_raw, p, ref_feat_bins, names, out_path):
+    d = len(names)
+    rows = []
+    for j in range(d):
+        rows.append({
+            "feature": names[j],
+            "coverage_1d": round(float(cov[j]), 6),
+            "ref_bins": len(ref_feat_bins[j]),
+            "ref_mean": float(p["mean_raw"][j]), "ref_std": float(p["std_raw"][j]),
+            "sample_mean": float(sample_raw[:, j].mean()), "sample_std": float(sample_raw[:, j].std()),
+            "sample_mean_abs_w": float(np.abs(w_s[:, j]).mean()),   # feature 이탈 크기(표준화)
+            "sample_mean_cj": float(cls["c"][:, j].mean()),         # MYT 조건부 기여 평균
+        })
+    pd.DataFrame(rows).to_csv(out_path, index=False)
+    print(f"[Save] per_feature_coverage: {out_path} (mean cov={cov.mean()*100:.2f}%)")
 
 
 # =============================================================================
@@ -626,88 +637,86 @@ def run():
     global N_FEATURES
     for pth in (SAMPLE_PATH, REF_PATH):
         if not os.path.exists(pth):
-            raise FileNotFoundError(f"입력 파일 없음: {pth} (CONFIG 경로 확인)")
+            raise FileNotFoundError(f"입력 파일 없음: {pth}")
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+    j = lambda f: os.path.join(OUTPUT_DIR, f)
 
-    # feature 이름 확정(양쪽 매칭) → Sample 로드 → 스케일러 → 스케일링
     names = resolve_feature_names(SAMPLE_PATH, REF_PATH, FMT)
     N_FEATURES = len(names)
-    sample = read_matrix_by_name(SAMPLE_PATH, names, FMT)
-    scaler = fit_scaler(sample, SCALE_METHOD)
-    sample_scaled = scaler.transform(sample)
 
-    # (1) μ·Σ 스트리밍 추정
-    n_ref, sum_x, sum_xx = stream_reduce(
-        REF_PATH, names, scaler, _moments_map, _moments_reduce, _moments_init, CHUNKSIZE, FMT)
-    if n_ref < N_FEATURES + 1:
-        raise ValueError(f"Reference 유효행 {n_ref} < 차원 {N_FEATURES}+1: 공분산 추정 불가.")
-    mu = sum_x / n_ref
-    Sigma = sum_xx / n_ref - np.outer(mu, mu)
-    p = build_mahalanobis(mu, Sigma, MAHAL_Q, MAHAL_GRID_DIMS)
-    dom = p["domain_set"]
-    print(f"[Domain] μ·Σ 추정({n_ref:,} rows), 타원 q={MAHAL_Q} "
-          f"(√T_full={np.sqrt(p['T']):.2f}); top-{MAHAL_GRID_DIMS} EVR={p['evr_k']*100:.1f}%, "
-          f"|G_total|={len(dom):,} 셀")
+    # Reference 고정 프레임 + pass2 (캐시 우선)
+    R = load_or_build_reference(REF_PATH, names, FMT)
+    p = R["p"]; ref_cells = R["ref_cells"]; dom = p["domain_set"]
+    ref_pts = R["ref_pts"]; d2_ref = R["d2_ref"]; ref_feat_bins = R["feat_bins"]
 
-    # (2) 커버리지 스트리밍 패스(Reference) + Sample(메모리)
-    sam_cells, sam_out, sam_tot = mahal_cover_map(sample_scaled, p)
-    map_fn = functools.partial(mahal_cover_map, p=p)
-    ref_cells, ref_out, ref_tot = stream_reduce(
-        REF_PATH, names, scaler, map_fn, _domain_reduce, _domain_init, CHUNKSIZE, FMT)
+    # Sample → 고정 프레임에 투영
+    sample_raw = read_matrix_by_name(SAMPLE_PATH, names, FMT)
+    z_s = standardize(sample_raw, p)
+    cls = classify_points(z_s, p, ref_cells)
+    w_s = (z_s - p["mu"]) / np.sqrt(p["diagS"])
+    sam_cells = mahal_sample_cells(z_s, p)
+
+    # 커버리지 지표
     ref_cov = len(ref_cells & dom) / len(dom)
     sam_cov = len(sam_cells & dom) / len(dom)
-    verified = len(sam_cells & ref_cells & dom)         # Cat1 셀
-    gap = len(ref_cells & dom) - verified               # Cat2 셀
-
-    # (3) 포인트별 분류(A) + 근원 항(B)
-    cls = classify_points(sample_scaled, p, ref_cells)
+    verified = len(sam_cells & ref_cells & dom)
+    denom_ref = len(ref_cells & dom)
+    gap = denom_ref - verified
+    cov_of_ref = verified / denom_ref if denom_ref else 0.0
+    feat_cov = per_feature_coverage(w_s, p, ref_feat_bins)      # ★ 헤드라인
+    headline = float(feat_cov.mean())
     cat = cls["cat"]
     n_ver, n_ind, n_ood = (cat == 0).sum(), (cat == 1).sum(), (cat == 2).sum()
+    sam_out = int((cls["d2"] > p["T"]).sum())
 
-    # 시각화용 Reference reservoir 표본
-    ref_pts = reservoir_sample(REF_PATH, names, scaler, PLOT_DOWNSAMPLE, CHUNKSIZE, FMT)
-    d2_ref = np.einsum("ij,jk,ik->i", ref_pts - mu, p["Sinv"], ref_pts - mu)
+    # per-feature ref 분포(reservoir) — small-multiples 용
+    w_r = (ref_pts - p["mu"]) / np.sqrt(p["diagS"])
     u_s, u_r = cls["u2"][:, :2], whiten_topk(ref_pts, p)[:, :2]
-
-    # (4) Gap 원인(C) — reservoir 근사
     gap_diff, n_gap_r, n_cov_r = gap_feature_diff(ref_pts, p, sam_cells)
 
     # 시각화
-    j = lambda f: os.path.join(OUTPUT_DIR, f)
+    plot_perfeature_coverage(feat_cov, names, j("per_feature_coverage_bars.png"))
+    plot_perfeature_dist(w_s, w_r, names, p, j("per_feature_distributions.png"))
     plot_coverage_2d(u_s, u_r, ref_cells, sam_cells, p, sam_cov, j("domain_mahalanobis_2d.png"))
-    plot_scatter_ref_sample(u_s, u_r, p, j("domain_scatter_ref_sample.png"))
+    plot_scatter_ref_sample(u_s, u_r, j("domain_scatter_ref_sample.png"))
     plot_distribution(d2_ref, cls["d2"], p, j("domain_mahal_distribution.png"))
     plot_biplot(p, names, j("domain_loadings_biplot.png"))
     top_ood = plot_ood_attribution(cls, names, j("domain_ood_attribution.png"))
     plot_gap_attribution(gap_diff, n_gap_r, n_cov_r, names, j("domain_gap_attribution.png"))
     plot_ood_heatmap(cls, names, j("domain_ood_heatmap.png"))
 
-    # 결과 저장 (행 데이터 + PC1/PC2)
+    # 저장
     export_sample(SAMPLE_PATH, names, cls, FMT, j("sample_pc_cover.csv"))
-    export_uncovered_ref(ref_pts, p, sam_cells, scaler, names, j("reference_uncovered_pc.csv"))
+    export_uncovered_ref(ref_pts, p, sam_cells, names, j("reference_uncovered_pc.csv"))
+    export_per_feature(feat_cov, w_s, cls, sample_raw, p, ref_feat_bins, names, j("per_feature_coverage.csv"))
 
     # 리포트
-    print("\n" + "=" * 68)
-    print("  [Mahalanobis Domain Coverage & Attribution]")
-    print("=" * 68)
-    denom_ref = len(ref_cells & dom)
-    cov_of_ref = verified / denom_ref if denom_ref else 0.0     # (A) Ref footprint 기준
-    print(f"  |G_total| (도메인 셀)              : {len(dom):,}")
-    print(f"  Reference Domain Coverage          : {ref_cov*100:8.4f}%   (분모=G_total)")
-    print(f"  Sample    Domain Coverage          : {sam_cov*100:8.4f}%   (분모=G_total)")
-    print(f"  >>> Sample Coverage of REF footprint: {cov_of_ref*100:8.4f}%   "
-          f"(분모=ref 점유셀 {denom_ref:,}, ref 안 다니는 빈 도메인 제외)")
-    print(f"  [셀] Cat1 대변={verified:,}  Cat2 gap(미대변)={gap:,}  (of ref {denom_ref:,})")
-    print(f"  [Sample 포인트] 대변={n_ver:,}  도메인내={n_ind:,}  OOD(무관)={n_ood:,}  "
-          f"(총 {len(sample_scaled):,})")
-    print(f"  Out-of-Domain 비율  Ref={ref_out/max(ref_tot,1)*100:.2f}%  "
-          f"Sample={sam_out/max(sam_tot,1)*100:.2f}%")
+    print("\n" + "=" * 70)
+    print("  [Mahalanobis Domain Coverage & Attribution]  (Reference-anchored)")
+    print("=" * 70)
+    print(f"  >>> Headline: per-feature coverage 평균 : {headline*100:8.4f}%  (21-d 완화·직관 지표)")
+    print(f"  (보조) top-2 격자 Sample coverage        : {sam_cov*100:8.4f}%   (분모=G_total {len(dom)})")
+    print(f"  (보조) Ref-footprint coverage            : {cov_of_ref*100:8.4f}%   (분모=ref셀 {denom_ref})")
+    print(f"  [셀] Cat1 대변={verified:,}  Cat2 gap={gap:,}  (of ref {denom_ref:,})")
+    print(f"  [진단] Sample full-d OOD                 : {sam_out/max(len(z_s),1)*100:.2f}%  "
+          f"(Ref OOD={R['ref_out']/max(R['ref_tot'],1)*100:.2f}%)")
+    print(f"  [Sample 포인트] 대변={n_ver:,}  도메인내={n_ind:,}  OOD={n_ood:,}  (총 {len(z_s):,})")
     if top_ood:
-        print("  OOD 근원 항 top-5 (조건부 c_j)     : "
+        print("  OOD 근원 항 top-5 (조건부 c_j)          : "
               + ", ".join(f"{nm}={v:.1f}" for nm, v in top_ood))
-    print("=" * 68)
-    return {"ref_cov": ref_cov, "sam_cov": sam_cov, "cov_of_ref": cov_of_ref,
+    print("=" * 70)
+    return {"headline_cov": headline, "sam_cov": sam_cov, "cov_of_ref": cov_of_ref,
             "verified": verified, "gap": gap, "n_ood": int(n_ood), "top_ood": top_ood}
+
+
+def mahal_sample_cells(z, p):
+    """Sample 의 top-2 타원 안 점유 셀 집합."""
+    e = z - p["mu"]
+    u = (e @ p["Vk"]) / p["sqrt_lamk"]
+    uu = u[(u ** 2).sum(1) <= p["Tk"]]
+    if len(uu) == 0:
+        return set()
+    return _cells_of(uu, p["internalK"], p["Vk"].shape[1])
 
 
 if __name__ == "__main__":
