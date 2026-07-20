@@ -50,6 +50,10 @@ FMT           = "csv"          # 'csv' 또는 'parquet'
 FEATURE_COLS    = None
 FEATURE_COL_IDX = list(range(0, 21))
 
+# 특정 feature term 을 '끄고' 분석(ablation). 여기에 이름을 넣으면 그 feature 는 제외되고
+# 프레임·PCA·K_eff·커버리지·OOD·PC loading 이 그 term 없이 다시 계산된다. 예: ["CM2", "G17"]
+EXCLUDE_COLS    = []
+
 SCALE_METHOD  = "standard"     # 'standard' | 'minmax'
 MAHAL_Q       = 0.99           # χ² quantile (도메인 경계)
 MAHAL_GRID_DIMS = 2            # top-2 격자 시각화 차원(K)
@@ -129,6 +133,12 @@ def resolve_feature_names(sample_path, ref_path, fmt):
         print("[IO] 경고: 아래 컬럼은 feature 에서 제외하고 계속 진행합니다:")
         for c, why in dropped:
             print(f"        - {c}: {why}")
+    if EXCLUDE_COLS:                                  # ablation: 지정 feature 끄기
+        ex = {str(c).strip() for c in EXCLUDE_COLS}
+        removed = [c for c in names if c in ex]
+        names = [c for c in names if c not in ex]
+        if removed:
+            print(f"[IO] EXCLUDE_COLS 로 끈 feature({len(removed)}개): {removed}")
     if not names:
         raise ValueError("사용할 공통 feature 컬럼이 하나도 없습니다.")
     print(f"[IO] feature {len(names)}개 사용(Reference 순서 고정): {names}")
