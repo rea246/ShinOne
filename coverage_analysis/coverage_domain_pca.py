@@ -6,15 +6,22 @@ coverage_domain_pca.py
 
 목적
     Reference(REF) 21차원과 Sample(SAMPLE) 21차원이 들어올 때
-        (1) REF 기준으로 PCA 를 학습해 2D 로 투영한다.
-        (2) 2D 평면에서 REF·SAMPLE 각각의 확률밀도(KDE) 분포를 그리고,
-            REF 99% 등고선과 SAMPLE 99% 등고선을 겹쳐 그린 뒤
-            겹치는 영역(면적)을 Coverage 로 정의해 산출한다.
-        (3) PCA(PC1·PC2)에 영향이 큰 feature 8개를 추려 교차 scatter(pairplot)를 본다.
+        (1) REF 기준으로 PCA 를 학습해 상위 PC(기본 3D)로 투영한다.
+        (2) REF·SAMPLE 각각의 확률밀도(KDE) 99% 등고선을 그리고 겹치는 영역을 Coverage 로 정의한다.
+            - 3D 격자 부피비로 주 Coverage 산출(PC2 이후 저설명 방향까지 반영).
+            - 3D 산점 + 각 면(PC1-2, PC1-3, PC2-3) 2D projection 등고선/겹침을 함께 그린다.
+            - 추가로 누적 EVR 80/90% 차원에서 '질량 기반' Coverage 를 산출(고차원 확장).
+        (3) PCA(상위 PC) 분산 기여가 임계값(기본 0.01) 이상인 feature 를 모두 추려 교차 scatter.
         (4) REF 에서 'cover 되지 못한 point' 와 '99% 밖에 분포한 point' 행만 추려
-            group 태그를 붙여 CSV 로 저장한다.
+            group 태그를 붙여 CSV 로 저장한다(PC1..PCk 포함).
         (5) SAMPLE 에서 'REF 를 cover 하는 point' 와 'cover 못하는 point' 를 나눠
             group 태그 열을 붙여 CSV 로 저장한다.
+
+    ※ Coverage 정의 2종:
+        - 부피(volume) 기반: 99% HDR 영역의 겹침 면적/부피 비율(2D·3D, 등고선 그림과 일치).
+          고차원에선 HDR 부피가 급감·비겹침 → 0 으로 붕괴(차원의 저주)하므로 3D 까지만 사용.
+        - 질량(mass) 기반: REF 도메인(자기 99%) 포인트 중 SAMPLE 99% 에도 드는 비율.
+          실제 포인트로 추정 → 고차원에서도 안정적. 80/90%EVR 확장은 이 방식.
 
 도메인/커버리지 정의 (KDE 99% HDR)
     - PCA 는 REF 를 표준화(REF 평균·표준편차)한 상관행렬의 고유분해로 학습한다.
@@ -95,15 +102,23 @@ FEATURE_COLS    = None
 FEATURE_COL_IDX = list(range(0, 21))    # REF/SAMPLE 앞 21차원
 
 HDR_Q         = 0.99            # 등고선(HDR) 분위수 = 99%
-GRID_N        = 240            # 밀도 적분/등고선용 격자 해상도(축당)
+GRID_N        = 240            # 2D 평면 등고선/적분 격자 해상도(축당)
 GRID_MARGIN   = 0.08           # 격자 여백(데이터 범위 대비 비율)
 GRID_ANCHOR   = "ref"          # 'ref'|'both' : 격자(플롯 축) 기준.
                                #   'ref'  = REF 범위로 축 고정 → sample 을 바꿔도 축이 동일해
                                #            sample1·sample2 플롯을 그대로 겹쳐 비교(권장).
                                #   'both' = REF+SAMPLE 합집합 범위(sample 마다 축이 달라짐).
 
-N_TOP_FEATURES = 8             # PCA 영향 큰 feature 상위 N (교차 scatter 대상)
-PAIR_MAX_PTS   = 3000          # pairplot 소스별 최대 표본 수(과밀 방지)
+# ---- Coverage 차원 (PC2 이후 저설명 방향까지 반영) ----
+COVERAGE_DIMS = 3              # 주 Coverage/분류/시각화 차원 (PC1..PC3). 3D 격자(부피비)로 산출.
+GRID_N_3D     = 64            # 3D 격자 해상도(축당) → GRID_N_3D^3 셀. 분류·부피적분용.
+COVERAGE_EVR_TARGETS = [0.80, 0.90]   # 이 '누적 EVR' 차원에서 '질량(mass) 기반' Coverage 추가 산출.
+                               #   ※ 고차원은 부피 기반이 0 으로 붕괴(차원의 저주)하므로 질량 기반 사용.
+
+# ---- PCA 영향 feature 선정 ----
+FEAT_IMP_THRESH = 0.01         # PC(상위 COVERAGE_DIMS) 분산 기여가 이 값 이상인 feature 를 모두 분석
+PAIR_MAX_VARS   = 12           # pairplot 변수 상한(초과 시 기여 상위만; 과대 격자 방지)
+PAIR_MAX_PTS    = 3000         # pairplot 소스별 최대 표본 수(과밀 방지)
 
 CHUNKSIZE      = 200_000
 OUTPUT_DIR     = "coverage_pca_plots"
@@ -311,12 +326,26 @@ def moments_from_matrix(X, chunk=500_000):
     return n, sum_x, sum_xx
 
 
+def _derive_pca(mu, sd, V, evr):
+    """
+    고정된 (mu, sd, V, evr) 에서 config(COVERAGE_DIMS) 에 맞는 파생값을 계산한다.
+    → 캐시된 basis 를 재사용해도 COVERAGE_DIMS 만 바꾸면 파생값이 즉시 반영된다.
+    반환 추가키: K, Vk(=V[:, :K]), evr2, load(상관 로딩 d×2), feat_imp(상위 K PC 기여 d,).
+    """
+    d = len(mu)
+    K = int(min(max(COVERAGE_DIMS, 2), d))             # 최소 2, 최대 d
+    Vk = V[:, :K]                                       # PC1..PCK 방향
+    load = V[:, :2] * np.sqrt(np.clip(evr[:2] * d, 0, None))   # 상관 로딩(상관행렬 trace=d)
+    # feature 중요도 = 상위 K PC 분산에서 각 feature 가 차지하는 몫(설명분산 가중)
+    feat_imp = np.zeros(d)
+    for m in range(K):
+        feat_imp += (V[:, m] ** 2) * evr[m]
+    return {"mu": mu, "sd": sd, "V": V, "evr": evr, "K": K, "Vk": Vk,
+            "evr2": float(evr[:2].sum()), "load": load, "feat_imp": feat_imp}
+
+
 def build_pca(n, sum_x, sum_xx):
-    """
-    REF μ·Σ 로 '표준화 상관행렬 PCA' 를 학습한다.
-    반환 dict: mu, sd(표준편차), V(고유벡터 d×d), evr(설명분산비 d,),
-               Vk(=V[:, :2]), evr2, load(상관 로딩 d×2), feat_imp(feature 중요도 d,).
-    """
+    """REF μ·Σ 로 '표준화 상관행렬 PCA' 를 학습한다(고유벡터 부호 고정 → 재현성)."""
     mu = sum_x / n
     cov = sum_xx / n - np.outer(mu, mu)               # raw 공분산
     d = len(mu)
@@ -329,43 +358,42 @@ def build_pca(n, sum_x, sum_xx):
     order = np.argsort(w)[::-1]                         # 큰 고유값 순
     w, V = np.clip(w[order], 0, None), V[:, order]
     # 고유벡터 부호를 결정적으로 고정(재현성): 각 PC 에서 |성분| 최대 좌표를 +로.
-    # → REF 가 같으면 실행/수치경로와 무관하게 항상 같은 방향(부호)을 갖는다.
     for k in range(V.shape[1]):
         jmax = int(np.argmax(np.abs(V[:, k])))
         if V[jmax, k] < 0:
             V[:, k] = -V[:, k]
     evr = w / w.sum()
 
-    Vk = V[:, :2]                                       # PC1·PC2 방향
-    load = Vk * np.sqrt(w[:2])                          # 상관 로딩(방향·상대크기)
-    # feature 중요도: PC1·PC2 분산에서 각 feature 가 차지하는 몫(설명분산 가중)
-    feat_imp = (Vk[:, 0] ** 2) * evr[0] + (Vk[:, 1] ** 2) * evr[1]
-
+    p = _derive_pca(mu, sd, V, evr)
+    cum = np.cumsum(evr)
     print(f"[PCA] REF 표준화 상관행렬 PCA 학습(dim={d}); "
-          f"PC1 EVR={evr[0]*100:.1f}%, PC2 EVR={evr[1]*100:.1f}% "
-          f"(top-2 합={evr[:2].sum()*100:.1f}%)")
-    return {"mu": mu, "sd": sd, "V": V, "evr": evr, "Vk": Vk, "evr2": float(evr[:2].sum()),
-            "load": load, "feat_imp": feat_imp}
+          f"PC1={evr[0]*100:.1f}% PC2={evr[1]*100:.1f}% "
+          f"PC3={evr[2]*100:.1f}% (top-{p['K']} 누적={cum[p['K']-1]*100:.1f}%)")
+    return p
 
 
 def pca_project(X_raw, p):
-    """raw feature (n, d) → PC1·PC2 score (n, 2).  z=(x−μ)/σ , score=z·Vk."""
+    """raw feature (n, d) → PC1..PCK score (n, K).  z=(x−μ)/σ , score=z·Vk."""
     z = (X_raw - p["mu"]) / p["sd"]
     return z @ p["Vk"]
 
 
+def dims_for_evr(evr, target):
+    """누적 EVR 이 target 에 처음 도달하는 차원 수(최소 2, 최대 d)."""
+    cum = np.cumsum(evr)
+    k = int(np.searchsorted(cum, target) + 1)
+    return int(min(max(k, 2), len(evr)))
+
+
 def save_pca_model(path, p, n_ref):
-    """REF PCA basis(mu, sd, V, evr, ...)를 npz 로 저장 → 여러 sample 실행이 동일 프레임 재사용."""
-    np.savez(path, mu=p["mu"], sd=p["sd"], V=p["V"], evr=p["evr"],
-             load=p["load"], feat_imp=p["feat_imp"], n_ref=np.int64(n_ref))
+    """REF PCA basis(mu, sd, V, evr)를 npz 로 저장 → 여러 sample 실행이 동일 프레임 재사용."""
+    np.savez(path, mu=p["mu"], sd=p["sd"], V=p["V"], evr=p["evr"], n_ref=np.int64(n_ref))
 
 
 def load_pca_model(path):
-    """저장된 REF PCA basis 를 로드해 build_pca 와 동일한 dict + n_ref 반환."""
+    """저장된 REF PCA basis 를 로드 → 현재 config 로 파생값 재계산 후 dict + n_ref 반환."""
     z = np.load(path)
-    p = {"mu": z["mu"], "sd": z["sd"], "V": z["V"], "evr": z["evr"],
-         "Vk": z["V"][:, :2], "evr2": float(z["evr"][:2].sum()),
-         "load": z["load"], "feat_imp": z["feat_imp"]}
+    p = _derive_pca(z["mu"], z["sd"], z["V"], z["evr"])
     return p, int(z["n_ref"])
 
 
@@ -380,8 +408,10 @@ def get_ref_pca(ref_X, names):
         pca_path = os.path.join(CACHE_DIR, f"pca_{_cache_key(REF_PATH, names)}.npz")
         if os.path.exists(pca_path):
             p, n_ref = load_pca_model(pca_path)
+            cum = float(np.cumsum(p["evr"])[p["K"] - 1])
             print(f"[Cache] REF PCA basis 재사용: {pca_path}  "
-                  f"(PC1 EVR={p['evr'][0]*100:.1f}%, PC2 EVR={p['evr'][1]*100:.1f}%)")
+                  f"(PC1={p['evr'][0]*100:.1f}% PC2={p['evr'][1]*100:.1f}% "
+                  f"PC3={p['evr'][2]*100:.1f}%, top-{p['K']} 누적={cum*100:.1f}%)")
             return p, n_ref
     n_ref, sum_x, sum_xx = moments_from_matrix(ref_X)
     if n_ref < ref_X.shape[1] + 1:
@@ -483,6 +513,88 @@ def classify_by_grid(scores, xs, ys, mask):
 
 
 # =============================================================================
+# [k-D Coverage] 3D 는 격자(부피 적분·분류), 80/90%EVR 등 고차원은 Monte-Carlo
+# =============================================================================
+def grid_axes_kd(base, dims, n, margin, anchor_pad=None):
+    """dims 개 축의 등간격 셀 중심(centers) + 셀경계(edges) + 셀부피. base 범위 + 여백."""
+    lo = base[:, :dims].min(axis=0); hi = base[:, :dims].max(axis=0)
+    pad = (hi - lo) * margin + 1e-9
+    lo -= pad; hi += pad
+    edges = [np.linspace(lo[a], hi[a], n + 1) for a in range(dims)]
+    centers = [(e[:-1] + e[1:]) / 2 for e in edges]
+    cell_vol = float(np.prod([e[1] - e[0] for e in edges]))
+    return edges, centers, cell_vol
+
+
+def kde_mask_kd(kde, centers, lvl, n_threads=1):
+    """dims-차원 격자 중심에서 KDE 평가 → (density ≥ lvl) 마스크. 형상 (n,)*dims."""
+    mesh = np.meshgrid(*centers, indexing="ij")
+    pts = np.vstack([m.ravel() for m in mesh])
+    dens = kde_eval(kde, pts, n_threads).reshape(mesh[0].shape)
+    return dens >= lvl
+
+
+def classify_by_grid_kd(scores, edges, mask):
+    """dims-차원 셀 마스크 조회로 in/out 판정(O(N)). 격자 밖은 False."""
+    dims = len(edges)
+    inb = np.ones(len(scores), dtype=bool)
+    idx = []
+    for a in range(dims):
+        e = edges[a]
+        idx.append(np.clip(np.digitize(scores[:, a], e) - 1, 0, len(e) - 2))
+        inb &= (scores[:, a] >= e[0]) & (scores[:, a] <= e[-1])
+    res = np.zeros(len(scores), dtype=bool)
+    res[inb] = mask[tuple(i[inb] for i in idx)]
+    return res
+
+
+def coverage_grid_kd(scores_r, scores_s, dims, q, n, margin, anchor, threads):
+    """
+    dims-차원 격자로 REF_99 / SAM_99 마스크·부피비 Coverage 산출.
+    반환: cov_s_of_r, cov_r_of_s, jaccard, edges, mask_r, mask_s, lvl_r, lvl_s, kde_r, kde_s.
+    (분류·시각화에 재사용하려고 마스크·KDE 도 함께 반환)
+    """
+    r, s = scores_r[:, :dims], scores_s[:, :dims]
+    kde_r = fit_kde(r, KDE_MAX_PTS); kde_s = fit_kde(s, KDE_MAX_PTS)
+    lvl_r = hdr_level(kde_r, r, q, threads); lvl_s = hdr_level(kde_s, s, q, threads)
+    base = r if anchor == "ref" else np.vstack([r, s])
+    edges, centers, _ = grid_axes_kd(base, dims, n, margin)
+    mask_r = kde_mask_kd(kde_r, centers, lvl_r, threads)
+    mask_s = kde_mask_kd(kde_s, centers, lvl_s, threads)
+    ovl = int((mask_r & mask_s).sum()); ar = int(mask_r.sum()); as_ = int(mask_s.sum())
+    uni = int((mask_r | mask_s).sum())
+    return {"cov_s_of_r": ovl / ar if ar else 0.0,
+            "cov_r_of_s": ovl / as_ if as_ else 0.0,
+            "jaccard": ovl / uni if uni else 0.0,
+            "edges": edges, "mask_r": mask_r, "mask_s": mask_s,
+            "lvl_r": lvl_r, "lvl_s": lvl_s, "kde_r": kde_r, "kde_s": kde_s, "dims": dims}
+
+
+def coverage_mass(scores_r, scores_s, dims, q, threads):
+    """
+    고차원 Coverage 를 '질량(mass) 기반'으로 산출(부피 기반은 고차원에서 0 으로 붕괴 → 무의미).
+    정의: REF 의 도메인(자기 99% HDR) 안 포인트 중, SAMPLE 99% HDR 에도 드는 비율.
+        Coverage_mass(SAMPLE→REF) = |{REF∈REF_99 ∧ REF∈SAM_99}| / |{REF∈REF_99}|
+    REF·SAMPLE 실제 포인트에서 직접 추정하므로 차원이 커도 안정적이고 빠르다.
+    반환: cov_s_of_r, cov_r_of_s, n_dom(신뢰도=REF 도메인 포인트 수), dims.
+    """
+    r, s = scores_r[:, :dims], scores_s[:, :dims]
+    kde_r = fit_kde(r, KDE_MAX_PTS); kde_s = fit_kde(s, KDE_MAX_PTS)
+    lvl_r = hdr_level(kde_r, r, q, threads); lvl_s = hdr_level(kde_s, s, q, threads)
+    # REF 포인트의 소속 → Coverage(SAMPLE→REF)
+    in_ref_r = kde_eval(kde_r, r.T, threads) >= lvl_r
+    in_sam_r = kde_eval(kde_s, r.T, threads) >= lvl_s
+    n_dom = int(in_ref_r.sum())
+    cov_s_of_r = int((in_ref_r & in_sam_r).sum()) / max(n_dom, 1)
+    # SAMPLE 포인트의 소속 → Coverage(REF→SAMPLE)
+    in_sam_s = kde_eval(kde_s, s.T, threads) >= lvl_s
+    in_ref_s = kde_eval(kde_r, s.T, threads) >= lvl_r
+    n_sam = int(in_sam_s.sum())
+    cov_r_of_s = int((in_sam_s & in_ref_s).sum()) / max(n_sam, 1)
+    return {"cov_s_of_r": cov_s_of_r, "cov_r_of_s": cov_r_of_s, "n_dom": n_dom, "dims": dims}
+
+
+# =============================================================================
 # 시각화 ① REF·SAMPLE KDE 밀도 + 99% 등고선 + 겹침(Coverage) 영역
 # =============================================================================
 def plot_density_coverage(XX, YY, dens_r, dens_s, lvl_r, lvl_s,
@@ -538,18 +650,70 @@ def plot_scatter_ref_sample(scores_r, scores_s, p, out_path):
 # =============================================================================
 # 시각화 ② PCA feature 중요도(상위) + 로딩 biplot
 # =============================================================================
-def plot_feature_importance(p, names, top_idx, out_path):
+def plot_feature_importance(p, names, sel_idx, out_path):
     fig, ax = plt.subplots(figsize=(9.5, max(5, 0.42 * N_FEATURES)))
     order = np.argsort(p["feat_imp"])[::-1]
     y = np.arange(len(order))[::-1]
-    colors = ["#D62728" if i in set(top_idx) else "#BBBBBB" for i in order]
+    sel = set(sel_idx)
+    colors = ["#D62728" if i in sel else "#BBBBBB" for i in order]
     ax.barh(y, p["feat_imp"][order], color=colors)
+    ax.axvline(FEAT_IMP_THRESH, color="#333", ls="--", lw=1.4,
+               label=f"threshold = {FEAT_IMP_THRESH}")
     ax.set_yticks(y); ax.set_yticklabels([names[i] for i in order], fontsize=9)
-    ax.set_xlabel("PC1·PC2 variance share (importance)")
-    ax.set_title(f"PCA feature importance (top-{len(top_idx)} = red)\n"
-                 f"top-2 EVR={p['evr2']*100:.1f}%")
+    ax.set_xlabel(f"top-{p['K']} PC variance share (importance)")
+    ax.set_title(f"PCA feature importance (>= {FEAT_IMP_THRESH}: {len(sel_idx)} features = red)\n"
+                 f"top-{p['K']} 누적 EVR={np.cumsum(p['evr'])[p['K']-1]*100:.1f}%")
+    ax.legend(fontsize=9, loc="lower right")
     fig.tight_layout(); fig.savefig(out_path, dpi=130); plt.close(fig)
     print(f"[Plot] (2) feature-importance 저장: {out_path}")
+
+
+# =============================================================================
+# 시각화 ③' 3D 산점(PC1-PC2-PC3) + 각 면 2D projection(등고선·겹침)
+# =============================================================================
+def _draw_plane(ax, sr, ss, xlab, ylab, threads):
+    """한 PC 평면(2D)에 REF/SAMPLE 밀도·99% 등고선·겹침을 그리고 평면 Coverage 반환."""
+    kr = fit_kde(sr, KDE_MAX_PTS); ks = fit_kde(ss, KDE_MAX_PTS)
+    lr = hdr_level(kr, sr, HDR_Q, threads); ls = hdr_level(ks, ss, HDR_Q, threads)
+    xs, ys, XX, YY, _ = make_grid(sr, ss, 150, GRID_MARGIN, GRID_ANCHOR)
+    dr = eval_grid(kr, XX, YY, threads); ds = eval_grid(ks, XX, YY, threads)
+    ax.contourf(XX, YY, dr, levels=10, cmap="Greys", alpha=0.28)
+    ov = ((dr >= lr) & (ds >= ls)).astype(float)
+    ax.contourf(XX, YY, ov, levels=[0.5, 1.5], colors=[C_OVERLAP], alpha=0.45)
+    ax.contour(XX, YY, dr, levels=[lr], colors=[C_REF_L], linewidths=2.0)
+    ax.contour(XX, YY, ds, levels=[ls], colors=[C_SAMPLE], linewidths=2.0)
+    ax.scatter(sr[:, 0], sr[:, 1], s=3, c=C_REF, alpha=0.08, linewidths=0)
+    ax.scatter(ss[:, 0], ss[:, 1], s=5, c=C_SAMPLE, alpha=0.10, linewidths=0)
+    mr = dr >= lr; ms = ds >= ls
+    cov = int((mr & ms).sum()) / max(int(mr.sum()), 1)
+    ax.set_xlabel(xlab); ax.set_ylabel(ylab); ax.set_aspect("equal")
+    ax.set_title(f"{xlab}-{ylab}  cov(S→R)={cov*100:.1f}%", fontsize=11)
+    return cov
+
+
+def plot_pca_3d_projections(scores_r, scores_s, p, cov3d_txt, out_path, threads=1, seed=0):
+    """좌상=3D 산점(PC1-PC2-PC3), 나머지 3칸=각 면(PC1-2, PC1-3, PC2-3) 2D projection."""
+    rng = np.random.default_rng(seed)
+    def _ds(a, k):
+        return a if len(a) <= k else a[rng.choice(len(a), k, replace=False)]
+    r3, s3 = _ds(scores_r, 4000), _ds(scores_s, 4000)
+
+    fig = plt.figure(figsize=(15, 13))
+    ax0 = fig.add_subplot(2, 2, 1, projection="3d")
+    ax0.scatter(r3[:, 0], r3[:, 1], r3[:, 2], s=4, c=C_REF, alpha=0.15, linewidths=0, label="Reference")
+    ax0.scatter(s3[:, 0], s3[:, 1], s3[:, 2], s=8, c=C_SAMPLE, alpha=0.25, linewidths=0, label="Sample")
+    ax0.set_xlabel("PC1"); ax0.set_ylabel("PC2"); ax0.set_zlabel("PC3")
+    ax0.set_title("3D scatter (PC1-PC2-PC3)", fontsize=12)
+    ax0.legend(fontsize=9, loc="upper left")
+
+    pairs = [(0, 1, "PC1", "PC2"), (0, 2, "PC1", "PC3"), (1, 2, "PC2", "PC3")]
+    for k, (a, b, xl, yl) in enumerate(pairs, start=2):
+        ax = fig.add_subplot(2, 2, k)
+        _draw_plane(ax, scores_r[:, [a, b]], scores_s[:, [a, b]], xl, yl, threads)
+    fig.suptitle("REF-PCA 3D coverage & plane projections\n" + cov3d_txt, fontsize=14)
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    fig.savefig(out_path, dpi=120); plt.close(fig)
+    print(f"[Plot] (3D) 3d-projections 저장: {out_path}")
 
 
 def plot_biplot(p, names, top_idx, out_path):
@@ -614,10 +778,14 @@ def plot_top_feature_pairplot(ref_raw, sample_raw, names, top_idx, out_path, see
 # =============================================================================
 # 결과 저장 ④ REF: uncovered + outside_99 행만 group 태그로 저장 (스트리밍)
 # =============================================================================
-def _ref_group_masks(sc, xs, ys, ref_mask, sam_mask):
-    """PC score → (keep, group) : outside_99 / uncovered 만 keep. 격자 lookup(KDE 재호출 없음)."""
-    in_ref = classify_by_grid(sc, xs, ys, ref_mask)
-    in_sam = classify_by_grid(sc, xs, ys, sam_mask)
+def _pc_cols(dims):
+    return [f"PC{a+1}" for a in range(dims)]
+
+
+def _ref_group_masks(sc, edges, mask_r, mask_s):
+    """PC score(k-D) → (keep, group) : outside_99 / uncovered 만 keep. k-D 격자 lookup."""
+    in_ref = classify_by_grid_kd(sc, edges, mask_r)
+    in_sam = classify_by_grid_kd(sc, edges, mask_s)
     outside = ~in_ref                              # 99% 밖
     uncovered = in_ref & (~in_sam)                 # 99% 안 이나 sample 이 대변 못함
     keep = outside | uncovered
@@ -625,26 +793,35 @@ def _ref_group_masks(sc, xs, ys, ref_mask, sam_mask):
     return keep, group
 
 
-def export_ref_groups(ref_path, names, p, xs, ys, ref_mask, sam_mask, fmt, out_path, ref_X=None):
+def export_ref_groups(ref_path, names, p, edges, mask_r, mask_s, fmt, out_path, ref_X=None):
     """
-    REF 에서 아래 두 group 에 해당하는 행 + PC1·PC2 + group 을 CSV 로 저장한다.
-      - outside_99 : REF 99% 등고선 밖
+    REF 에서 아래 두 group 에 해당하는 행 + PC1..PCk + group 을 CSV 로 저장한다.
+      - outside_99 : REF 99% 등고선(k-D HDR) 밖
       - uncovered  : REF 99% 안 이지만 SAMPLE 99% 밖(대변 안 됨)
-    (covered = REF 99% 안 & SAMPLE 99% 안 → 저장 대상 아님)
-
-    분류는 KDE 재호출 없이 '격자 마스크 lookup'(O(N))으로 수행한다.
-    REF_EXPORT_ORIGINAL_COLS:
-      True  → 원본 파일을 1회 스트리밍(모든 컬럼 유지). 원본 메타 컬럼(hash 등) 보존.
-      False → 캐시된 feature 행렬(ref_X)만 사용(파일 재읽기 0). feature 컬럼만 저장.
+    분류는 KDE 재호출 없이 'k-D 격자 마스크 lookup'(O(N))으로 수행(COVERAGE_DIMS 차원).
+    REF_EXPORT_ORIGINAL_COLS: True=원본 전체 컬럼 유지(파일 1회 재읽기) / False=캐시만(재읽기 0).
     """
+    dims = len(edges)
+    pcs = _pc_cols(dims)
     header_written = [False]
     n_out99 = n_unc = n_total = 0
     if os.path.exists(out_path):
         os.remove(out_path)
 
+    def _emit(base_df, sc, keep, group):
+        nonlocal n_out99, n_unc
+        out = base_df.loc[keep].copy()
+        for a in range(dims):
+            out[pcs[a]] = sc[keep, a]
+        out["group"] = group[keep]
+        out.to_csv(out_path, index=False, mode="a", header=not header_written[0])
+        header_written[0] = True
+        n_out99 += int((group[keep] == "outside_99").sum())
+        n_unc += int((group[keep] == "uncovered").sum())
+
     if REF_EXPORT_ORIGINAL_COLS:
         def _flush(df_full):
-            nonlocal n_out99, n_unc, n_total
+            nonlocal n_total
             df_full.columns = [str(c).strip() for c in df_full.columns]
             Xf, finite = _select(df_full, names)
             n_total += int(finite.sum())
@@ -652,16 +829,9 @@ def export_ref_groups(ref_path, names, p, xs, ys, ref_mask, sam_mask, fmt, out_p
                 return
             rows = df_full.loc[finite].reset_index(drop=True)
             sc = pca_project(Xf[finite], p)
-            keep, group = _ref_group_masks(sc, xs, ys, ref_mask, sam_mask)
-            if not keep.any():
-                return
-            out = rows.loc[keep].copy()
-            out["PC1"] = sc[keep, 0]; out["PC2"] = sc[keep, 1]
-            out["group"] = group[keep]
-            out.to_csv(out_path, index=False, mode="a", header=not header_written[0])
-            header_written[0] = True
-            n_out99 += int((group[keep] == "outside_99").sum())
-            n_unc += int((group[keep] == "uncovered").sum())
+            keep, group = _ref_group_masks(sc, edges, mask_r, mask_s)
+            if keep.any():
+                _emit(rows, sc, keep, group)
 
         if fmt == "csv":
             for chunk in pd.read_csv(ref_path, chunksize=CHUNKSIZE):
@@ -672,26 +842,26 @@ def export_ref_groups(ref_path, names, p, xs, ys, ref_mask, sam_mask, fmt, out_p
             for batch in pf.iter_batches(batch_size=CHUNKSIZE):
                 _flush(batch.to_pandas())
         if not header_written[0]:
-            pd.DataFrame(columns=list(_header(ref_path, fmt)) + ["PC1", "PC2", "group"]) \
+            pd.DataFrame(columns=list(_header(ref_path, fmt)) + pcs + ["group"]) \
                 .to_csv(out_path, index=False)
     else:
-        # 캐시 행렬만 사용(파일 재읽기 없음). feature 컬럼 + PC + group.
         n_total = len(ref_X)
         for i in range(0, len(ref_X), CHUNKSIZE):
             Xf = np.asarray(ref_X[i:i + CHUNKSIZE], dtype=np.float64)
             sc = pca_project(Xf, p)
-            keep, group = _ref_group_masks(sc, xs, ys, ref_mask, sam_mask)
+            keep, group = _ref_group_masks(sc, edges, mask_r, mask_s)
             if not keep.any():
                 continue
             out = pd.DataFrame(Xf[keep], columns=names)
-            out["PC1"] = sc[keep, 0]; out["PC2"] = sc[keep, 1]
+            for a in range(dims):
+                out[pcs[a]] = sc[keep, a]
             out["group"] = group[keep]
             out.to_csv(out_path, index=False, mode="a", header=not header_written[0])
             header_written[0] = True
             n_out99 += int((group[keep] == "outside_99").sum())
             n_unc += int((group[keep] == "uncovered").sum())
         if not header_written[0]:
-            pd.DataFrame(columns=names + ["PC1", "PC2", "group"]).to_csv(out_path, index=False)
+            pd.DataFrame(columns=names + pcs + ["group"]).to_csv(out_path, index=False)
 
     print(f"[Save] REF groups 저장: {out_path}  "
           f"(outside_99={n_out99:,}, uncovered={n_unc:,}, 전체 유효 REF={n_total:,})")
@@ -701,13 +871,15 @@ def export_ref_groups(ref_path, names, p, xs, ys, ref_mask, sam_mask, fmt, out_p
 # =============================================================================
 # 결과 저장 ⑤ SAMPLE: cover_ref / not_cover_ref group 태그 열 추가 저장
 # =============================================================================
-def export_sample_groups(sample_path, names, p, xs, ys, ref_mask, fmt, out_path):
+def export_sample_groups(sample_path, names, p, edges, mask_r, fmt, out_path):
     """
-    Sample 원본(모든 컬럼)에 PC1·PC2 와 group 열을 붙여 저장한다.
-      - cover_ref     : REF 99% 등고선 안(=REF 를 대변/cover)
+    Sample 원본(모든 컬럼)에 PC1..PCk 와 group 열을 붙여 저장한다.
+      - cover_ref     : REF 99% 등고선(k-D) 안(=REF 를 대변/cover)
       - not_cover_ref : REF 99% 등고선 밖
-    분류는 격자 마스크 lookup(KDE 재호출 없음). NaN/Inf 행은 PC/group 이 비어있음.
+    분류는 k-D 격자 마스크 lookup(KDE 재호출 없음). NaN/Inf 행은 PC/group 이 비어있음.
     """
+    dims = len(edges)
+    pcs = _pc_cols(dims)
     if fmt == "csv":
         df = pd.read_csv(sample_path)
     else:
@@ -716,16 +888,19 @@ def export_sample_groups(sample_path, names, p, xs, ys, ref_mask, fmt, out_path)
     df.columns = [str(c).strip() for c in df.columns]
     Xf, finite = _select(df, names)
 
-    pc1 = np.full(len(df), np.nan); pc2 = np.full(len(df), np.nan)
+    pc = {c: np.full(len(df), np.nan) for c in pcs}
     group = np.array([""] * len(df), dtype=object)
 
     sc = pca_project(Xf[finite], p)
-    in_ref = classify_by_grid(sc, xs, ys, ref_mask)
+    in_ref = classify_by_grid_kd(sc, edges, mask_r)
     g = np.where(in_ref, "cover_ref", "not_cover_ref")
-    pc1[finite] = sc[:, 0]; pc2[finite] = sc[:, 1]
+    for a in range(dims):
+        pc[pcs[a]][finite] = sc[:, a]
     group[finite] = g
 
-    df["PC1"], df["PC2"], df["group"] = pc1, pc2, group
+    for c in pcs:
+        df[c] = pc[c]
+    df["group"] = group
     df.to_csv(out_path, index=False)
     n_cov = int((g == "cover_ref").sum()); n_not = int((g == "not_cover_ref").sum())
     print(f"[Save] SAMPLE groups 저장: {out_path}  "
@@ -753,81 +928,102 @@ def run():
 
     # (1) REF PCA basis '1회 fit → 재사용'(sample 을 바꿔도 REF μ·σ·고유벡터·PC 100% 고정)
     p, n_ref = get_ref_pca(ref_X, names)
+    K = p["K"]
 
-    # PCA 영향 큰 top-N feature
-    top_idx = list(np.argsort(p["feat_imp"])[::-1][:N_TOP_FEATURES])
-    print(f"[PCA] 영향 큰 top-{N_TOP_FEATURES} feature: {[names[i] for i in top_idx]}")
+    # PCA 영향 feature: 상위 K PC 분산 기여 >= FEAT_IMP_THRESH 인 feature 를 모두 선정
+    order = np.argsort(p["feat_imp"])[::-1]
+    sel_idx = [int(i) for i in order if p["feat_imp"][i] >= FEAT_IMP_THRESH]
+    if not sel_idx:
+        sel_idx = [int(i) for i in order[:3]]
+    pair_idx = sel_idx[:PAIR_MAX_VARS]
+    print(f"[PCA] 영향 feature(>= {FEAT_IMP_THRESH}) {len(sel_idx)}개: {[names[i] for i in sel_idx]}")
+    if len(sel_idx) > PAIR_MAX_VARS:
+        print(f"[PCA] pairplot 은 상위 {PAIR_MAX_VARS}개만 사용(과대 격자 방지).")
 
-    # (2) 시각화용 표본: Sample 전체(메모리) + REF 캐시에서 균일 표본
+    # (2) 시각화용 표본: Sample 전체(메모리) + REF 캐시에서 균일 표본 → K-D PCA score
     sample_raw = read_matrix_by_name(SAMPLE_PATH, names, FMT)
     ref_raw, _ = subsample_rows(ref_X, PLOT_DOWNSAMPLE)
     print(f"[Sample] REF 시각화 표본 {len(ref_raw):,} rows (of {n_ref:,})")
-
-    scores_s = pca_project(sample_raw, p)
+    scores_s = pca_project(sample_raw, p)      # (n, K)
     scores_r = pca_project(ref_raw, p)
 
-    # (3) KDE 적합(표본 상한 KDE_MAX_PTS) + 99% HDR 임계치
-    kde_r = fit_kde(scores_r, KDE_MAX_PTS)
-    kde_s = fit_kde(scores_s, KDE_MAX_PTS)
-    lvl_r = hdr_level(kde_r, scores_r, HDR_Q, N_THREADS)
-    lvl_s = hdr_level(kde_s, scores_s, HDR_Q, N_THREADS)
+    # (3) [주] 3D Coverage(부피비) + 분류용 3D 격자 마스크
+    c3 = coverage_grid_kd(scores_r, scores_s, COVERAGE_DIMS, HDR_Q,
+                          GRID_N_3D, GRID_MARGIN, GRID_ANCHOR, N_THREADS)
+    edges, mask_r3, mask_s3 = c3["edges"], c3["mask_r"], c3["mask_s"]
+    cov3_txt = (f"{COVERAGE_DIMS}D Coverage(SAMPLE→REF)={c3['cov_s_of_r']*100:.2f}%  |  "
+                f"Jaccard={c3['jaccard']*100:.2f}%")
 
-    # (4) 격자 KDE 평가(스레드 병렬) → Coverage(겹침 면적) 산출
-    xs, ys, XX, YY, cell_area = make_grid(scores_r, scores_s, GRID_N, GRID_MARGIN, GRID_ANCHOR)
-    dens_r = eval_grid(kde_r, XX, YY, N_THREADS)
-    dens_s = eval_grid(kde_s, XX, YY, N_THREADS)
-    ref_mask = dens_r >= lvl_r
-    sam_mask = dens_s >= lvl_s
-    overlap_mask = ref_mask & sam_mask
-    area_ref = ref_mask.sum() * cell_area
-    area_sam = sam_mask.sum() * cell_area
-    area_ovl = overlap_mask.sum() * cell_area
-    area_uni = (ref_mask | sam_mask).sum() * cell_area
-    cov_sample_of_ref = area_ovl / area_ref if area_ref else 0.0   # 주지표
-    cov_ref_of_sample = area_ovl / area_sam if area_sam else 0.0
-    jaccard = area_ovl / area_uni if area_uni else 0.0
-    cov_txt = (f"Coverage(SAMPLE→REF)={cov_sample_of_ref*100:.2f}%  |  "
-               f"Jaccard={jaccard*100:.2f}%")
+    # (4) 추가: 3D(bridge) + 누적 EVR 80/90% 차원에서 '질량 기반' Coverage 산출(수치)
+    #     (부피 기반은 고차원에서 0 으로 붕괴하므로 질량 기반으로 확장)
+    def _scores_dd(dd):
+        if dd <= scores_r.shape[1]:
+            return scores_r[:, :dd], scores_s[:, :dd]
+        Vd = p["V"][:, :dd]                                  # score 차원 부족 시 확장 투영
+        return ((ref_raw - p["mu"]) / p["sd"]) @ Vd, ((sample_raw - p["mu"]) / p["sd"]) @ Vd
+
+    mass_targets = [(f"{COVERAGE_DIMS}D", COVERAGE_DIMS)]
+    for tgt in COVERAGE_EVR_TARGETS:
+        mass_targets.append((f"EVR{int(tgt*100)}%", dims_for_evr(p["evr"], tgt)))
+    mass_results = []
+    for label, dd in mass_targets:
+        sr, ss = _scores_dd(dd)
+        mm = coverage_mass(sr, ss, dd, HDR_Q, N_THREADS)
+        mm["label"] = label
+        mass_results.append(mm)
+
+    # (5) 2D(PC1-PC2) 메인 등고선 플롯 (해상도 높게)
+    kde_r2 = fit_kde(scores_r[:, :2], KDE_MAX_PTS); kde_s2 = fit_kde(scores_s[:, :2], KDE_MAX_PTS)
+    lvl_r2 = hdr_level(kde_r2, scores_r[:, :2], HDR_Q, N_THREADS)
+    lvl_s2 = hdr_level(kde_s2, scores_s[:, :2], HDR_Q, N_THREADS)
+    xs, ys, XX, YY, _ = make_grid(scores_r[:, :2], scores_s[:, :2], GRID_N, GRID_MARGIN, GRID_ANCHOR)
+    dens_r2 = eval_grid(kde_r2, XX, YY, N_THREADS); dens_s2 = eval_grid(kde_s2, XX, YY, N_THREADS)
+    cov2_s_of_r = int(((dens_r2 >= lvl_r2) & (dens_s2 >= lvl_s2)).sum()) / max(int((dens_r2 >= lvl_r2).sum()), 1)
+    cov_txt2 = f"PC1-PC2 Coverage(SAMPLE→REF)={cov2_s_of_r*100:.2f}%"
 
     # 시각화
-    plot_density_coverage(XX, YY, dens_r, dens_s, lvl_r, lvl_s,
-                          scores_r, scores_s, cov_txt, j("pca_density_coverage.png"))
+    plot_density_coverage(XX, YY, dens_r2, dens_s2, lvl_r2, lvl_s2,
+                          scores_r[:, :2], scores_s[:, :2], cov_txt2, j("pca_density_coverage.png"))
+    plot_pca_3d_projections(scores_r, scores_s, p, cov3_txt, j("pca_3d_projections.png"), N_THREADS)
     plot_scatter_ref_sample(scores_r, scores_s, p, j("pca_scatter_ref_sample.png"))
-    plot_feature_importance(p, names, top_idx, j("pca_feature_importance.png"))
-    plot_biplot(p, names, top_idx, j("pca_loadings_biplot.png"))
-    plot_top_feature_pairplot(ref_raw, sample_raw, names, top_idx, j("pca_top8_pairplot.png"))
+    plot_feature_importance(p, names, sel_idx, j("pca_feature_importance.png"))
+    plot_biplot(p, names, sel_idx, j("pca_loadings_biplot.png"))
+    plot_top_feature_pairplot(ref_raw, sample_raw, names, pair_idx, j("pca_feature_pairplot.png"))
 
-    # (5) CSV 저장 — 분류는 격자 lookup(KDE 재호출 없음)
-    ref_stats = export_ref_groups(REF_PATH, names, p, xs, ys, ref_mask, sam_mask,
+    # (6) CSV 저장 — 분류는 3D 격자 lookup(KDE 재호출 없음)
+    ref_stats = export_ref_groups(REF_PATH, names, p, edges, mask_r3, mask_s3,
                                   FMT, j("reference_uncovered_outside.csv"), ref_X=ref_X)
-    sam_stats = export_sample_groups(SAMPLE_PATH, names, p, xs, ys, ref_mask,
+    sam_stats = export_sample_groups(SAMPLE_PATH, names, p, edges, mask_r3,
                                      FMT, j("sample_cover_group.csv"))
 
     # 리포트
+    cum = np.cumsum(p["evr"])
     print("\n" + "=" * 70)
-    print("  [REF-PCA 2D | KDE 99% Coverage]")
+    print(f"  [REF-PCA {COVERAGE_DIMS}D | KDE 99% Coverage]")
     print("=" * 70)
     print(f"  REF 유효행 수                       : {n_ref:,}")
-    print(f"  PCA top-2 설명분산(EVR)             : {p['evr2']*100:6.2f}%  "
-          f"(PC1={p['evr'][0]*100:.1f}%, PC2={p['evr'][1]*100:.1f}%)")
-    print(f"  영향 큰 top-{N_TOP_FEATURES} feature : {[names[i] for i in top_idx]}")
-    print("  ---- 99% 등고선(HDR) 면적 ----")
-    print(f"  area(REF_99)                        : {area_ref:.4f}")
-    print(f"  area(SAMPLE_99)                     : {area_sam:.4f}")
-    print(f"  area(overlap)                       : {area_ovl:.4f}")
-    print(f"  >>> Coverage(SAMPLE→REF)            : {cov_sample_of_ref*100:7.3f}%   "
-          f"(overlap / REF_99)")
-    print(f"      Coverage(REF→SAMPLE)            : {cov_ref_of_sample*100:7.3f}%   "
-          f"(overlap / SAMPLE_99)")
-    print(f"      Jaccard(overlap/union)          : {jaccard*100:7.3f}%")
-    print("  ---- 포인트 group 집계 ----")
+    print(f"  EVR: PC1={p['evr'][0]*100:.1f}% PC2={p['evr'][1]*100:.1f}% "
+          f"PC3={p['evr'][2]*100:.1f}%  (top-{K} 누적={cum[K-1]*100:.1f}%)")
+    print(f"  영향 feature(>= {FEAT_IMP_THRESH}) {len(sel_idx)}개 : {[names[i] for i in sel_idx]}")
+    print("  ---- Coverage(SAMPLE→REF) [부피 기반, 등고선 그림과 일치] ----")
+    print(f"  PC1-PC2 (2D)                        : {cov2_s_of_r*100:7.3f}%")
+    print(f"  {COVERAGE_DIMS}D (격자 부피비)                  : {c3['cov_s_of_r']*100:7.3f}%   "
+          f"(REF→SAMPLE={c3['cov_r_of_s']*100:.1f}%, Jaccard={c3['jaccard']*100:.1f}%)")
+    print("  ---- Coverage(SAMPLE→REF) [질량 기반, 고차원 확장] ----")
+    for mm in mass_results:
+        flag = "  ⚠신뢰도낮음(n_dom<300)" if mm["n_dom"] < 300 else ""
+        print(f"  {mm['label']:<8} ({mm['dims']:>2}D)                  "
+              f": {mm['cov_s_of_r']*100:7.3f}%   (REF→SAMPLE={mm['cov_r_of_s']*100:.1f}%, "
+              f"n_dom={mm['n_dom']:,}){flag}")
+    print("  ---- 포인트 group 집계 (분류=" + f"{COVERAGE_DIMS}D) ----")
     print(f"  [REF]    outside_99={ref_stats['outside_99']:,}  "
           f"uncovered={ref_stats['uncovered']:,}  (전체 {ref_stats['ref_total']:,})")
     print(f"  [SAMPLE] cover_ref={sam_stats['cover_ref']:,}  "
           f"not_cover_ref={sam_stats['not_cover_ref']:,}  (전체 {sam_stats['sample_total']:,})")
     print("=" * 70)
-    return {"coverage_sample_of_ref": cov_sample_of_ref, "jaccard": jaccard,
-            "evr2": p["evr2"], "top_features": [names[i] for i in top_idx],
+    return {"cov_2d": cov2_s_of_r, "cov_3d": c3["cov_s_of_r"], "jaccard_3d": c3["jaccard"],
+            "mass": mass_results, "evr": p["evr"][:K].tolist(),
+            "sel_features": [names[i] for i in sel_idx],
             "ref_stats": ref_stats, "sam_stats": sam_stats}
 
 
