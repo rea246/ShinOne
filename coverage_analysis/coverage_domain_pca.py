@@ -39,16 +39,27 @@ coverage_domain_pca.py
     * Feature 는 CONFIG(위치 FEATURE_COL_IDX 또는 이름 FEATURE_COLS)로 직접 지정.
       위치로 골라도 Reference 는 '이름'으로 매칭 → 두 파일 열 순서가 달라도 안전.
     * plot 라벨의 feature 이름 = CSV 컬럼 이름.
-    * Reference(대용량)는 chunk 스트리밍(μ·Σ 1패스 + 분류/저장 1패스).
-    * KDE·pairplot 은 Reference reservoir 표본으로 적합/시각화(대용량 대응).
     * 비유한(NaN/Inf) 행은 읽는 즉시 제거하고 개수를 보고한다.
+
+성능(속도) 설계  ── "전처리 1회 캐시 + 재사용", 격자 lookup, 스레드
+    (1) [전처리 캐시] REF feature 행렬을 '한 번만' 파싱해 float32 .npy 로 캐시하고
+        (파일 크기·mtime·feature 목록으로 키 생성) 이후 실행/단계에서 재사용한다.
+        → CSV 를 3번 읽던 것을 첫 실행 1~2회, 재실행 0~1회로 줄인다.
+        캐시 무효화는 자동(파일이 바뀌면 키가 달라짐). USE_CACHE=False 로 끌 수 있다.
+    (2) [격자 lookup 분류] 종전엔 REF 전 행마다 gaussian_kde 를 호출(=O(행수×KDE학습점))
+        해 대용량에서 폭발했다. 이제 KDE 는 격자에서 '한 번만' 평가해 99% 마스크를 만들고,
+        각 포인트는 격자 셀 인덱스로 O(1) 조회한다. → 분류가 O(N) 로 선형화.
+    (3) [KDE 표본 상한] KDE 적합에 KDE_MAX_PTS(기본 6000)만 사용(정확도 충분·속도↑).
+    (4) [스레드] 격자 KDE 평가를 N_THREADS 로 분할(밀도 격자 평가만; gaussian_kde 의
+        C 루프는 GIL 을 풀어 스레드 병렬이 유효). 기본 1(단일).
 
 실행:  python coverage_domain_pca.py
        (필요 시: pip install seaborn scipy scikit-learn matplotlib pandas)
 """
 
-import itertools
+import hashlib
 import os
+from concurrent.futures import ThreadPoolExecutor
 
 import matplotlib
 matplotlib.use("Agg")                 # 헤드리스 백엔드
@@ -82,7 +93,15 @@ PAIR_MAX_PTS   = 3000          # pairplot 소스별 최대 표본 수(과밀 방
 
 CHUNKSIZE      = 200_000
 OUTPUT_DIR     = "coverage_pca_plots"
-PLOT_DOWNSAMPLE = 20_000       # KDE 적합/시각화용 Reference reservoir 표본 수
+PLOT_DOWNSAMPLE = 20_000       # 시각화용 Reference 표본 수(산점/pairplot)
+
+# ---- 성능(속도) 옵션 ----
+USE_CACHE      = True          # REF feature 행렬을 .npy 로 1회 캐시하고 재사용
+CACHE_DIR      = "coverage_pca_cache"
+KDE_MAX_PTS    = 6000          # KDE 적합에 쓰는 최대 표본 수(속도/정확도 균형)
+N_THREADS      = max(1, (os.cpu_count() or 1))   # 격자 KDE 평가 스레드 수(1=단일)
+REF_EXPORT_ORIGINAL_COLS = True   # True: 원본 전체 컬럼 유지(원본 파일 1회 재읽기)
+                                  # False: feature 컬럼만 저장(캐시만 사용, 파일 재읽기 0)
 
 sns.set_theme(style="white", context="talk")   # 내부 격자(gridline) 없음
 
@@ -216,40 +235,65 @@ def iter_ref_chunks_raw(path, names, chunksize, fmt):
         print(f"[IO] Reference 비유한 행 누적 {dropped_total[0]:,}개 제거")
 
 
-def reservoir_sample_raw(path, names, k, chunksize, fmt, seed=0):
-    """Reference 를 스트리밍하며 균일하게 k개 행 추출(Algorithm R), '원본(raw)' 배열 반환."""
-    rng = np.random.default_rng(seed)
-    reservoir = np.empty((k, len(names)), dtype=np.float64)
-    filled = seen = 0
-    for chunk in iter_ref_chunks_raw(path, names, chunksize, fmt):
-        if filled < k:
-            take = min(k - filled, len(chunk))
-            reservoir[filled:filled + take] = chunk[:take]
-            filled += take; seen += take
-            chunk = chunk[take:]
-            if len(chunk) == 0:
-                continue
-        t = seen + np.arange(1, len(chunk) + 1)
-        accept = rng.random(len(chunk)) < (k / t)
-        if accept.any():
-            reservoir[rng.integers(0, k, accept.sum())] = chunk[accept]
-        seen += len(chunk)
-    print(f"[Reservoir] 전체 {seen:,} rows → {filled:,} rows 추출.")
-    return reservoir[:filled]
+# =============================================================================
+# [전처리 캐시] REF feature 행렬을 '1회' 파싱해 float32 .npy 로 캐시하고 재사용
+# =============================================================================
+def _cache_key(path, names):
+    """파일 stat(크기·mtime) + feature 목록으로 캐시 키 생성(파일 바뀌면 자동 무효화)."""
+    st = os.stat(path)
+    sig = f"{os.path.abspath(path)}|{st.st_size}|{int(st.st_mtime)}|{','.join(names)}"
+    return hashlib.md5(sig.encode()).hexdigest()[:16]
+
+
+def load_ref_matrix(path, names, fmt):
+    """
+    REF 의 feature 행렬 (N, d) float32 를 반환한다(비유한 행 제거 후).
+    USE_CACHE 면 <CACHE_DIR>/ref_<key>.npy 로 캐시하고, 이후엔 mmap 으로 즉시 로드한다.
+    → CSV 재파싱(가장 큰 비용)을 실행 간·단계 간 1회로 줄이는 핵심.
+    """
+    if USE_CACHE:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        cache_path = os.path.join(CACHE_DIR, f"ref_{_cache_key(path, names)}.npy")
+        if os.path.exists(cache_path):
+            X = np.load(cache_path, mmap_mode="r")
+            print(f"[Cache] REF feature 캐시 재사용: {cache_path}  (rows={len(X):,}, dim={X.shape[1]})")
+            return X
+    # 캐시 미스 → 1회 스트리밍 파싱하여 행렬 구성
+    parts = list(iter_ref_chunks_raw(path, names, CHUNKSIZE, fmt))
+    if not parts:
+        raise ValueError("Reference 에 유효한 행이 없습니다(전부 NaN/Inf?).")
+    X = np.concatenate(parts, axis=0).astype(np.float32, copy=False)
+    if USE_CACHE:
+        np.save(cache_path, X)
+        print(f"[Cache] REF feature 캐시 저장: {cache_path}  (rows={len(X):,}, dim={X.shape[1]})")
+    else:
+        print(f"[IO] REF feature 파싱 완료(캐시 off): rows={len(X):,}, dim={X.shape[1]}")
+    return X
+
+
+def subsample_rows(X, k, seed=0):
+    """행렬에서 최대 k행 균일 표본 추출(인덱스 정렬 → mmap 접근 효율). (표본배열, 인덱스) 반환."""
+    n = len(X)
+    if n <= k:
+        return np.asarray(X, dtype=np.float64), np.arange(n)
+    idx = np.sort(np.random.default_rng(seed).choice(n, k, replace=False))
+    return np.asarray(X[idx], dtype=np.float64), idx
 
 
 # =============================================================================
-# [PCA] REF 스트리밍 모멘트(μ, Σ) 추정 → 표준화 상관행렬 PCA 학습
+# [PCA] REF 모멘트(μ, Σ) → 표준화 상관행렬 PCA 학습
 # =============================================================================
-def stream_ref_moments(path, names, chunksize, fmt):
-    """Reference 전체 1패스로 [n, Σx, ΣxxᵀT] (raw feature 공간) 집계."""
+def moments_from_matrix(X, chunk=500_000):
+    """캐시된 REF 행렬에서 [n, Σx, ΣxxᵀT] 를 float64 누적으로 집계(청크로 메모리·정밀도 관리)."""
+    d = X.shape[1]
     n = 0
-    sum_x = np.zeros(N_FEATURES)
-    sum_xx = np.zeros((N_FEATURES, N_FEATURES))
-    for X in iter_ref_chunks_raw(path, names, chunksize, fmt):
-        n += X.shape[0]
-        sum_x += X.sum(axis=0)
-        sum_xx += X.T @ X
+    sum_x = np.zeros(d)
+    sum_xx = np.zeros((d, d))
+    for i in range(0, len(X), chunk):
+        b = np.asarray(X[i:i + chunk], dtype=np.float64)
+        n += b.shape[0]
+        sum_x += b.sum(axis=0)
+        sum_xx += b.T @ b
     return n, sum_x, sum_xx
 
 
@@ -293,17 +337,41 @@ def pca_project(X_raw, p):
 # =============================================================================
 # [KDE / HDR] 2D 밀도 + 99% 최고밀도영역(등고선) 임계치
 # =============================================================================
-def fit_kde(scores):
-    """2D score (n, 2) → gaussian_kde.  (내부적으로 (d, n) 로 넘김)"""
-    return gaussian_kde(scores.T)
+def fit_kde(scores, max_pts=None, seed=0):
+    """
+    2D score (n, 2) → gaussian_kde.
+    max_pts 초과 시 균일 표본으로 축소해 적합(속도↑, 밀도추정 정확도엔 거의 영향 없음).
+    """
+    s = scores
+    if max_pts is not None and len(scores) > max_pts:
+        idx = np.random.default_rng(seed).choice(len(scores), max_pts, replace=False)
+        s = scores[idx]
+    return gaussian_kde(s.T)
 
 
-def hdr_level(kde, scores, q):
+def kde_eval(kde, pts, n_threads=1):
+    """
+    KDE 를 (2, m) 평가점에서 계산. n_threads>1 이면 평가점을 나눠 스레드 병렬 실행.
+    (gaussian_kde 의 C 커널 루프는 GIL 을 풀어 스레드 병렬이 유효)
+    """
+    m = pts.shape[1]
+    if n_threads <= 1 or m < 20_000:
+        return kde(pts)
+    splits = np.array_split(np.arange(m), n_threads)
+    out = np.empty(m)
+    with ThreadPoolExecutor(max_workers=n_threads) as ex:
+        futs = {ex.submit(kde, pts[:, s]): s for s in splits if len(s)}
+        for fut, s in futs.items():
+            out[s] = fut.result()
+    return out
+
+
+def hdr_level(kde, scores, q, n_threads=1):
     """
     HDR(최고밀도영역) 임계 밀도값 = 학습 포인트 밀도의 하위 (1−q) 분위수.
     density ≥ level 인 영역이 분포의 약 q(=99%) 를 포함한다.
     """
-    dens = kde(scores.T)
+    dens = kde_eval(kde, scores.T, n_threads)
     return float(np.percentile(dens, (1.0 - q) * 100.0))
 
 
@@ -315,15 +383,32 @@ def make_grid(scores_a, scores_b, n, margin):
     lo -= pad; hi += pad
     xs = np.linspace(lo[0], hi[0], n)
     ys = np.linspace(lo[1], hi[1], n)
-    XX, YY = np.meshgrid(xs, ys)                       # (n, n)
+    XX, YY = np.meshgrid(xs, ys)                       # (n, n) — XX[i,j]=xs[j], YY[i,j]=ys[i]
     cell_area = (xs[1] - xs[0]) * (ys[1] - ys[0])
     return xs, ys, XX, YY, cell_area
 
 
-def eval_grid(kde, XX, YY):
-    """격자 위 밀도값 (n, n)."""
+def eval_grid(kde, XX, YY, n_threads=1):
+    """격자 위 밀도값 (n, n).  스레드 병렬 평가 지원."""
     pts = np.vstack([XX.ravel(), YY.ravel()])
-    return kde(pts).reshape(XX.shape)
+    return kde_eval(kde, pts, n_threads).reshape(XX.shape)
+
+
+def classify_by_grid(scores, xs, ys, mask):
+    """
+    각 포인트를 '격자 셀 마스크 조회'로 in/out 판정한다(KDE 재호출 없이 O(N)).
+    격자(xs, ys)는 등간격 linspace → 셀 인덱스는 반올림으로 O(1). 격자 밖은 False.
+    mask 형상은 (len(ys), len(xs)) = (row=y, col=x).
+    """
+    nx, ny = len(xs), len(ys)
+    dx = xs[1] - xs[0]; dy = ys[1] - ys[0]
+    sx, sy = scores[:, 0], scores[:, 1]
+    inb = (sx >= xs[0]) & (sx <= xs[-1]) & (sy >= ys[0]) & (sy <= ys[-1])
+    ix = np.clip(np.round((sx - xs[0]) / dx).astype(np.int64), 0, nx - 1)
+    iy = np.clip(np.round((sy - ys[0]) / dy).astype(np.int64), 0, ny - 1)
+    res = np.zeros(len(scores), dtype=bool)
+    res[inb] = mask[iy[inb], ix[inb]]
+    return res
 
 
 # =============================================================================
@@ -458,58 +543,85 @@ def plot_top_feature_pairplot(ref_raw, sample_raw, names, top_idx, out_path, see
 # =============================================================================
 # 결과 저장 ④ REF: uncovered + outside_99 행만 group 태그로 저장 (스트리밍)
 # =============================================================================
-def export_ref_groups(ref_path, names, p, kde_r, kde_s, lvl_r, lvl_s, fmt, out_path):
+def _ref_group_masks(sc, xs, ys, ref_mask, sam_mask):
+    """PC score → (keep, group) : outside_99 / uncovered 만 keep. 격자 lookup(KDE 재호출 없음)."""
+    in_ref = classify_by_grid(sc, xs, ys, ref_mask)
+    in_sam = classify_by_grid(sc, xs, ys, sam_mask)
+    outside = ~in_ref                              # 99% 밖
+    uncovered = in_ref & (~in_sam)                 # 99% 안 이나 sample 이 대변 못함
+    keep = outside | uncovered
+    group = np.where(outside, "outside_99", "uncovered")
+    return keep, group
+
+
+def export_ref_groups(ref_path, names, p, xs, ys, ref_mask, sam_mask, fmt, out_path, ref_X=None):
     """
-    Reference 전체(모든 컬럼)를 스트리밍하며,
-      - outside_99 : REF 99% 등고선 밖(density_ref < level_ref)
+    REF 에서 아래 두 group 에 해당하는 행 + PC1·PC2 + group 을 CSV 로 저장한다.
+      - outside_99 : REF 99% 등고선 밖
       - uncovered  : REF 99% 안 이지만 SAMPLE 99% 밖(대변 안 됨)
-    두 group 에 해당하는 원본 행 + PC1·PC2 + group 을 CSV 로 append 저장한다.
     (covered = REF 99% 안 & SAMPLE 99% 안 → 저장 대상 아님)
+
+    분류는 KDE 재호출 없이 '격자 마스크 lookup'(O(N))으로 수행한다.
+    REF_EXPORT_ORIGINAL_COLS:
+      True  → 원본 파일을 1회 스트리밍(모든 컬럼 유지). 원본 메타 컬럼(hash 등) 보존.
+      False → 캐시된 feature 행렬(ref_X)만 사용(파일 재읽기 0). feature 컬럼만 저장.
     """
-    want = set(names)
     header_written = [False]
     n_out99 = n_unc = n_total = 0
-
-    def _flush(df_full):
-        nonlocal n_out99, n_unc, n_total
-        df_full.columns = [str(c).strip() for c in df_full.columns]
-        Xf, finite = _select(df_full, names)
-        n_total += int(finite.sum())
-        if finite.sum() == 0:
-            return
-        rows = df_full.loc[finite].reset_index(drop=True)
-        sc = pca_project(Xf[finite], p)
-        dr = kde_r(sc.T); ds = kde_s(sc.T)
-        in_ref = dr >= lvl_r
-        in_sam = ds >= lvl_s
-        outside = ~in_ref                          # 99% 밖
-        uncovered = in_ref & (~in_sam)             # 99% 안 이나 sample 이 대변 못함
-        keep = outside | uncovered
-        if not keep.any():
-            return
-        group = np.where(outside, "outside_99", "uncovered")
-        out = rows.loc[keep].copy()
-        out["PC1"] = sc[keep, 0]
-        out["PC2"] = sc[keep, 1]
-        out["group"] = group[keep]
-        out.to_csv(out_path, index=False, mode="a", header=not header_written[0])
-        header_written[0] = True
-        n_out99 += int(outside.sum()); n_unc += int(uncovered.sum())
-
     if os.path.exists(out_path):
         os.remove(out_path)
-    if fmt == "csv":
-        for chunk in pd.read_csv(ref_path, chunksize=CHUNKSIZE):
-            _flush(chunk)
-    else:
-        import pyarrow.parquet as pq
-        pf = pq.ParquetFile(ref_path)
-        for batch in pf.iter_batches(batch_size=CHUNKSIZE):
-            _flush(batch.to_pandas())
 
-    if not header_written[0]:      # 해당 행이 하나도 없으면 빈 헤더라도 생성
-        pd.DataFrame(columns=list(_header(ref_path, fmt)) + ["PC1", "PC2", "group"]) \
-            .to_csv(out_path, index=False)
+    if REF_EXPORT_ORIGINAL_COLS:
+        def _flush(df_full):
+            nonlocal n_out99, n_unc, n_total
+            df_full.columns = [str(c).strip() for c in df_full.columns]
+            Xf, finite = _select(df_full, names)
+            n_total += int(finite.sum())
+            if finite.sum() == 0:
+                return
+            rows = df_full.loc[finite].reset_index(drop=True)
+            sc = pca_project(Xf[finite], p)
+            keep, group = _ref_group_masks(sc, xs, ys, ref_mask, sam_mask)
+            if not keep.any():
+                return
+            out = rows.loc[keep].copy()
+            out["PC1"] = sc[keep, 0]; out["PC2"] = sc[keep, 1]
+            out["group"] = group[keep]
+            out.to_csv(out_path, index=False, mode="a", header=not header_written[0])
+            header_written[0] = True
+            n_out99 += int((group[keep] == "outside_99").sum())
+            n_unc += int((group[keep] == "uncovered").sum())
+
+        if fmt == "csv":
+            for chunk in pd.read_csv(ref_path, chunksize=CHUNKSIZE):
+                _flush(chunk)
+        else:
+            import pyarrow.parquet as pq
+            pf = pq.ParquetFile(ref_path)
+            for batch in pf.iter_batches(batch_size=CHUNKSIZE):
+                _flush(batch.to_pandas())
+        if not header_written[0]:
+            pd.DataFrame(columns=list(_header(ref_path, fmt)) + ["PC1", "PC2", "group"]) \
+                .to_csv(out_path, index=False)
+    else:
+        # 캐시 행렬만 사용(파일 재읽기 없음). feature 컬럼 + PC + group.
+        n_total = len(ref_X)
+        for i in range(0, len(ref_X), CHUNKSIZE):
+            Xf = np.asarray(ref_X[i:i + CHUNKSIZE], dtype=np.float64)
+            sc = pca_project(Xf, p)
+            keep, group = _ref_group_masks(sc, xs, ys, ref_mask, sam_mask)
+            if not keep.any():
+                continue
+            out = pd.DataFrame(Xf[keep], columns=names)
+            out["PC1"] = sc[keep, 0]; out["PC2"] = sc[keep, 1]
+            out["group"] = group[keep]
+            out.to_csv(out_path, index=False, mode="a", header=not header_written[0])
+            header_written[0] = True
+            n_out99 += int((group[keep] == "outside_99").sum())
+            n_unc += int((group[keep] == "uncovered").sum())
+        if not header_written[0]:
+            pd.DataFrame(columns=names + ["PC1", "PC2", "group"]).to_csv(out_path, index=False)
+
     print(f"[Save] REF groups 저장: {out_path}  "
           f"(outside_99={n_out99:,}, uncovered={n_unc:,}, 전체 유효 REF={n_total:,})")
     return {"outside_99": n_out99, "uncovered": n_unc, "ref_total": n_total}
@@ -518,12 +630,12 @@ def export_ref_groups(ref_path, names, p, kde_r, kde_s, lvl_r, lvl_s, fmt, out_p
 # =============================================================================
 # 결과 저장 ⑤ SAMPLE: cover_ref / not_cover_ref group 태그 열 추가 저장
 # =============================================================================
-def export_sample_groups(sample_path, names, p, kde_r, lvl_r, fmt, out_path):
+def export_sample_groups(sample_path, names, p, xs, ys, ref_mask, fmt, out_path):
     """
     Sample 원본(모든 컬럼)에 PC1·PC2 와 group 열을 붙여 저장한다.
       - cover_ref     : REF 99% 등고선 안(=REF 를 대변/cover)
       - not_cover_ref : REF 99% 등고선 밖
-    (분석에서 제외된 NaN/Inf 행은 PC/group 이 비어있음)
+    분류는 격자 마스크 lookup(KDE 재호출 없음). NaN/Inf 행은 PC/group 이 비어있음.
     """
     if fmt == "csv":
         df = pd.read_csv(sample_path)
@@ -537,7 +649,7 @@ def export_sample_groups(sample_path, names, p, kde_r, lvl_r, fmt, out_path):
     group = np.array([""] * len(df), dtype=object)
 
     sc = pca_project(Xf[finite], p)
-    in_ref = kde_r(sc.T) >= lvl_r
+    in_ref = classify_by_grid(sc, xs, ys, ref_mask)
     g = np.where(in_ref, "cover_ref", "not_cover_ref")
     pc1[finite] = sc[:, 0]; pc2[finite] = sc[:, 1]
     group[finite] = g
@@ -565,8 +677,11 @@ def run():
     names = resolve_feature_names(SAMPLE_PATH, REF_PATH, FMT)
     N_FEATURES = len(names)
 
-    # (1) REF 1패스로 μ·Σ → 표준화 상관행렬 PCA 학습
-    n_ref, sum_x, sum_xx = stream_ref_moments(REF_PATH, names, CHUNKSIZE, FMT)
+    # (0) REF feature 행렬을 '1회'만 파싱해 캐시(이후 모든 단계·재실행에서 재사용)
+    ref_X = load_ref_matrix(REF_PATH, names, FMT)
+
+    # (1) 캐시 행렬에서 μ·Σ → 표준화 상관행렬 PCA 학습
+    n_ref, sum_x, sum_xx = moments_from_matrix(ref_X)
     if n_ref < N_FEATURES + 1:
         raise ValueError(f"Reference 유효행 {n_ref} < 차원 {N_FEATURES}+1: 공분산 추정 불가.")
     p = build_pca(n_ref, sum_x, sum_xx)
@@ -575,22 +690,24 @@ def run():
     top_idx = list(np.argsort(p["feat_imp"])[::-1][:N_TOP_FEATURES])
     print(f"[PCA] 영향 큰 top-{N_TOP_FEATURES} feature: {[names[i] for i in top_idx]}")
 
-    # (2) 시각화/KDE 용 표본: Sample 전체(메모리) + Reference reservoir
+    # (2) 시각화용 표본: Sample 전체(메모리) + REF 캐시에서 균일 표본
     sample_raw = read_matrix_by_name(SAMPLE_PATH, names, FMT)
-    ref_raw = reservoir_sample_raw(REF_PATH, names, PLOT_DOWNSAMPLE, CHUNKSIZE, FMT)
+    ref_raw, _ = subsample_rows(ref_X, PLOT_DOWNSAMPLE)
+    print(f"[Sample] REF 시각화 표본 {len(ref_raw):,} rows (of {n_ref:,})")
 
     scores_s = pca_project(sample_raw, p)
     scores_r = pca_project(ref_raw, p)
 
-    # (3) KDE 적합 + 99% HDR 임계치
-    kde_r, kde_s = fit_kde(scores_r), fit_kde(scores_s)
-    lvl_r = hdr_level(kde_r, scores_r, HDR_Q)
-    lvl_s = hdr_level(kde_s, scores_s, HDR_Q)
+    # (3) KDE 적합(표본 상한 KDE_MAX_PTS) + 99% HDR 임계치
+    kde_r = fit_kde(scores_r, KDE_MAX_PTS)
+    kde_s = fit_kde(scores_s, KDE_MAX_PTS)
+    lvl_r = hdr_level(kde_r, scores_r, HDR_Q, N_THREADS)
+    lvl_s = hdr_level(kde_s, scores_s, HDR_Q, N_THREADS)
 
-    # (4) 격자 적분으로 Coverage(겹침 면적) 산출
+    # (4) 격자 KDE 평가(스레드 병렬) → Coverage(겹침 면적) 산출
     xs, ys, XX, YY, cell_area = make_grid(scores_r, scores_s, GRID_N, GRID_MARGIN)
-    dens_r = eval_grid(kde_r, XX, YY)
-    dens_s = eval_grid(kde_s, XX, YY)
+    dens_r = eval_grid(kde_r, XX, YY, N_THREADS)
+    dens_s = eval_grid(kde_s, XX, YY, N_THREADS)
     ref_mask = dens_r >= lvl_r
     sam_mask = dens_s >= lvl_s
     overlap_mask = ref_mask & sam_mask
@@ -612,10 +729,10 @@ def run():
     plot_biplot(p, names, top_idx, j("pca_loadings_biplot.png"))
     plot_top_feature_pairplot(ref_raw, sample_raw, names, top_idx, j("pca_top8_pairplot.png"))
 
-    # (5) CSV 저장 — REF groups(전체 스트리밍) + SAMPLE groups
-    ref_stats = export_ref_groups(REF_PATH, names, p, kde_r, kde_s, lvl_r, lvl_s,
-                                  FMT, j("reference_uncovered_outside.csv"))
-    sam_stats = export_sample_groups(SAMPLE_PATH, names, p, kde_r, lvl_r,
+    # (5) CSV 저장 — 분류는 격자 lookup(KDE 재호출 없음)
+    ref_stats = export_ref_groups(REF_PATH, names, p, xs, ys, ref_mask, sam_mask,
+                                  FMT, j("reference_uncovered_outside.csv"), ref_X=ref_X)
+    sam_stats = export_sample_groups(SAMPLE_PATH, names, p, xs, ys, ref_mask,
                                      FMT, j("sample_cover_group.csv"))
 
     # 리포트

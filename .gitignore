@@ -13,3 +13,8 @@ __pycache__/
 # Verification plot outputs
 preproc_check/
 synth/
+
+# Coverage analysis outputs & preprocessing cache
+coverage_pca_plots/
+coverage_pca_cache/
+coverage_plots/
