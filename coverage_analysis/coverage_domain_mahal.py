@@ -572,6 +572,47 @@ def plot_biplot(p, names, out_path):
     print(f"[Plot] biplot 저장: {out_path}")
 
 
+def pc_dominant_terms(p, names, topn=3):
+    """각 유효 PC 를 지배하는 원본 term 산출. 기여율 = loading²(PC별 합=1)."""
+    V = p["Veff"]; K = V.shape[1]
+    contrib = V ** 2
+    evr = (p["sqrt_lam_eff"] ** 2) / p["diagS"].sum()      # PC별 설명분산비
+    lines = []
+    for i in range(K):
+        order = np.argsort(contrib[:, i])[::-1][:topn]
+        terms = ", ".join(f"{names[jf]}({contrib[jf, i]*100:.0f}%{'+' if V[jf, i] >= 0 else '-'})"
+                          for jf in order)
+        lines.append((i + 1, float(evr[i]), terms))
+    return contrib, evr, lines
+
+
+def export_pc_loadings(p, names, out_csv):
+    """feature × 유효PC loading + 기여율(%) CSV."""
+    V = p["Veff"]; K = V.shape[1]; contrib = V ** 2
+    df = pd.DataFrame({"feature": names})
+    for i in range(K):
+        df[f"PC{i+1}_loading"] = V[:, i]
+        df[f"PC{i+1}_contrib%"] = contrib[:, i] * 100
+    df.to_csv(out_csv, index=False)
+    print(f"[Save] pc_loadings: {out_csv}")
+
+
+def plot_pc_loadings_heatmap(p, names, out_path):
+    """유효 PC 별 원본 feature loading 히트맵 (어느 term 이 각 PC 지배하는지)."""
+    V = p["Veff"]; K = V.shape[1]
+    evr = (p["sqrt_lam_eff"] ** 2) / p["diagS"].sum()
+    fig, ax = plt.subplots(figsize=(min(2 + 1.3 * K, 14), max(6, 0.4 * len(names))))
+    sns.heatmap(V, cmap="coolwarm", center=0, ax=ax, annot=(len(names) <= 25),
+                fmt=".2f", annot_kws={"size": 7},
+                xticklabels=[f"PC{i+1}\n(EVR {evr[i]*100:.0f}%)" for i in range(K)],
+                yticklabels=names, cbar_kws={"label": "loading (eigenvector component)"})
+    ax.set_xlabel("effective PC"); ax.set_ylabel("feature")
+    ax.set_title("PC loadings: which feature dominates each effective PC")
+    plt.setp(ax.get_yticklabels(), fontsize=8)
+    fig.tight_layout(); fig.savefig(out_path, dpi=130); plt.close(fig)
+    print(f"[Plot] pc-loadings heatmap 저장: {out_path}")
+
+
 def plot_ood_attribution(cls, names, out_path, topn=15):
     ood = cls["cat"] == 2
     if ood.sum() == 0:
@@ -736,6 +777,7 @@ def run():
     plot_scatter_ref_sample(u_s, u_r, j("domain_scatter_ref_sample.png"))
     plot_distribution(d2_ref, cls["d2"], p, j("domain_mahal_distribution.png"))
     plot_biplot(p, names, j("domain_loadings_biplot.png"))
+    plot_pc_loadings_heatmap(p, names, j("pc_loadings_heatmap.png"))
     top_ood = plot_ood_attribution(cls, names, j("domain_ood_attribution.png"))
     plot_gap_attribution(gap_diff, n_gap_r, n_cov_r, names, j("domain_gap_attribution.png"))
     plot_ood_heatmap(cls, names, j("domain_ood_heatmap.png"))
@@ -744,6 +786,8 @@ def run():
     export_sample(SAMPLE_PATH, names, cls, FMT, j("sample_pc_cover.csv"))
     export_uncovered_ref(ref_pts, p, sam_cells, names, j("reference_uncovered_pc.csv"))
     export_per_feature(feat_cov, w_s, cls, sample_raw, p, ref_feat_bins, names, j("per_feature_coverage.csv"))
+    _, _, pc_lines = pc_dominant_terms(p, names)
+    export_pc_loadings(p, names, j("pc_loadings.csv"))
 
     # 리포트
     print("\n" + "=" * 70)
@@ -760,6 +804,9 @@ def run():
     if top_ood:
         print("  OOD 근원 항 top-5 (조건부 c_j)          : "
               + ", ".join(f"{nm}={v:.1f}" for nm, v in top_ood))
+    print("  PC별 지배 term (기여율%, 부호):")
+    for i, evr_i, terms in pc_lines:
+        print(f"     PC{i} (EVR {evr_i*100:4.1f}%): {terms}")
     print("=" * 70)
     return {"headline_cov": headline, "sam_cov": sam_cov, "cov_of_ref": cov_of_ref,
             "verified": verified, "gap": gap, "n_ood": int(n_ood), "top_ood": top_ood}
