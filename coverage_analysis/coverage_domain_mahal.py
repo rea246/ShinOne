@@ -55,7 +55,9 @@ FEATURE_COL_IDX = list(range(0, 21))
 EXCLUDE_COLS    = []
 
 SCALE_METHOD  = "standard"     # 'standard' | 'minmax'
-MAHAL_Q       = 0.99           # χ² quantile (도메인 경계)
+MAHAL_Q       = 0.9999         # χ² quantile (도메인 경계) — 넓게
+# OOD 경계 방식: 'chi2'(이론 χ²) | 'empirical'(Reference 실측 D²_eff 분위수 → 더 soft·꼬리보정)
+OOD_BOUND     = "empirical"
 MAHAL_GRID_DIMS = 2            # top-2 격자 시각화 차원(K)
 N_BINS_MAHAL  = 10             # top-2 격자 해상도
 N_BINS_1D     = 20             # per-feature 1D 격자 해상도
@@ -261,7 +263,9 @@ def build_frame(mean_raw, cov_raw, mn, mx, method, q, K):
             "std_raw": np.sqrt(np.diag(cov_raw)),
             "eff_dim": eff_dim, "K_eff": K_eff, "Veff": Veff,
             "sqrt_lam_eff": sqrt_lam_eff, "Peff": Peff, "T_eff": T_eff,
-            "diagPeff": np.diag(Peff).copy(), "evr_eff": evr_eff}
+            "diagPeff": np.diag(Peff).copy(), "evr_eff": evr_eff,
+            "V_full": V, "lam_full": w,                    # 전체 PC (loading 전량 출력용)
+            "corr": Sig / np.sqrt(np.outer(np.diag(Sig), np.diag(Sig)))}  # 상관행렬
 
 
 # =============================================================================
@@ -343,7 +347,7 @@ def _cache_key(ref_path, names, fmt):
     key = {"ref": os.path.abspath(ref_path), "size": st.st_size, "mtime": int(st.st_mtime),
            "names": names, "fmt": fmt, "scale": SCALE_METHOD, "q": MAHAL_Q,
            "K": MAHAL_GRID_DIMS, "nb": N_BINS_MAHAL, "nb1d": N_BINS_1D,
-           "ds": PLOT_DOWNSAMPLE, "seed": RESERVOIR_SEED, "effov": EFF_DIM_OVERRIDE}
+           "ds": PLOT_DOWNSAMPLE, "seed": RESERVOIR_SEED, "effov": EFF_DIM_OVERRIDE, "v": 3}
     return hashlib.sha1(json.dumps(key, sort_keys=True).encode()).hexdigest()[:16]
 
 
@@ -376,7 +380,7 @@ def load_or_build_reference(ref_path, names, fmt):
 # =============================================================================
 # Sample 분류(A) + 근원 항(B) + per-feature 커버리지
 # =============================================================================
-def classify_points(z, p, ref_cells):
+def classify_points(z, p, ref_cells, T_ood):
     e = z - p["mu"]
     g = e @ p["Peff"]                               # 유효차원 부분공간 정밀행렬
     d2 = np.einsum("ij,ij->i", e, g)                # D²_eff = eᵀ P_eff e (=Σ top-K_eff u²)
@@ -384,7 +388,7 @@ def classify_points(z, p, ref_cells):
     uu_ = e ** 2 / p["diagS"]                       # 무조건부 기여(변수 단독)
     u2 = e @ p["Vk"] / p["sqrt_lamk"]               # top-2 (격자/시각화용)
     cat = np.empty(len(z), dtype=np.int8)
-    ood = d2 > p["T_eff"]; cat[ood] = 2
+    ood = d2 > T_ood; cat[ood] = 2
     ind = ~ood
     in_ell = ind & ((u2 ** 2).sum(1) <= p["Tk"])
     for i in np.where(ind)[0]:
@@ -582,6 +586,33 @@ def plot_biplot(p, names, out_path):
     print(f"[Plot] biplot 저장: {out_path}")
 
 
+def plot_corr_clustered(corr, names, out_path):
+    """Feature 상관행렬 clustered heatmap (red=유사/양, blue=반대/음)."""
+    d = corr.shape[0]
+    order = np.arange(d)
+    if d >= 3:
+        from scipy.cluster.hierarchy import linkage, leaves_list
+        from scipy.spatial.distance import squareform
+        dist = 1.0 - corr; dist = (dist + dist.T) / 2; np.fill_diagonal(dist, 0.0)
+        Z = linkage(squareform(dist, checks=False), method="average")
+        order = leaves_list(Z)
+    C = corr[np.ix_(order, order)]; nm = [names[i] for i in order]
+    fig, ax = plt.subplots(figsize=(max(7, 0.5 * d), max(6, 0.45 * d)))
+    sns.heatmap(C, cmap="coolwarm", center=0, vmin=-1, vmax=1, square=True, ax=ax,
+                xticklabels=nm, yticklabels=nm, annot=(d <= 20), fmt=".2f",
+                annot_kws={"size": 6}, cbar_kws={"label": "correlation"})
+    ax.set_title("Feature correlation (clustered)\nred = similar(+corr) / blue = opposite(-corr)")
+    plt.setp(ax.get_xticklabels(), rotation=90, fontsize=7)
+    plt.setp(ax.get_yticklabels(), rotation=0, fontsize=7)
+    fig.tight_layout(); fig.savefig(out_path, dpi=130); plt.close(fig)
+    print(f"[Plot] correlation heatmap 저장: {out_path}")
+
+
+def export_correlation(corr, names, out_csv):
+    pd.DataFrame(corr, index=names, columns=names).to_csv(out_csv)
+    print(f"[Save] correlation_matrix: {out_csv}")
+
+
 def pc_dominant_terms(p, names, topn=3):
     """각 유효 PC 를 지배하는 원본 term 산출. 기여율 = loading²(PC별 합=1)."""
     V = p["Veff"]; K = V.shape[1]
@@ -597,14 +628,21 @@ def pc_dominant_terms(p, names, topn=3):
 
 
 def export_pc_loadings(p, names, out_csv):
-    """feature × 유효PC loading + 기여율(%) CSV."""
-    V = p["Veff"]; K = V.shape[1]; contrib = V ** 2
+    """feature × '전체' PC loading + 기여율(%) CSV (유효차원뿐 아니라 전 PC 출력)."""
+    V = p["V_full"]; d = V.shape[1]; contrib = V ** 2
+    evr = p["lam_full"] / p["lam_full"].sum()
     df = pd.DataFrame({"feature": names})
-    for i in range(K):
+    for i in range(d):                                   # 전체 PC 출력
         df[f"PC{i+1}_loading"] = V[:, i]
         df[f"PC{i+1}_contrib%"] = contrib[:, i] * 100
+    # 각 PC 의 설명분산비(EVR)와 유효차원 여부를 마지막 요약 행으로 덧붙임
+    meta = {"feature": "__EVR%__"}
+    for i in range(d):
+        meta[f"PC{i+1}_loading"] = np.nan
+        meta[f"PC{i+1}_contrib%"] = round(float(evr[i]) * 100, 4)
+    df = pd.concat([df, pd.DataFrame([meta])], ignore_index=True)
     df.to_csv(out_csv, index=False)
-    print(f"[Save] pc_loadings: {out_csv}")
+    print(f"[Save] pc_loadings (전체 {d} PC): {out_csv}")
 
 
 def plot_pc_loadings_heatmap(p, names, out_path):
@@ -680,7 +718,7 @@ def plot_ood_heatmap(cls, names, out_path, topn=OOD_HEATMAP_TOPN):
 _COVER_LABEL = np.array(["covered", "in_domain_no_ref", "out_of_domain"])
 
 
-def export_sample(sample_path, names, cls, fmt, out_path):
+def export_sample(sample_path, names, cls, fmt, d2_ref, out_path):
     if fmt == "csv":
         df = pd.read_csv(sample_path)
     else:
@@ -690,12 +728,18 @@ def export_sample(sample_path, names, cls, fmt, out_path):
     X = df.loc[:, names].to_numpy(dtype=np.float64)
     finite = np.isfinite(X).all(axis=1)
     pc1 = np.full(len(df), np.nan); pc2 = np.full(len(df), np.nan)
-    d2 = np.full(len(df), np.nan); status = np.array([""] * len(df), dtype=object)
+    d2 = np.full(len(df), np.nan); pctl = np.full(len(df), np.nan)
+    status = np.array([""] * len(df), dtype=object)
     covered = np.zeros(len(df), dtype=bool)
     pc1[finite] = cls["u2"][:, 0]; pc2[finite] = cls["u2"][:, 1]
     d2[finite] = cls["d2"]; status[finite] = _COVER_LABEL[cls["cat"]]
     covered[finite] = (cls["cat"] == 0)
-    df["PC1"], df["PC2"], df["D2_full"] = pc1, pc2, d2
+    # soft 지표: Reference D²_eff 분포 대비 백분위(0~1). 0.5=평범, 1=ref 최외곽, >q=이탈
+    ref_sorted = np.sort(d2_ref)
+    pctl[finite] = np.searchsorted(ref_sorted, cls["d2"], side="right") / len(ref_sorted)
+    df["PC1"], df["PC2"] = pc1, pc2
+    df["D2_eff"] = d2                     # 유효차원 Mahalanobis²(=Σ 유효PC whitened²)
+    df["D2_eff_ref_pctl"] = pctl          # soft: Reference 분포 대비 백분위
     df["cover_status"], df["covered"] = status, covered
     df.to_csv(out_path, index=False)
     print(f"[Save] sample_pc_cover: {out_path} (rows={len(df):,}, covered={int(covered.sum()):,})")
@@ -752,10 +796,18 @@ def run():
     p = R["p"]; ref_cells = R["ref_cells"]; dom = p["domain_set"]
     ref_pts = R["ref_pts"]; d2_ref = R["d2_ref"]; ref_feat_bins = R["feat_bins"]
 
+    # OOD 경계(soft): empirical=Reference 실측 D²_eff 분위수 / chi2=이론
+    d2_ref = R["d2_ref"]
+    if OOD_BOUND == "empirical":
+        T_ood = float(np.quantile(d2_ref, MAHAL_Q))
+        ref_ood_rate = float(np.mean(d2_ref > T_ood))
+    else:
+        T_ood = p["T_eff"]; ref_ood_rate = R["ref_out"] / max(R["ref_tot"], 1)
+
     # Sample → 고정 프레임에 투영
     sample_raw = read_matrix_by_name(SAMPLE_PATH, names, FMT)
     z_s = standardize(sample_raw, p)
-    cls = classify_points(z_s, p, ref_cells)
+    cls = classify_points(z_s, p, ref_cells, T_ood)
     w_s = (z_s - p["mu"]) / np.sqrt(p["diagS"])
     sam_cells = mahal_sample_cells(z_s, p)
 
@@ -770,7 +822,7 @@ def run():
     headline = float(feat_cov.mean())
     cat = cls["cat"]
     n_ver, n_ind, n_ood = (cat == 0).sum(), (cat == 1).sum(), (cat == 2).sum()
-    sam_out = int((cls["d2"] > p["T_eff"]).sum())
+    sam_out = int(n_ood)
 
     # per-feature ref 분포(reservoir) + 유효차원 whitened 좌표
     w_r = (ref_pts - p["mu"]) / np.sqrt(p["diagS"])
@@ -788,16 +840,18 @@ def run():
     plot_distribution(d2_ref, cls["d2"], p, j("domain_mahal_distribution.png"))
     plot_biplot(p, names, j("domain_loadings_biplot.png"))
     plot_pc_loadings_heatmap(p, names, j("pc_loadings_heatmap.png"))
+    plot_corr_clustered(p["corr"], names, j("feature_correlation.png"))
     top_ood = plot_ood_attribution(cls, names, j("domain_ood_attribution.png"))
     plot_gap_attribution(gap_diff, n_gap_r, n_cov_r, names, j("domain_gap_attribution.png"))
     plot_ood_heatmap(cls, names, j("domain_ood_heatmap.png"))
 
     # 저장
-    export_sample(SAMPLE_PATH, names, cls, FMT, j("sample_pc_cover.csv"))
+    export_sample(SAMPLE_PATH, names, cls, FMT, d2_ref, j("sample_pc_cover.csv"))
     export_uncovered_ref(ref_pts, p, sam_cells, names, j("reference_uncovered_pc.csv"))
     export_per_feature(feat_cov, w_s, cls, sample_raw, p, ref_feat_bins, names, j("per_feature_coverage.csv"))
     _, _, pc_lines = pc_dominant_terms(p, names)
     export_pc_loadings(p, names, j("pc_loadings.csv"))
+    export_correlation(p["corr"], names, j("feature_correlation.csv"))
 
     # 리포트
     print("\n" + "=" * 70)
@@ -808,8 +862,9 @@ def run():
     print(f"  (보조) Ref-footprint coverage            : {cov_of_ref*100:8.4f}%   (분모=ref셀 {denom_ref})")
     print(f"  [셀] Cat1 대변={verified:,}  Cat2 gap={gap:,}  (of ref {denom_ref:,})")
     print(f"  [진단] 유효차원 K_eff={p['K_eff']} (PR={p['eff_dim']:.2f}, EVR={p['evr_eff']*100:.1f}%)")
+    print(f"  [진단] OOD 경계 방식={OOD_BOUND} (q={MAHAL_Q}, T_ood={T_ood:.1f})")
     print(f"  [진단] Sample OOD (eff {p['K_eff']}-d)          : {sam_out/max(len(z_s),1)*100:.2f}%  "
-          f"(Ref OOD={R['ref_out']/max(R['ref_tot'],1)*100:.2f}%)")
+          f"(Ref OOD={ref_ood_rate*100:.2f}%)")
     print(f"  [Sample 포인트] 대변={n_ver:,}  도메인내={n_ind:,}  OOD={n_ood:,}  (총 {len(z_s):,})")
     if top_ood:
         print("  OOD 근원 항 top-5 (조건부 c_j)          : "
