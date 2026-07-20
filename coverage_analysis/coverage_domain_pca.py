@@ -41,8 +41,18 @@ coverage_domain_pca.py
     * plot 라벨의 feature 이름 = CSV 컬럼 이름.
     * 비유한(NaN/Inf) 행은 읽는 즉시 제거하고 개수를 보고한다.
 
+여러 sample 비교 (REF 고정, sample1·sample2·… 교체)
+    * PCA 축(고유벡터)·표준화 통계(μ_ref·σ_ref)는 '오직 REF' 로만 계산한다.
+      → sample 을 바꿔도 REF 의 PC 값·벡터·EVR 은 절대 바뀌지 않는다(참고 mahal 스크립트는
+        스케일러를 SAMPLE 로 fit 해서 sample 마다 축이 흔들렸다 — 이를 제거).
+    * REF PCA basis 는 <CACHE_DIR>/pca_<key>.npz 로 '1회 fit → 재사용'(get_ref_pca) 하여
+      sample 실행 간 μ·σ·고유벡터·PC 가 100% 동일함을 보장한다.
+    * 고유벡터 부호를 결정적으로 고정(build_pca) → 부호 뒤집힘 없이 재현.
+    * GRID_ANCHOR='ref' 면 플롯 축을 REF 범위로 고정 → sample1·sample2 그림을 그대로 겹쳐 비교.
+    * outside_99(=REF 자기 99% 밖)는 sample 과 무관하게 동일; uncovered·Coverage 만 sample 별로 달라진다.
+
 성능(속도) 설계  ── "전처리 1회 캐시 + 재사용", 격자 lookup, 스레드
-    (1) [전처리 캐시] REF feature 행렬을 '한 번만' 파싱해 float32 .npy 로 캐시하고
+    (1) [전처리 캐시] REF feature 행렬 + PCA basis 를 '한 번만' 만들어 캐시하고
         (파일 크기·mtime·feature 목록으로 키 생성) 이후 실행/단계에서 재사용한다.
         → CSV 를 3번 읽던 것을 첫 실행 1~2회, 재실행 0~1회로 줄인다.
         캐시 무효화는 자동(파일이 바뀌면 키가 달라짐). USE_CACHE=False 로 끌 수 있다.
@@ -87,6 +97,10 @@ FEATURE_COL_IDX = list(range(0, 21))    # REF/SAMPLE 앞 21차원
 HDR_Q         = 0.99            # 등고선(HDR) 분위수 = 99%
 GRID_N        = 240            # 밀도 적분/등고선용 격자 해상도(축당)
 GRID_MARGIN   = 0.08           # 격자 여백(데이터 범위 대비 비율)
+GRID_ANCHOR   = "ref"          # 'ref'|'both' : 격자(플롯 축) 기준.
+                               #   'ref'  = REF 범위로 축 고정 → sample 을 바꿔도 축이 동일해
+                               #            sample1·sample2 플롯을 그대로 겹쳐 비교(권장).
+                               #   'both' = REF+SAMPLE 합집합 범위(sample 마다 축이 달라짐).
 
 N_TOP_FEATURES = 8             # PCA 영향 큰 feature 상위 N (교차 scatter 대상)
 PAIR_MAX_PTS   = 3000          # pairplot 소스별 최대 표본 수(과밀 방지)
@@ -314,6 +328,12 @@ def build_pca(n, sum_x, sum_xx):
     w, V = np.linalg.eigh(corr)                        # 오름차순 고유값
     order = np.argsort(w)[::-1]                         # 큰 고유값 순
     w, V = np.clip(w[order], 0, None), V[:, order]
+    # 고유벡터 부호를 결정적으로 고정(재현성): 각 PC 에서 |성분| 최대 좌표를 +로.
+    # → REF 가 같으면 실행/수치경로와 무관하게 항상 같은 방향(부호)을 갖는다.
+    for k in range(V.shape[1]):
+        jmax = int(np.argmax(np.abs(V[:, k])))
+        if V[jmax, k] < 0:
+            V[:, k] = -V[:, k]
     evr = w / w.sum()
 
     Vk = V[:, :2]                                       # PC1·PC2 방향
@@ -332,6 +352,45 @@ def pca_project(X_raw, p):
     """raw feature (n, d) → PC1·PC2 score (n, 2).  z=(x−μ)/σ , score=z·Vk."""
     z = (X_raw - p["mu"]) / p["sd"]
     return z @ p["Vk"]
+
+
+def save_pca_model(path, p, n_ref):
+    """REF PCA basis(mu, sd, V, evr, ...)를 npz 로 저장 → 여러 sample 실행이 동일 프레임 재사용."""
+    np.savez(path, mu=p["mu"], sd=p["sd"], V=p["V"], evr=p["evr"],
+             load=p["load"], feat_imp=p["feat_imp"], n_ref=np.int64(n_ref))
+
+
+def load_pca_model(path):
+    """저장된 REF PCA basis 를 로드해 build_pca 와 동일한 dict + n_ref 반환."""
+    z = np.load(path)
+    p = {"mu": z["mu"], "sd": z["sd"], "V": z["V"], "evr": z["evr"],
+         "Vk": z["V"][:, :2], "evr2": float(z["evr"][:2].sum()),
+         "load": z["load"], "feat_imp": z["feat_imp"]}
+    return p, int(z["n_ref"])
+
+
+def get_ref_pca(ref_X, names):
+    """
+    REF PCA basis 를 얻는다.  USE_CACHE 면 <CACHE_DIR>/pca_<key>.npz 로 '1회 fit → 재사용'.
+    → sample 을 바꿔가며 여러 번 돌려도 REF 의 μ·σ·고유벡터·PC 가 100% 동일하게 고정된다.
+    """
+    pca_path = None
+    if USE_CACHE:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        pca_path = os.path.join(CACHE_DIR, f"pca_{_cache_key(REF_PATH, names)}.npz")
+        if os.path.exists(pca_path):
+            p, n_ref = load_pca_model(pca_path)
+            print(f"[Cache] REF PCA basis 재사용: {pca_path}  "
+                  f"(PC1 EVR={p['evr'][0]*100:.1f}%, PC2 EVR={p['evr'][1]*100:.1f}%)")
+            return p, n_ref
+    n_ref, sum_x, sum_xx = moments_from_matrix(ref_X)
+    if n_ref < ref_X.shape[1] + 1:
+        raise ValueError(f"Reference 유효행 {n_ref} < 차원 {ref_X.shape[1]}+1: 공분산 추정 불가.")
+    p = build_pca(n_ref, sum_x, sum_xx)
+    if pca_path:
+        save_pca_model(pca_path, p, n_ref)
+        print(f"[Cache] REF PCA basis 저장: {pca_path}")
+    return p, n_ref
 
 
 # =============================================================================
@@ -375,16 +434,28 @@ def hdr_level(kde, scores, q, n_threads=1):
     return float(np.percentile(dens, (1.0 - q) * 100.0))
 
 
-def make_grid(scores_a, scores_b, n, margin):
-    """두 점군을 모두 감싸는 공통 격자(가장자리 좌표 xs, ys + 셀 중심 XX,YY + 셀면적)."""
-    allpts = np.vstack([scores_a, scores_b])
-    lo = allpts.min(axis=0); hi = allpts.max(axis=0)
+def make_grid(scores_ref, scores_sample, n, margin, anchor="ref"):
+    """
+    격자(가장자리 xs, ys + 셀중심 XX,YY + 셀면적) 생성.
+    anchor='ref'  : REF 범위로 축 고정(여러 sample 비교 시 축이 동일 → 그림 겹쳐 보기 좋음).
+    anchor='both' : REF+SAMPLE 합집합 범위.
+    """
+    base = scores_ref if anchor == "ref" else np.vstack([scores_ref, scores_sample])
+    lo = base.min(axis=0); hi = base.max(axis=0)
     pad = (hi - lo) * margin + 1e-9
     lo -= pad; hi += pad
     xs = np.linspace(lo[0], hi[0], n)
     ys = np.linspace(lo[1], hi[1], n)
     XX, YY = np.meshgrid(xs, ys)                       # (n, n) — XX[i,j]=xs[j], YY[i,j]=ys[i]
     cell_area = (xs[1] - xs[0]) * (ys[1] - ys[0])
+    # anchor='ref' 일 때 sample 이 REF 프레임 밖으로 얼마나 벗어나는지 보고(등고선 clip 경고)
+    if anchor == "ref" and len(scores_sample):
+        out = ((scores_sample[:, 0] < xs[0]) | (scores_sample[:, 0] > xs[-1]) |
+               (scores_sample[:, 1] < ys[0]) | (scores_sample[:, 1] > ys[-1]))
+        frac = float(out.mean())
+        if frac > 0.005:
+            print(f"[Grid] 주의: SAMPLE 의 {frac*100:.1f}% 가 REF 축 프레임 밖(등고선 일부 clip). "
+                  f"필요시 GRID_ANCHOR='both' 로 전환.")
     return xs, ys, XX, YY, cell_area
 
 
@@ -680,11 +751,8 @@ def run():
     # (0) REF feature 행렬을 '1회'만 파싱해 캐시(이후 모든 단계·재실행에서 재사용)
     ref_X = load_ref_matrix(REF_PATH, names, FMT)
 
-    # (1) 캐시 행렬에서 μ·Σ → 표준화 상관행렬 PCA 학습
-    n_ref, sum_x, sum_xx = moments_from_matrix(ref_X)
-    if n_ref < N_FEATURES + 1:
-        raise ValueError(f"Reference 유효행 {n_ref} < 차원 {N_FEATURES}+1: 공분산 추정 불가.")
-    p = build_pca(n_ref, sum_x, sum_xx)
+    # (1) REF PCA basis '1회 fit → 재사용'(sample 을 바꿔도 REF μ·σ·고유벡터·PC 100% 고정)
+    p, n_ref = get_ref_pca(ref_X, names)
 
     # PCA 영향 큰 top-N feature
     top_idx = list(np.argsort(p["feat_imp"])[::-1][:N_TOP_FEATURES])
@@ -705,7 +773,7 @@ def run():
     lvl_s = hdr_level(kde_s, scores_s, HDR_Q, N_THREADS)
 
     # (4) 격자 KDE 평가(스레드 병렬) → Coverage(겹침 면적) 산출
-    xs, ys, XX, YY, cell_area = make_grid(scores_r, scores_s, GRID_N, GRID_MARGIN)
+    xs, ys, XX, YY, cell_area = make_grid(scores_r, scores_s, GRID_N, GRID_MARGIN, GRID_ANCHOR)
     dens_r = eval_grid(kde_r, XX, YY, N_THREADS)
     dens_s = eval_grid(kde_s, XX, YY, N_THREADS)
     ref_mask = dens_r >= lvl_r
