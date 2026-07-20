@@ -718,7 +718,7 @@ def plot_ood_heatmap(cls, names, out_path, topn=OOD_HEATMAP_TOPN):
 _COVER_LABEL = np.array(["covered", "in_domain_no_ref", "out_of_domain"])
 
 
-def export_sample(sample_path, names, cls, fmt, d2_ref, out_path):
+def export_sample(sample_path, names, cls, fmt, d2_ref, ueff, out_path):
     if fmt == "csv":
         df = pd.read_csv(sample_path)
     else:
@@ -727,26 +727,25 @@ def export_sample(sample_path, names, cls, fmt, d2_ref, out_path):
     df.columns = [str(c).strip() for c in df.columns]
     X = df.loc[:, names].to_numpy(dtype=np.float64)
     finite = np.isfinite(X).all(axis=1)
-    pc1 = np.full(len(df), np.nan); pc2 = np.full(len(df), np.nan)
-    d2 = np.full(len(df), np.nan); pctl = np.full(len(df), np.nan)
-    status = np.array([""] * len(df), dtype=object)
-    covered = np.zeros(len(df), dtype=bool)
-    pc1[finite] = cls["u2"][:, 0]; pc2[finite] = cls["u2"][:, 1]
+    n = len(df); K = ueff.shape[1]
+    d2 = np.full(n, np.nan); pctl = np.full(n, np.nan)
+    status = np.array([""] * n, dtype=object); covered = np.zeros(n, dtype=bool)
+    # 유효 PC 전체(PC1..PC_Keff) whitened 좌표
+    for i in range(K):
+        col = np.full(n, np.nan); col[finite] = ueff[:, i]; df[f"PC{i+1}"] = col
     d2[finite] = cls["d2"]; status[finite] = _COVER_LABEL[cls["cat"]]
     covered[finite] = (cls["cat"] == 0)
-    # soft 지표: Reference D²_eff 분포 대비 백분위(0~1). 0.5=평범, 1=ref 최외곽, >q=이탈
-    ref_sorted = np.sort(d2_ref)
+    ref_sorted = np.sort(d2_ref)          # soft: Reference D²_eff 분포 대비 백분위(0~1)
     pctl[finite] = np.searchsorted(ref_sorted, cls["d2"], side="right") / len(ref_sorted)
-    df["PC1"], df["PC2"] = pc1, pc2
     df["D2_eff"] = d2                     # 유효차원 Mahalanobis²(=Σ 유효PC whitened²)
-    df["D2_eff_ref_pctl"] = pctl          # soft: Reference 분포 대비 백분위
+    df["D2_eff_ref_pctl"] = pctl
     df["cover_status"], df["covered"] = status, covered
     df.to_csv(out_path, index=False)
-    print(f"[Save] sample_pc_cover: {out_path} (rows={len(df):,}, covered={int(covered.sum()):,})")
+    print(f"[Save] sample_pc_cover: {out_path} (rows={n:,}, PC1..PC{K}, covered={int(covered.sum()):,})")
 
 
 def export_uncovered_ref(ref_pts, p, sam_cells, names, out_path):
-    u = whiten_topk(ref_pts, p)
+    u = whiten_topk(ref_pts, p)                            # top-2 (셀/gap 판정용)
     in_ell = (u ** 2).sum(1) <= p["Tk"]
     idx = np.empty(u.shape, dtype=np.int16)
     for a in range(u.shape[1]):
@@ -755,7 +754,9 @@ def export_uncovered_ref(ref_pts, p, sam_cells, names, out_path):
     unc = np.array([in_ell[i] and (keys[i] not in sam_cells) for i in range(len(ref_pts))])
     feats = ref_pts[unc] * p["scale"] + p["center"]        # 표준화 역변환 → 원본 스케일
     out = pd.DataFrame(feats, columns=names)
-    out["PC1"], out["PC2"] = u[unc, 0], u[unc, 1]
+    ueff = (ref_pts[unc] - p["mu"]) @ p["Veff"] / p["sqrt_lam_eff"]   # 유효 PC 전체
+    for i in range(ueff.shape[1]):
+        out[f"PC{i+1}"] = ueff[:, i]
     out.to_csv(out_path, index=False)
     print(f"[Save] reference_uncovered: {out_path} (uncovered={int(unc.sum()):,}/{len(ref_pts):,})")
 
@@ -846,7 +847,7 @@ def run():
     plot_ood_heatmap(cls, names, j("domain_ood_heatmap.png"))
 
     # 저장
-    export_sample(SAMPLE_PATH, names, cls, FMT, d2_ref, j("sample_pc_cover.csv"))
+    export_sample(SAMPLE_PATH, names, cls, FMT, d2_ref, ueff_s, j("sample_pc_cover.csv"))
     export_uncovered_ref(ref_pts, p, sam_cells, names, j("reference_uncovered_pc.csv"))
     export_per_feature(feat_cov, w_s, cls, sample_raw, p, ref_feat_bins, names, j("per_feature_coverage.csv"))
     _, _, pc_lines = pc_dominant_terms(p, names)
