@@ -17,6 +17,8 @@ Y_LIM = None                 # 예: (0, 100) / None 이면 자동
 
 MARKER_SIZE = 60
 ALPHA = 0.75
+
+WIDE_CSV_PATH = "group_wide.csv"   # 그룹별 x,y로 전개해서 저장할 csv 경로
 # ================================================
 
 # 그룹 구분용 고정 팔레트 (최대 8개 그룹까지 색이 뚜렷하게 구분됨)
@@ -42,6 +44,18 @@ def _use_korean_font():
     plt.rcParams["axes.unicode_minus"] = False
 
 
+def save_wide_csv(df, groups):
+    """group, X, Y 형태를 g1_x, g1_y, g2_x, g2_y ... 형태로 전개해서 저장."""
+    wide_cols = {}
+    for group in groups:
+        sub = df[df[GROUP_COL] == group]
+        wide_cols[f"{group}_{X_COL}"] = sub[X_COL].reset_index(drop=True)
+        wide_cols[f"{group}_{Y_COL}"] = sub[Y_COL].reset_index(drop=True)
+
+    wide_df = pd.DataFrame(wide_cols)
+    wide_df.to_csv(WIDE_CSV_PATH, index=False)
+
+
 def main():
     sns.set_theme(style="whitegrid", context="talk")
     _use_korean_font()
@@ -49,6 +63,8 @@ def main():
     df = pd.read_csv(TXT_PATH, sep="\t", header=0, usecols=[GROUP_COL, X_COL, Y_COL])
 
     groups = list(pd.unique(df[GROUP_COL]))
+
+    save_wide_csv(df, groups)
 
     if len(groups) > len(PALETTE):
         raise ValueError(
