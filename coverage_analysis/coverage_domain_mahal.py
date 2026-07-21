@@ -76,10 +76,9 @@ USE_CACHE     = True           # Reference 파생물 캐시 사용
 CACHE_DIR     = ".refcache"
 RESERVOIR_SEED = 0
 
-# 전체 Reference 를 스트리밍해 (1) uncovered 행 '전량' + (2) covered 대표표본을 저장.
-#   ※ sample 의존이라 캐시 불가 → 켜면 실행마다 Reference 를 한 번 더 읽는다.
+# uncovered(gap) 행을 '전량' 저장(전체 Reference 스트리밍). sample 의존이라 캐시 불가 →
+# 켜면 실행마다 Reference 를 한 번 더 읽는다. (scatter reservoir 전량은 항상 별도 저장)
 EXPORT_REF_ROWS  = True
-COVERED_SAMPLE_N = 2000        # covered 대표 패턴 표본 수
 
 sns.set_theme(style="white", context="talk")
 
@@ -766,57 +765,60 @@ def export_uncovered_ref(ref_pts, p, sam_cells, names, out_path):
     print(f"[Save] reference_uncovered: {out_path} (uncovered={int(unc.sum()):,}/{len(ref_pts):,})")
 
 
-def export_ref_rows(ref_path, names, p, sam_cells, fmt, out_uncov, out_cov, cov_n, chunksize):
+def _cover_status_topk(z_e, p, sam_cells):
+    """표준화잔차 e=z-μ 배열 → 각 행의 top-2 셀 기준 cover 상태 문자열 배열."""
+    u2 = (z_e @ p["Vk"]) / p["sqrt_lamk"]
+    in_ell = (u2 ** 2).sum(1) <= p["Tk"]
+    idx = np.empty(u2.shape, dtype=np.int16)
+    for a in range(2):
+        idx[:, a] = np.digitize(u2[:, a], p["internalK"])
+    keys = [row.tobytes() for row in idx]
+    st = np.empty(len(z_e), dtype=object)
+    for i in range(len(z_e)):
+        if not in_ell[i]:
+            st[i] = "out_of_domain"
+        else:
+            st[i] = "covered" if keys[i] in sam_cells else "gap"
+    return st
+
+
+def export_scatter_ref(ref_pts, p, sam_cells, names, out_path):
     """
-    전체 Reference 를 스트리밍하며 top-2 셀 기준으로 covered/uncovered(gap) 판정:
-      - uncovered(gap: 타원 안·sample 미점유 셀) 행을 '전량' out_uncov 에 증분 저장(메모리 안전).
-      - covered(타원 안·sample 점유 셀) 행에서 reservoir 로 대표 cov_n 개를 out_cov 에 저장.
-    각 행 = 원본 feature 값 + 유효 PC(PC1..PC_Keff).
+    scatter plot 에 쓰인 Reference reservoir 전량을 CSV 로 저장.
+    각 행 = 원본 feature(역변환) + 유효 PC(PC1..PC_Keff) + cover_status(covered/gap/out_of_domain).
     """
+    e = ref_pts - p["mu"]
+    status = _cover_status_topk(e, p, sam_cells)
+    feats = ref_pts * p["scale"] + p["center"]
+    ueff = (e @ p["Veff"]) / p["sqrt_lam_eff"]
+    df = pd.DataFrame(feats, columns=names)
+    for i in range(ueff.shape[1]):
+        df[f"PC{i+1}"] = ueff[:, i]
+    df["cover_status"] = status
+    df.to_csv(out_path, index=False)
+    n_cov = int((status == "covered").sum()); n_gap = int((status == "gap").sum())
+    print(f"[Save] reference_scatter(전량): {out_path} (rows={len(df):,}, "
+          f"covered={n_cov:,}, gap={n_gap:,}, ood={len(df)-n_cov-n_gap:,})")
+
+
+def export_ref_rows_full(ref_path, names, p, sam_cells, fmt, out_uncov, chunksize):
+    """전체 Reference 를 스트리밍해 uncovered(gap) 행을 '전량' 증분 저장(메모리 안전)."""
     K = p["Veff"].shape[1]
     cols = list(names) + [f"PC{i+1}" for i in range(K)]
     if os.path.exists(out_uncov):
         os.remove(out_uncov)
     header_written = False; n_unc = 0
-    rng = np.random.default_rng(RESERVOIR_SEED)
-    cov_res = np.empty((cov_n, len(cols)), dtype=np.float64); filled = seen = 0
-
     for X in iter_ref_chunks_raw(ref_path, names, chunksize, fmt):
         e = standardize(X, p) - p["mu"]
-        u2 = (e @ p["Vk"]) / p["sqrt_lamk"]
-        in_ell = (u2 ** 2).sum(1) <= p["Tk"]
-        idx = np.empty(u2.shape, dtype=np.int16)
-        for a in range(2):
-            idx[:, a] = np.digitize(u2[:, a], p["internalK"])
-        keys = [row.tobytes() for row in idx]
-        cov_m = np.array([in_ell[i] and (keys[i] in sam_cells) for i in range(len(X))])
-        unc_m = np.array([in_ell[i] and (keys[i] not in sam_cells) for i in range(len(X))])
-        ueff = (e @ p["Veff"]) / p["sqrt_lam_eff"]
-        rowmat = np.hstack([X, ueff])
-
-        if unc_m.any():                                  # uncovered 전량 증분 저장
-            pd.DataFrame(rowmat[unc_m], columns=cols).to_csv(
+        unc_m = _cover_status_topk(e, p, sam_cells) == "gap"
+        if unc_m.any():
+            rowmat = np.hstack([X[unc_m], ((e @ p["Veff"]) / p["sqrt_lam_eff"])[unc_m]])
+            pd.DataFrame(rowmat, columns=cols).to_csv(
                 out_uncov, mode="a", header=not header_written, index=False)
             header_written = True; n_unc += int(unc_m.sum())
-
-        cr = rowmat[cov_m]                               # covered reservoir
-        if len(cr):
-            if filled < cov_n:
-                take = min(cov_n - filled, len(cr))
-                cov_res[filled:filled + take] = cr[:take]
-                filled += take; seen += take; cr = cr[take:]
-            if len(cr):
-                t = seen + np.arange(1, len(cr) + 1)
-                acc = rng.random(len(cr)) < (cov_n / t)
-                if acc.any():
-                    cov_res[rng.integers(0, cov_n, acc.sum())] = cr[acc]
-                seen += len(cr)
-
     if not header_written:
         pd.DataFrame(columns=cols).to_csv(out_uncov, index=False)
-    pd.DataFrame(cov_res[:filled], columns=cols).to_csv(out_cov, index=False)
     print(f"[Save] reference_uncovered(전량): {out_uncov} (uncovered rows={n_unc:,})")
-    print(f"[Save] reference_covered(대표): {out_cov} (covered 표본={filled:,})")
 
 
 def export_per_feature(cov, w_s, cls, sample_raw, p, ref_feat_bins, names, out_path):
@@ -906,9 +908,9 @@ def run():
 
     # 저장
     export_sample(SAMPLE_PATH, names, cls, FMT, d2_ref, ueff_s, j("sample_pc_cover.csv"))
+    export_scatter_ref(ref_pts, p, sam_cells, names, j("reference_scatter_pc.csv"))   # scatter 전량
     if EXPORT_REF_ROWS:
-        export_ref_rows(REF_PATH, names, p, sam_cells, FMT, j("reference_uncovered_pc.csv"),
-                        j("reference_covered_pc.csv"), COVERED_SAMPLE_N, CHUNKSIZE)
+        export_ref_rows_full(REF_PATH, names, p, sam_cells, FMT, j("reference_uncovered_pc.csv"), CHUNKSIZE)
     else:
         export_uncovered_ref(ref_pts, p, sam_cells, names, j("reference_uncovered_pc.csv"))
     export_per_feature(feat_cov, w_s, cls, sample_raw, p, ref_feat_bins, names, j("per_feature_coverage.csv"))
