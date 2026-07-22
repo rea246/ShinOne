@@ -483,6 +483,10 @@ def run():
     ml = coverage_metrics(R["Yr_lin"], Ys_lin, R["ystd_l"], R["dens_l"], R["tau_l"], R_l)
     delta = ml["true_cov"] - mk["true_cov"]        # 착시(가짜 커버리지) 크기
 
+    # 강조 그룹(gauge 필터)만으로의 coverage (그 그룹 패턴만으로 reference 를 얼마나 덮나, 같은 R)
+    mh = coverage_metrics(R["Yr"], Ys[hl], R["ystd_k"], R["dens_k"], R["tau_k"], R_k) \
+        if (HIGHLIGHT_GAUGE_WORDS and hl.any()) else None
+
     # True Gap → '중요 gap'(Reference 밀도 큰 것)만 추려 KMeans 군집
     gap_mask = mk["gap_mask"]
     dens = R["dens_k"]
@@ -562,6 +566,12 @@ def run():
         "n_gap_groups": len(grp_summary), "gap_groups": grp_summary,
         "n_sample": len(sample_raw),
     }
+    if mh is not None:
+        summary["highlight_words"] = HIGHLIGHT_GAUGE_WORDS
+        summary["highlight_n_patterns"] = int(hl.sum())
+        summary["highlight_true_coverage_pct"] = round(mh["true_cov"] * 100, 3)
+        summary["highlight_share_of_full_pct"] = round(
+            mh["true_cov"] / mk["true_cov"] * 100, 3) if mk["true_cov"] else 0.0
     with open(j("kpca_summary_metrics.json"), "w") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
 
@@ -570,6 +580,9 @@ def run():
     print("=" * 66)
     print(f"  gamma(median heuristic)   : {R['gamma']:.4g}")
     print(f"  Kernel PCA True Coverage  : {mk['true_cov']*100:7.2f}%   (True Gap {mk['true_gap']*100:.2f}%)")
+    if mh is not None:
+        print(f"  └ 강조그룹 {HIGHLIGHT_GAUGE_WORDS} coverage: {mh['true_cov']*100:7.2f}%  "
+              f"(패턴 {int(hl.sum()):,}개, 전체 대비 {mh['true_cov']/max(mk['true_cov'],1e-9)*100:.1f}%)")
     print(f"  Linear PCA True Coverage  : {ml['true_cov']*100:7.2f}%")
     print(f"  >>> Δ_illusion (가짜커버)  : {delta*100:+7.2f}%p   (선형이 과대평가한 정도)")
     print(f"  대표반경 R(예산기반)      : {R_k:.4g}  (k=ceil(N_ref/N_sample)={k_k}, R_MULT={R_MULT})")
