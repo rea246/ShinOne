@@ -14,7 +14,10 @@ coverage_domain_kpca.py
       sample1/sample2 를 같은 잠재공간에 투영(비교 일관). Sample 은 투영만.
     * reservoir 근사: O(N²) 커널을 피하려 Reference 표본(landmark)으로 fit·커버리지.
     * γ 자동추정: median heuristic  γ = 1 / (2 · median||xi−xj||²)  (표준화 공간).
-    * 지표: 3D(KP1-3) 잠재에서 KDE 99% HDR → cell 기반 True Coverage / True Gap.
+    * 도메인: 3D(KP1-3) 잠재에서 Reference 99% HDR(희소 outlier 제외).
+    * 커버리지(reach 기반, sample 밀도 미사용): Reference 지점 근처 반경 R 안에 sample
+      패턴이 하나라도 있으면 '대표됨'. R 은 예산(패턴 수)이 정함(성긴 sample 벌점 없음).
+    * 중요도: Reference 밀도 큰 gap 을 우선(중요 gap 그룹).
     * 선형 vs 비선형 착시: Δ_illusion = Coverage_linearPCA − Coverage_KernelPCA.
 
 산출물
@@ -63,14 +66,16 @@ N_REF         = 15000          # 커버리지/플롯용 Reference reservoir (lan
 N_COMPONENTS  = 3              # 비선형 주성분 수 (KP1..KP3)
 GAMMA         = None           # None → median heuristic 자동추정, 값 지정 시 그대로
 
-# ---- KDE 99% HDR / 커버리지 ----
-HDR_Q         = 0.99           # HDR 질량비 (99%) — Ref/Sample 경계 공통
-KDE_BW        = None           # KernelDensity bandwidth (None='scott 유사', 실수=고정값)
-# 커버리지 = Reference 99% HDR 안에서 'Sample 밀도가 존재(=Sample HDR 안)'하는 비율.
-#   COVER_BW_MULT : Sample KDE 반경 배율. ↑ 이면 커버리지 완화(=gap 감소). gap 목표치에 맞춰 조절.
-COVER_BW_MULT = 2.0
-# ---- 중요 Gap 그룹 (진짜 밀도 큰 gap 만 추려 군집) ----
-GAP_IMPORTANT_Q = 0.5          # 도메인 밀도 상위(1-Q) 만 '중요 gap' (0.5 = 밀도 상위 50%)
+# ---- 도메인(Reference HDR) ----
+HDR_Q         = 0.99           # Reference 99% HDR (희소 outlier 1% 제외한 유효 도메인)
+KDE_BW        = None           # Reference KernelDensity bandwidth (None='scott 유사')
+# ---- 커버리지 = reach 기반 (sample 밀도 미사용) ----
+#   reference 지점 근처(반경 R)에 sample 패턴이 하나라도 있으면 '대표됨(covered)'.
+#   R = 대표 반경. '예산(패턴 수)'이 정함: 패턴 하나가 ceil(N_ref/N_sample)개를 대표해야 하므로
+#       R = Reference 의 그 k번째 최근접이웃 거리 중앙값 × R_MULT.  sample 이 성겨도 벌점 없음.
+R_MULT        = 1.0            # 대표 반경 허용오차 배율(공학적 tolerance). ↑ 이면 커버리지 완화.
+# ---- 중요 Gap 그룹 (Reference 밀도 큰 gap 만 추려 군집) ----
+GAP_IMPORTANT_Q = 0.5          # Reference 밀도 상위(1-Q) 만 '중요 gap' (0.5 = 상위 50%)
 N_GAP_GROUPS    = 8            # 중요 gap 을 KMeans 로 묶을 그룹 수
 
 CHUNKSIZE     = 200_000
@@ -203,25 +208,34 @@ def kde_fit_dens(Yn, bw=None):
     return kd, np.exp(kd.score_samples(Yn))
 
 
-def coverage_metrics(Yr, Ys, ystd, dens_r, tau_r):
+def representation_radius(Yr, ystd, n_sample, mult):
     """
-    밀도 기반 True Coverage: HDR(99%) 안 Reference 포인트 중, 'Sample 밀도가 존재'
-    (= Sample 99% HDR 안)하는 비율. Sample KDE 로 판정하므로 점 수 차이에 불변.
+    대표 반경 R 을 '예산(패턴 수)'으로 정한다. 패턴 하나가 평균 k=ceil(N_ref/N_sample)개를
+    대표해야 하므로, R = Reference 의 k번째 최근접이웃 거리 중앙값 × mult (표준화 좌표).
+    """
+    Yn = Yr / ystd
+    k = int(max(1, round(len(Yn) / max(n_sample, 1))))
+    k = min(k, len(Yn) - 1)
+    dd, _ = cKDTree(Yn).query(Yn, k=k + 1)                 # [:,0]=self
+    return float(np.median(dd[:, k]) * mult), k
+
+
+def coverage_metrics(Yr, Ys, ystd, dens_r, tau_r, R):
+    """
+    reach 기반 True Coverage (sample 밀도 미사용):
+    Reference 99% HDR 안 지점 중, '최근접 sample 패턴 거리 <= R' 인 비율.
+    gap = R 안에 sample 이 없는(=대표 못 된) Reference 지점.
     """
     ref_hdr = dens_r >= tau_r
     idx = np.where(ref_hdr)[0]
     gap_mask = np.zeros(len(Yr), dtype=bool)
-    if len(Ys) < 5 or len(idx) == 0:
+    if len(Ys) == 0 or len(idx) == 0:
         gap_mask[idx] = True
         return {"true_cov": 0.0, "true_gap": 1.0, "n_ref_hdr": int(len(idx)),
                 "n_covered": 0, "gap_mask": gap_mask}
-    Yr_n, Ys_n = Yr / ystd, Ys / ystd                      # 공통(참조) 표준화 좌표
-    bw = (KDE_BW if KDE_BW is not None else _bw(len(Ys_n), Ys_n.shape[1])) * COVER_BW_MULT
-    skde = KernelDensity(kernel="gaussian", bandwidth=bw).fit(Ys_n)   # 완화된 반경
-    dens_s = np.exp(skde.score_samples(Ys_n))
-    tau_s = float(np.quantile(dens_s, 1 - HDR_Q))          # Sample HDR 임계
-    dens_s_ref = np.exp(skde.score_samples(Yr_n[idx]))     # ref 포인트에서의 sample 밀도
-    covered = dens_s_ref >= tau_s
+    Yr_n, Ys_n = Yr / ystd, Ys / ystd                      # 등방(표준화) 좌표에서 거리
+    nn_d, _ = cKDTree(Ys_n).query(Yr_n[idx], k=1)          # 최근접 sample 거리
+    covered = nn_d <= R
     gap_mask[idx[~covered]] = True
     tc = float(covered.mean())
     return {"true_cov": tc, "true_gap": 1 - tc, "n_ref_hdr": int(len(idx)),
@@ -366,9 +380,12 @@ def run():
     Ys = R["kpca"].transform(Xs_s)                 # 비선형 잠재
     Ys_lin = R["pca"].transform(Xs_s)              # 선형 잠재
 
-    # 커버리지 (KPCA vs 선형)
-    mk = coverage_metrics(R["Yr"], Ys, R["ystd_k"], R["dens_k"], R["tau_k"])
-    ml = coverage_metrics(R["Yr_lin"], Ys_lin, R["ystd_l"], R["dens_l"], R["tau_l"])
+    # 대표 반경 R (예산=sample 패턴 수 기반) — 공간별
+    R_k, k_k = representation_radius(R["Yr"], R["ystd_k"], len(sample_raw), R_MULT)
+    R_l, k_l = representation_radius(R["Yr_lin"], R["ystd_l"], len(sample_raw), R_MULT)
+    # 커버리지 (KPCA vs 선형) — reach 기반
+    mk = coverage_metrics(R["Yr"], Ys, R["ystd_k"], R["dens_k"], R["tau_k"], R_k)
+    ml = coverage_metrics(R["Yr_lin"], Ys_lin, R["ystd_l"], R["dens_l"], R["tau_l"], R_l)
     delta = ml["true_cov"] - mk["true_cov"]        # 착시(가짜 커버리지) 크기
 
     # True Gap → '중요 gap'(Reference 밀도 큰 것)만 추려 KMeans 군집
@@ -419,7 +436,7 @@ def run():
         "kpca_true_gap_pct": round(mk["true_gap"] * 100, 3),
         "linear_true_coverage_pct": round(ml["true_cov"] * 100, 3),
         "delta_illusion_pct": round(delta * 100, 3),
-        "cover_bw_mult": COVER_BW_MULT,
+        "R_mult": R_MULT, "repr_radius_kpca": round(R_k, 5), "k_neighbors": k_k,
         "n_ref_hdr_kpca": mk["n_ref_hdr"],
         "n_covered_kpca": mk["n_covered"], "n_gap_ref_points": int(gap_mask.sum()),
         "gap_important_q": GAP_IMPORTANT_Q, "n_important_gap": int(imp_mask.sum()),
@@ -436,8 +453,8 @@ def run():
     print(f"  Kernel PCA True Coverage  : {mk['true_cov']*100:7.2f}%   (True Gap {mk['true_gap']*100:.2f}%)")
     print(f"  Linear PCA True Coverage  : {ml['true_cov']*100:7.2f}%")
     print(f"  >>> Δ_illusion (가짜커버)  : {delta*100:+7.2f}%p   (선형이 과대평가한 정도)")
-    print(f"  True Gap 포인트           : {int(gap_mask.sum()):,}  "
-          f"(cover_bw_mult={COVER_BW_MULT})")
+    print(f"  대표반경 R(예산기반)      : {R_k:.4g}  (k=ceil(N_ref/N_sample)={k_k}, R_MULT={R_MULT})")
+    print(f"  True Gap 포인트           : {int(gap_mask.sum()):,}")
     print(f"  >>> 중요 gap(밀도상위)     : {int(imp_mask.sum()):,}개, {len(grp_summary)}개 그룹 "
           f"→ uncovered_kpca_gap_patterns.csv / kpca_gap_groups.png")
     for r in grp_summary[:5]:
