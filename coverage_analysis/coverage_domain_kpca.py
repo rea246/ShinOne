@@ -62,8 +62,10 @@ FMT           = "csv"
 FEATURE_COLS    = None
 FEATURE_COL_IDX = list(range(0, 21))
 EXCLUDE_COLS    = []
-# gap CSV 에 함께 실을 '식별/비-feature 열'(ref.csv 매칭용). None → 모든 비-feature 열 포함.
-KEEP_COLS       = None
+# gap/scatter CSV 에 함께 실을 '식별 열'(ref.csv 매칭용). 매칭에 필요한 열만 지정 권장.
+#   예) ["lot_id"].   []=식별열 없음.
+#   ⚠️ None=모든 비-feature 열을 읽음 → 열 많은/큰 reference 에선 메모리 폭증·크래시 위험(비권장).
+KEEP_COLS       = ["lot_id"]
 
 SCALE_METHOD  = "standard"     # 'standard' | 'minmax'
 
@@ -167,12 +169,18 @@ def iter_ref_chunks_raw(path, names, chunksize, fmt):
 
 
 def _keep_cols(path, names, fmt):
-    """gap CSV 에 실을 비-feature(식별) 열 목록."""
+    """gap/scatter CSV 에 실을 비-feature(식별) 열 목록."""
     hdr = _header(path, fmt); nset = set(names)
     if KEEP_COLS is None:
-        return [c for c in hdr if c not in nset]
-    return [str(c).strip() for c in KEEP_COLS
-            if str(c).strip() in set(hdr) and str(c).strip() not in nset]
+        extra = [c for c in hdr if c not in nset]
+        print(f"[IO] ⚠️ KEEP_COLS=None → 비-feature 열 {len(extra)}개 전부 읽음(메모리 위험). "
+              f"큰 데이터면 KEEP_COLS=['lot_id'] 처럼 필요한 열만 지정 권장.")
+        return extra
+    keep = [str(c).strip() for c in KEEP_COLS if str(c).strip() in set(hdr) and str(c).strip() not in nset]
+    missing = [str(c).strip() for c in KEEP_COLS if str(c).strip() not in set(hdr)]
+    if missing:
+        print(f"[IO] 경고: KEEP_COLS 중 Reference 에 없는 열 제외: {missing}")
+    return keep
 
 
 def reservoir_full(path, names, keep, k, chunksize, fmt, seed=0):
