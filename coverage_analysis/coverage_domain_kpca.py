@@ -34,6 +34,11 @@ import json
 import os
 import pickle
 
+# ★ numpy/scipy import 전에 BLAS 스레드 제한 (OpenBLAS 오버서브스크립션 → hang/segfault 방지)
+for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+           "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+    os.environ.setdefault(_v, "1")
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -463,6 +468,31 @@ def run():
     gap_df["gap_group"] = groups
     gap_df = gap_df.sort_values("ref_density", ascending=False)
     gap_df.to_csv(j("uncovered_kpca_gap_patterns.csv"), index=False)
+
+    # scatter 에 쓰인 Reference 전량 저장 (식별열+feature+KP+상태)
+    ref_status = np.where(dens < R["tau_k"], "out_of_domain",
+                          np.where(gap_mask, "gap", "covered"))
+    parts = []
+    if R.get("keep_cols"):
+        parts.append(pd.DataFrame(R["ref_keep"], columns=R["keep_cols"]).reset_index(drop=True))
+    parts.append(pd.DataFrame(R["ref_raw"], columns=names).reset_index(drop=True))
+    ref_sc = pd.concat(parts, axis=1)
+    ref_sc["KP1"], ref_sc["KP2"], ref_sc["KP3"] = R["Yr"][:, 0], R["Yr"][:, 1], R["Yr"][:, 2]
+    ref_sc["ref_density"], ref_sc["cover_status"] = dens, ref_status
+    ref_sc.to_csv(j("kpca_reference_scatter.csv"), index=False)
+
+    # scatter 에 쓰인 Sample 전량 저장 (원본 전체 열 + KP)
+    if FMT == "csv":
+        sdf = pd.read_csv(SAMPLE_PATH)
+    else:
+        import pyarrow.parquet as pq
+        sdf = pq.read_table(SAMPLE_PATH).to_pandas()
+    sdf.columns = [str(c).strip() for c in sdf.columns]
+    fin = np.isfinite(sdf.loc[:, names].to_numpy(float)).all(axis=1)
+    for a, nm in enumerate(["KP1", "KP2", "KP3"]):
+        col = np.full(len(sdf), np.nan); col[fin] = Ys[:, a]; sdf[nm] = col
+    sdf.to_csv(j("kpca_sample_scatter.csv"), index=False)
+    print(f"[Save] kpca_reference_scatter.csv ({len(ref_sc):,}), kpca_sample_scatter.csv ({len(sdf):,})")
 
     # 시각화
     plot_2d(R["Yr"], Ys, gap_mask, mk["true_cov"], j("kpca_coverage_2d.png"))
