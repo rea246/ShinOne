@@ -40,6 +40,7 @@ import pandas as pd
 import seaborn as sns
 from scipy.spatial import cKDTree
 from scipy.spatial.distance import pdist
+from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA, KernelPCA
 from sklearn.neighbors import KernelDensity
 
@@ -64,9 +65,13 @@ GAMMA         = None           # None → median heuristic 자동추정, 값 지
 
 # ---- KDE 99% HDR / 커버리지 ----
 HDR_Q         = 0.99           # HDR 질량비 (99%) — Ref/Sample 경계 공통
-KDE_BW        = None           # gaussian_kde bw_method (None='scott', 실수=배율)
-# 커버리지 = Reference 99% HDR 안에서 'Sample 밀도가 존재(=Sample 99% HDR 안)'하는 비율.
-#   Sample KDE 로 판정 → 점 수 차이에 불변(성긴 sample 도 공정 비교).
+KDE_BW        = None           # KernelDensity bandwidth (None='scott 유사', 실수=고정값)
+# 커버리지 = Reference 99% HDR 안에서 'Sample 밀도가 존재(=Sample HDR 안)'하는 비율.
+#   COVER_BW_MULT : Sample KDE 반경 배율. ↑ 이면 커버리지 완화(=gap 감소). gap 목표치에 맞춰 조절.
+COVER_BW_MULT = 2.0
+# ---- 중요 Gap 그룹 (진짜 밀도 큰 gap 만 추려 군집) ----
+GAP_IMPORTANT_Q = 0.5          # 도메인 밀도 상위(1-Q) 만 '중요 gap' (0.5 = 밀도 상위 50%)
+N_GAP_GROUPS    = 8            # 중요 gap 을 KMeans 로 묶을 그룹 수
 
 CHUNKSIZE     = 200_000
 OUTPUT_DIR    = "coverage_plots"
@@ -211,8 +216,10 @@ def coverage_metrics(Yr, Ys, ystd, dens_r, tau_r):
         return {"true_cov": 0.0, "true_gap": 1.0, "n_ref_hdr": int(len(idx)),
                 "n_covered": 0, "gap_mask": gap_mask}
     Yr_n, Ys_n = Yr / ystd, Ys / ystd                      # 공통(참조) 표준화 좌표
-    skde, dens_s = kde_fit_dens(Ys_n)
-    tau_s = float(np.quantile(dens_s, 1 - HDR_Q))          # Sample 99% HDR 임계
+    bw = (KDE_BW if KDE_BW is not None else _bw(len(Ys_n), Ys_n.shape[1])) * COVER_BW_MULT
+    skde = KernelDensity(kernel="gaussian", bandwidth=bw).fit(Ys_n)   # 완화된 반경
+    dens_s = np.exp(skde.score_samples(Ys_n))
+    tau_s = float(np.quantile(dens_s, 1 - HDR_Q))          # Sample HDR 임계
     dens_s_ref = np.exp(skde.score_samples(Yr_n[idx]))     # ref 포인트에서의 sample 밀도
     covered = dens_s_ref >= tau_s
     gap_mask[idx[~covered]] = True
@@ -308,6 +315,24 @@ def plot_3d(Yr, Ys, gap_mask, out_path):
     print(f"[Plot] 3D 저장: {out_path}")
 
 
+def plot_gap_groups(Yr, Ys, imp_mask, groups, gsize, out_path):
+    """중요 gap 그룹을 KP1-2 에 색·크기(그룹 밀도)로 표시."""
+    fig, ax = plt.subplots(figsize=(9.5, 8.5))
+    ax.scatter(Yr[:, 0], Yr[:, 1], s=5, c=C_REF, alpha=0.12, linewidths=0, label="Reference")
+    ax.scatter(Ys[:, 0], Ys[:, 1], s=10, c=C_SAMPLE, alpha=0.35, linewidths=0, label="Sample")
+    Yi = Yr[imp_mask]
+    pal = sns.color_palette("tab10", int(groups.max()) + 1 if len(groups) else 1)
+    for g in np.unique(groups):
+        mm = groups == g
+        ax.scatter(Yi[mm, 0], Yi[mm, 1], s=22, color=pal[g], alpha=0.9, linewidths=0,
+                   label=f"gap grp{g} (n={int(mm.sum())})")
+    ax.set_xlabel("Kernel PC1"); ax.set_ylabel("Kernel PC2")
+    ax.set_title("Important gap groups (high Reference density, sample-unreached)")
+    ax.legend(fontsize=8, loc="best", ncol=2)
+    fig.tight_layout(); fig.savefig(out_path, dpi=130); plt.close(fig)
+    print(f"[Plot] gap groups 저장: {out_path}")
+
+
 def plot_comparison(Yl_r, Yl_s, cov_l, Yk_r, Yk_s, cov_k, out_path):
     fig, axes = plt.subplots(1, 2, figsize=(16, 7.5))
     for ax, (Yr, Ys, cov, ttl, xl) in zip(axes, [
@@ -346,23 +371,42 @@ def run():
     ml = coverage_metrics(R["Yr_lin"], Ys_lin, R["ystd_l"], R["dens_l"], R["tau_l"])
     delta = ml["true_cov"] - mk["true_cov"]        # 착시(가짜 커버리지) 크기
 
-    # True Gap Reference 포인트 + density_gap_score (KPCA 공간)
+    # True Gap → '중요 gap'(Reference 밀도 큰 것)만 추려 KMeans 군집
     gap_mask = mk["gap_mask"]
-    gap_pts = R["Yr"][gap_mask]
-    if gap_mask.any() and len(Ys):
-        nn_d, _ = cKDTree(Ys).query(gap_pts, k=1)   # 가장 가까운 sample 까지 거리
+    dens = R["dens_k"]
+    ref_hdr = dens >= R["tau_k"]
+    thr = float(np.quantile(dens[ref_hdr], GAP_IMPORTANT_Q)) if ref_hdr.any() else 0.0
+    imp_mask = gap_mask & (dens >= thr)             # 중요 gap = gap ∩ 밀도 상위
+    Yi = R["Yr"][imp_mask]
+    if len(Yi) >= 1:
+        ng = int(min(N_GAP_GROUPS, len(Yi)))
+        groups = KMeans(n_clusters=ng, n_init=10, random_state=RESERVOIR_SEED).fit_predict(Yi)
     else:
-        nn_d = np.zeros(int(gap_mask.sum()))
-    gap_score = R["dens_k"][gap_mask] * nn_d        # 밀집·먼 gap = 고우선순위
-    gap_df = pd.DataFrame(R["ref_raw"][gap_mask], columns=names)
-    gap_df["KP1"], gap_df["KP2"], gap_df["KP3"] = gap_pts[:, 0], gap_pts[:, 1], gap_pts[:, 2]
-    gap_df["density_gap_score"] = gap_score
-    gap_df = gap_df.sort_values("density_gap_score", ascending=False)
+        groups = np.zeros(0, dtype=int)
+    # 그룹별 요약(크기·평균 Reference 밀도)
+    gsize = {int(g): int((groups == g).sum()) for g in np.unique(groups)}
+    grp_summary = []
+    for g in np.unique(groups):
+        mm = groups == g
+        grp_summary.append({"group": int(g), "n": int(mm.sum()),
+                            "mean_ref_density": float(dens[imp_mask][mm].mean()),
+                            "KP1": float(Yi[mm, 0].mean()), "KP2": float(Yi[mm, 1].mean()),
+                            "KP3": float(Yi[mm, 2].mean())})
+    grp_summary.sort(key=lambda r: r["mean_ref_density"], reverse=True)
+
+    # 중요 gap 원본행 저장(그룹·밀도 포함, 밀도 내림차순)
+    gap_df = pd.DataFrame(R["ref_raw"][imp_mask], columns=names)
+    gap_df["KP1"], gap_df["KP2"], gap_df["KP3"] = Yi[:, 0], Yi[:, 1], Yi[:, 2]
+    gap_df["ref_density"] = dens[imp_mask]
+    gap_df["gap_group"] = groups
+    gap_df = gap_df.sort_values("ref_density", ascending=False)
     gap_df.to_csv(j("uncovered_kpca_gap_patterns.csv"), index=False)
 
     # 시각화
     plot_2d(R["Yr"], Ys, gap_mask, mk["true_cov"], j("kpca_coverage_2d.png"))
     plot_3d(R["Yr"], Ys, gap_mask, j("kpca_coverage_3d.png"))
+    if len(Yi):
+        plot_gap_groups(R["Yr"], Ys, imp_mask, groups, gsize, j("kpca_gap_groups.png"))
     plot_comparison(R["Yr_lin"], Ys_lin, ml["true_cov"], R["Yr"], Ys, mk["true_cov"],
                     j("kpca_vs_linear_pca_comparison.png"))
 
@@ -375,8 +419,11 @@ def run():
         "kpca_true_gap_pct": round(mk["true_gap"] * 100, 3),
         "linear_true_coverage_pct": round(ml["true_cov"] * 100, 3),
         "delta_illusion_pct": round(delta * 100, 3),
+        "cover_bw_mult": COVER_BW_MULT,
         "n_ref_hdr_kpca": mk["n_ref_hdr"],
         "n_covered_kpca": mk["n_covered"], "n_gap_ref_points": int(gap_mask.sum()),
+        "gap_important_q": GAP_IMPORTANT_Q, "n_important_gap": int(imp_mask.sum()),
+        "n_gap_groups": len(grp_summary), "gap_groups": grp_summary,
         "n_sample": len(sample_raw),
     }
     with open(j("kpca_summary_metrics.json"), "w") as f:
@@ -389,7 +436,12 @@ def run():
     print(f"  Kernel PCA True Coverage  : {mk['true_cov']*100:7.2f}%   (True Gap {mk['true_gap']*100:.2f}%)")
     print(f"  Linear PCA True Coverage  : {ml['true_cov']*100:7.2f}%")
     print(f"  >>> Δ_illusion (가짜커버)  : {delta*100:+7.2f}%p   (선형이 과대평가한 정도)")
-    print(f"  True Gap Reference 포인트 : {int(gap_mask.sum()):,}개 → uncovered_kpca_gap_patterns.csv")
+    print(f"  True Gap 포인트           : {int(gap_mask.sum()):,}  "
+          f"(cover_bw_mult={COVER_BW_MULT})")
+    print(f"  >>> 중요 gap(밀도상위)     : {int(imp_mask.sum()):,}개, {len(grp_summary)}개 그룹 "
+          f"→ uncovered_kpca_gap_patterns.csv / kpca_gap_groups.png")
+    for r in grp_summary[:5]:
+        print(f"       grp{r['group']}: n={r['n']:,}  meanRefDensity={r['mean_ref_density']:.3g}")
     print("=" * 66)
     return summary
 
