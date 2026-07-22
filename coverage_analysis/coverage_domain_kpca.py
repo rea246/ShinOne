@@ -57,6 +57,8 @@ FMT           = "csv"
 FEATURE_COLS    = None
 FEATURE_COL_IDX = list(range(0, 21))
 EXCLUDE_COLS    = []
+# gap CSV 에 함께 실을 '식별/비-feature 열'(ref.csv 매칭용). None → 모든 비-feature 열 포함.
+KEEP_COLS       = None
 
 SCALE_METHOD  = "standard"     # 'standard' | 'minmax'
 
@@ -159,21 +161,58 @@ def iter_ref_chunks_raw(path, names, chunksize, fmt):
                 yield X
 
 
-def reservoir_raw(path, names, k, chunksize, fmt, seed=0):
+def _keep_cols(path, names, fmt):
+    """gap CSV 에 실을 비-feature(식별) 열 목록."""
+    hdr = _header(path, fmt); nset = set(names)
+    if KEEP_COLS is None:
+        return [c for c in hdr if c not in nset]
+    return [str(c).strip() for c in KEEP_COLS
+            if str(c).strip() in set(hdr) and str(c).strip() not in nset]
+
+
+def reservoir_full(path, names, keep, k, chunksize, fmt, seed=0):
+    """
+    Reference 를 reservoir 로 k행 추출하되, feature 값(resX) 과 식별 열(resK) 을 함께 보존.
+    (feature 유한행만 대상, 동일 샘플링 결정으로 두 배열을 같이 갱신)
+    """
     rng = np.random.default_rng(seed)
-    d = len(names); res = np.empty((k, d)); filled = seen = 0
-    for X in iter_ref_chunks_raw(path, names, chunksize, fmt):
+    d, nk = len(names), len(keep)
+    want = set(names) | set(keep)
+    resX = np.empty((k, d)); resK = np.empty((k, nk), dtype=object)
+    filled = seen = 0
+
+    def chunks():
+        if fmt == "csv":
+            for ch in pd.read_csv(path, usecols=lambda c: str(c).strip() in want, chunksize=chunksize):
+                yield ch
+        else:
+            import pyarrow.parquet as pq
+            pf = pq.ParquetFile(path)
+            raw = [c for c in pf.schema_arrow.names if str(c).strip() in want]
+            for b in pf.iter_batches(batch_size=chunksize, columns=raw):
+                yield b.to_pandas()
+
+    for ch in chunks():
+        ch.columns = [str(c).strip() for c in ch.columns]
+        X = ch.loc[:, names].to_numpy(dtype=np.float64)
+        finite = np.isfinite(X).all(axis=1)
+        X = X[finite]
+        Kv = ch.loc[:, keep].to_numpy(dtype=object)[finite] if nk else np.empty((len(X), 0), object)
+        if len(X) == 0:
+            continue
         if filled < k:
-            take = min(k - filled, len(X)); res[filled:filled + take] = X[:take]
-            filled += take; seen += take; X = X[take:]
+            take = min(k - filled, len(X))
+            resX[filled:filled + take] = X[:take]; resK[filled:filled + take] = Kv[:take]
+            filled += take; seen += take; X = X[take:]; Kv = Kv[take:]
             if len(X) == 0:
                 continue
         t = seen + np.arange(1, len(X) + 1); acc = rng.random(len(X)) < (k / t)
         if acc.any():
-            res[rng.integers(0, k, acc.sum())] = X[acc]
+            pos = rng.integers(0, k, acc.sum())
+            resX[pos] = X[acc]; resK[pos] = Kv[acc]
         seen += len(X)
-    print(f"[Reservoir] 전체 {seen:,} → {filled:,} 추출")
-    return res[:filled]
+    print(f"[Reservoir] 전체 {seen:,} → {filled:,} 추출 (식별열 {nk}개 보존)")
+    return resX[:filled], resK[:filled]
 
 
 # =============================================================================
@@ -250,7 +289,7 @@ def _cache_key(ref_path, names, fmt):
     key = {"ref": os.path.abspath(ref_path), "size": st.st_size, "mtime": int(st.st_mtime),
            "names": names, "fmt": fmt, "scale": SCALE_METHOD, "nl": N_LANDMARKS, "nref": N_REF,
            "nc": N_COMPONENTS, "gamma": GAMMA, "hdrq": HDR_Q, "bw": KDE_BW,
-           "seed": RESERVOIR_SEED, "v": 3}
+           "keep": KEEP_COLS, "seed": RESERVOIR_SEED, "v": 4}
     return hashlib.sha1(json.dumps(key, sort_keys=True).encode()).hexdigest()[:16]
 
 
@@ -263,7 +302,8 @@ def build_reference(ref_path, names, fmt):
             return pickle.load(f)
 
     print("[Cache] 없음 → Reference reservoir fit")
-    ref_raw = reservoir_raw(ref_path, names, N_REF, CHUNKSIZE, FMT, RESERVOIR_SEED)
+    keep = _keep_cols(ref_path, names, fmt)
+    ref_raw, ref_keep = reservoir_full(ref_path, names, keep, N_REF, CHUNKSIZE, FMT, RESERVOIR_SEED)
     center, scale = fit_scaler(ref_raw, SCALE_METHOD)
     Xs = (ref_raw - center) / scale
     landmarks = Xs[:min(N_LANDMARKS, len(Xs))]              # fit 표본
@@ -285,7 +325,8 @@ def build_reference(ref_path, names, fmt):
     dens_k, tau_k, ystd_k = kde_tau(Yr)
     dens_l, tau_l, ystd_l = kde_tau(Yr_lin)
 
-    obj = {"ref_raw": ref_raw, "center": center, "scale": scale, "gamma": gamma,
+    obj = {"ref_raw": ref_raw, "ref_keep": ref_keep, "keep_cols": keep,
+           "center": center, "scale": scale, "gamma": gamma,
            "kpca": kpca, "pca": pca, "Yr": Yr, "Yr_lin": Yr_lin,
            "dens_k": dens_k, "tau_k": tau_k, "ystd_k": ystd_k,
            "dens_l": dens_l, "tau_l": tau_l, "ystd_l": ystd_l, "names": names}
@@ -411,8 +452,12 @@ def run():
                             "KP3": float(Yi[mm, 2].mean())})
     grp_summary.sort(key=lambda r: r["mean_ref_density"], reverse=True)
 
-    # 중요 gap 원본행 저장(그룹·밀도 포함, 밀도 내림차순)
-    gap_df = pd.DataFrame(R["ref_raw"][imp_mask], columns=names)
+    # 중요 gap 원본행 저장(식별열 + feature + KP + 밀도/그룹, 밀도 내림차순)
+    parts = []
+    if R.get("keep_cols"):                          # ref.csv 매칭용 식별 열 먼저
+        parts.append(pd.DataFrame(R["ref_keep"][imp_mask], columns=R["keep_cols"]).reset_index(drop=True))
+    parts.append(pd.DataFrame(R["ref_raw"][imp_mask], columns=names).reset_index(drop=True))
+    gap_df = pd.concat(parts, axis=1)
     gap_df["KP1"], gap_df["KP2"], gap_df["KP3"] = Yi[:, 0], Yi[:, 1], Yi[:, 2]
     gap_df["ref_density"] = dens[imp_mask]
     gap_df["gap_group"] = groups
