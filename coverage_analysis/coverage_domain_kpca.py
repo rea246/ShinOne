@@ -66,6 +66,9 @@ EXCLUDE_COLS    = []
 #   예) ["lot_id"].   []=식별열 없음.
 #   ⚠️ None=모든 비-feature 열을 읽음 → 열 많은/큰 reference 에선 메모리 폭증·크래시 위험(비권장).
 KEEP_COLS       = ["lot_id"]
+# ---- Sample 강조: gauge_name 에 특정 단어 포함 데이터를 다른 색으로 강조 ----
+GAUGE_COL             = "gauge_name"   # sample 의 gauge 이름 열
+HIGHLIGHT_GAUGE_WORDS = []             # 예) ["CM2", "G17"] (부분일치, 대소문자 무시). []=강조 없음
 
 SCALE_METHOD  = "standard"     # 'standard' | 'minmax'
 
@@ -94,7 +97,7 @@ USE_CACHE     = True
 CACHE_DIR     = ".refcache"
 
 sns.set_theme(style="white", context="talk")
-C_REF = "#8C8C8C"; C_SAMPLE = "#2CA02C"; C_GAP = "#F4511E"
+C_REF = "#8C8C8C"; C_SAMPLE = "#2CA02C"; C_GAP = "#F4511E"; C_HL = "#8E24AA"
 
 
 # =============================================================================
@@ -354,10 +357,26 @@ def build_reference(ref_path, names, fmt):
 # =============================================================================
 # 시각화
 # =============================================================================
-def plot_2d(Yr, Ys, gap_mask, cov, out_path):
+def _draw_sample(ax, Ys, hl, s, alpha=0.6, three_d=False):
+    """sample 산점(초록) + gauge 강조 부분집합(다른 색)을 위에 그린다."""
+    base = ~hl if hl is not None else np.ones(len(Ys), dtype=bool)
+    if three_d:
+        ax.scatter(Ys[base, 0], Ys[base, 1], Ys[base, 2], s=s, c=C_SAMPLE, alpha=alpha,
+                   linewidths=0, label="Sample")
+        if hl is not None and hl.any():
+            ax.scatter(Ys[hl, 0], Ys[hl, 1], Ys[hl, 2], s=s * 2.2, c=C_HL, alpha=0.95,
+                       linewidths=0, label="Sample (gauge highlight)")
+    else:
+        ax.scatter(Ys[base, 0], Ys[base, 1], s=s, c=C_SAMPLE, alpha=alpha, linewidths=0, label="Sample")
+        if hl is not None and hl.any():
+            ax.scatter(Ys[hl, 0], Ys[hl, 1], s=s * 1.8, c=C_HL, alpha=0.95, linewidths=0,
+                       label="Sample (gauge highlight)")
+
+
+def plot_2d(Yr, Ys, gap_mask, cov, out_path, hl=None):
     fig, ax = plt.subplots(figsize=(9, 8.5))
     ax.scatter(Yr[:, 0], Yr[:, 1], s=6, c=C_REF, alpha=0.15, linewidths=0, label="Reference")
-    ax.scatter(Ys[:, 0], Ys[:, 1], s=14, c=C_SAMPLE, alpha=0.6, linewidths=0, label="Sample")
+    _draw_sample(ax, Ys, hl, 14)
     if gap_mask.any():
         ax.scatter(Yr[gap_mask, 0], Yr[gap_mask, 1], s=18, c=C_GAP, alpha=0.8, linewidths=0,
                    label="True Gap (ref, sample-unreached)")
@@ -369,10 +388,10 @@ def plot_2d(Yr, Ys, gap_mask, cov, out_path):
     print(f"[Plot] 2D 저장: {out_path}")
 
 
-def plot_3d(Yr, Ys, gap_mask, out_path):
+def plot_3d(Yr, Ys, gap_mask, out_path, hl=None):
     fig = plt.figure(figsize=(10, 9)); ax = fig.add_subplot(111, projection="3d")
     ax.scatter(Yr[:, 0], Yr[:, 1], Yr[:, 2], s=4, c=C_REF, alpha=0.12, linewidths=0, label="Reference")
-    ax.scatter(Ys[:, 0], Ys[:, 1], Ys[:, 2], s=12, c=C_SAMPLE, alpha=0.6, linewidths=0, label="Sample")
+    _draw_sample(ax, Ys, hl, 12, three_d=True)
     if gap_mask.any():
         ax.scatter(Yr[gap_mask, 0], Yr[gap_mask, 1], Yr[gap_mask, 2], s=16, c=C_GAP, alpha=0.85,
                    linewidths=0, label="True Gap")
@@ -383,11 +402,11 @@ def plot_3d(Yr, Ys, gap_mask, out_path):
     print(f"[Plot] 3D 저장: {out_path}")
 
 
-def plot_gap_groups(Yr, Ys, imp_mask, groups, gsize, out_path):
+def plot_gap_groups(Yr, Ys, imp_mask, groups, gsize, out_path, hl=None):
     """중요 gap 그룹을 KP1-2 에 색·크기(그룹 밀도)로 표시."""
     fig, ax = plt.subplots(figsize=(9.5, 8.5))
     ax.scatter(Yr[:, 0], Yr[:, 1], s=5, c=C_REF, alpha=0.12, linewidths=0, label="Reference")
-    ax.scatter(Ys[:, 0], Ys[:, 1], s=10, c=C_SAMPLE, alpha=0.35, linewidths=0, label="Sample")
+    _draw_sample(ax, Ys, hl, 10, alpha=0.35)
     Yi = Yr[imp_mask]
     pal = sns.color_palette("tab10", int(groups.max()) + 1 if len(groups) else 1)
     for g in np.unique(groups):
@@ -401,14 +420,15 @@ def plot_gap_groups(Yr, Ys, imp_mask, groups, gsize, out_path):
     print(f"[Plot] gap groups 저장: {out_path}")
 
 
-def plot_comparison(Yl_r, Yl_s, cov_l, Yk_r, Yk_s, cov_k, out_path):
+def plot_comparison(Yl_r, Yl_s, cov_l, Yk_r, Yk_s, cov_k, out_path, hl=None):
     fig, axes = plt.subplots(1, 2, figsize=(16, 7.5))
     for ax, (Yr, Ys, cov, ttl, xl) in zip(axes, [
             (Yl_r, Yl_s, cov_l, "Linear PCA", "PC"), (Yk_r, Yk_s, cov_k, "Kernel PCA", "KP")]):
         ax.scatter(Yr[:, 0], Yr[:, 1], s=6, c=C_REF, alpha=0.15, linewidths=0)
-        ax.scatter(Ys[:, 0], Ys[:, 1], s=14, c=C_SAMPLE, alpha=0.6, linewidths=0)
+        _draw_sample(ax, Ys, hl, 14)
         ax.set_xlabel(f"{xl}1"); ax.set_ylabel(f"{xl}2")
         ax.set_title(f"{ttl}\nTrue Coverage = {cov*100:.1f}%")
+    axes[0].legend(fontsize=9, loc="best")
     fig.suptitle(f"Linear vs Kernel PCA — fake-coverage illusion  Δ = {(cov_l-cov_k)*100:+.1f}%p",
                  fontsize=14)
     fig.tight_layout(rect=[0, 0, 1, 0.95]); fig.savefig(out_path, dpi=130); plt.close(fig)
@@ -428,11 +448,32 @@ def run():
     names = resolve_feature_names(SAMPLE_PATH, REF_PATH, FMT)
     R = build_reference(REF_PATH, names, FMT)
 
-    # Sample 투영 (동일 프레임)
-    sample_raw = read_matrix(SAMPLE_PATH, names, FMT)
+    # Sample 전체 읽기(원본 열 포함) → feature/유한행/gauge 강조 마스크
+    if FMT == "csv":
+        sdf = pd.read_csv(SAMPLE_PATH)
+    else:
+        import pyarrow.parquet as pq
+        sdf = pq.read_table(SAMPLE_PATH).to_pandas()
+    sdf.columns = [str(c).strip() for c in sdf.columns]
+    Xfull = sdf.loc[:, names].to_numpy(dtype=np.float64)
+    fin = np.isfinite(Xfull).all(axis=1)
+    sample_raw = Xfull[fin]
     Xs_s = (sample_raw - R["center"]) / R["scale"]
     Ys = R["kpca"].transform(Xs_s)                 # 비선형 잠재
     Ys_lin = R["pca"].transform(Xs_s)              # 선형 잠재
+
+    # gauge_name 에 특정 단어 포함 → 강조 마스크(Ys=유한행 정렬)
+    hl = np.zeros(len(Ys), dtype=bool)
+    if HIGHLIGHT_GAUGE_WORDS:
+        if GAUGE_COL in sdf.columns:
+            gser = sdf[GAUGE_COL].astype(str).str.lower()
+            mfull = np.zeros(len(sdf), dtype=bool)
+            for w in HIGHLIGHT_GAUGE_WORDS:
+                mfull |= gser.str.contains(str(w).lower(), regex=False, na=False).to_numpy()
+            hl = mfull[fin]
+            print(f"[Highlight] gauge_name ⊃ {HIGHLIGHT_GAUGE_WORDS}: {int(hl.sum()):,}/{len(hl):,} 강조")
+        else:
+            print(f"[Highlight] 경고: '{GAUGE_COL}' 열이 sample 에 없어 강조 생략")
 
     # 대표 반경 R (예산=sample 패턴 수 기반) — 공간별
     R_k, k_k = representation_radius(R["Yr"], R["ystd_k"], len(sample_raw), R_MULT)
@@ -489,26 +530,21 @@ def run():
     ref_sc["ref_density"], ref_sc["cover_status"] = dens, ref_status
     ref_sc.to_csv(j("kpca_reference_scatter.csv"), index=False)
 
-    # scatter 에 쓰인 Sample 전량 저장 (원본 전체 열 + KP)
-    if FMT == "csv":
-        sdf = pd.read_csv(SAMPLE_PATH)
-    else:
-        import pyarrow.parquet as pq
-        sdf = pq.read_table(SAMPLE_PATH).to_pandas()
-    sdf.columns = [str(c).strip() for c in sdf.columns]
-    fin = np.isfinite(sdf.loc[:, names].to_numpy(float)).all(axis=1)
+    # scatter 에 쓰인 Sample 전량 저장 (원본 전체 열 + KP + 강조여부)
+    hl_full = np.zeros(len(sdf), dtype=bool); hl_full[np.where(fin)[0][hl]] = True
     for a, nm in enumerate(["KP1", "KP2", "KP3"]):
         col = np.full(len(sdf), np.nan); col[fin] = Ys[:, a]; sdf[nm] = col
+    sdf["gauge_highlight"] = hl_full
     sdf.to_csv(j("kpca_sample_scatter.csv"), index=False)
     print(f"[Save] kpca_reference_scatter.csv ({len(ref_sc):,}), kpca_sample_scatter.csv ({len(sdf):,})")
 
-    # 시각화
-    plot_2d(R["Yr"], Ys, gap_mask, mk["true_cov"], j("kpca_coverage_2d.png"))
-    plot_3d(R["Yr"], Ys, gap_mask, j("kpca_coverage_3d.png"))
+    # 시각화 (hl = gauge 강조 마스크)
+    plot_2d(R["Yr"], Ys, gap_mask, mk["true_cov"], j("kpca_coverage_2d.png"), hl=hl)
+    plot_3d(R["Yr"], Ys, gap_mask, j("kpca_coverage_3d.png"), hl=hl)
     if len(Yi):
-        plot_gap_groups(R["Yr"], Ys, imp_mask, groups, gsize, j("kpca_gap_groups.png"))
+        plot_gap_groups(R["Yr"], Ys, imp_mask, groups, gsize, j("kpca_gap_groups.png"), hl=hl)
     plot_comparison(R["Yr_lin"], Ys_lin, ml["true_cov"], R["Yr"], Ys, mk["true_cov"],
-                    j("kpca_vs_linear_pca_comparison.png"))
+                    j("kpca_vs_linear_pca_comparison.png"), hl=hl)
 
     # 지표 JSON
     summary = {
