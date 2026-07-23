@@ -1,23 +1,14 @@
 """
 plot_group_histogram.py — 탭(\\t) 구분 txt 를 읽어 group 별 histogram 비교
 
-지정한 column list 의 각 column 에 대해, group column 값별로 분포를 겹쳐 그려
+지정한 COLUMNS 의 각 column 에 대해, GROUP_COL 값별로 분포를 겹쳐 그려
 (seaborn histplot, hue=group) 그룹 간 분포 차이를 한눈에 비교한다.
 
-  - 입력    : \\t 로 구분된 txt/tsv (헤더 있음)
-  - group   : 비교 기준이 되는 범주형 column (예: label, class, batch ...)
-  - columns : 분포를 볼 수치형 column 들. 각 column 마다 subplot 1개.
-  - 출력    : column 들을 격자(grid)로 배치한 PNG 한 장 (column 별 개별 저장도 가능)
-
-사용 예:
-  python plot_group_histogram.py --file data.txt --group-col label \\
-         --columns width height area
-  python plot_group_histogram.py -f data.tsv -g class -c f1 f2 f3 f4 \\
-         --bins 40 --stat density --kde --separate --out-dir hist_out
+설정은 아래 [설정] 블록의 값만 고치고 그냥 실행하면 된다:
+  python plot_group_histogram.py
 """
 
 import os
-import argparse
 
 import pandas as pd
 
@@ -28,13 +19,28 @@ import seaborn as sns
 
 
 # ══════════════════════════════════════════════════════════════════
+# [설정] — 여기 값만 고치면 됨
+# ══════════════════════════════════════════════════════════════════
+FILE      = "data.txt"                 # \t 구분 txt/tsv 경로
+GROUP_COL = "label"                    # 비교 기준 group column (범주형)
+COLUMNS   = ["width", "height", "area"]  # histogram 그릴 수치형 column 목록
+
+BINS      = 30            # 히스토그램 구간 수
+STAT      = "count"       # "count" / "density" / "probability" / "frequency"
+                         #   (그룹 크기 다르면 "density" 추천)
+KDE       = False         # True 면 KDE 곡선도 겹쳐 그림
+SEPARATE  = False         # True 면 column 별 PNG 개별 저장, False 면 격자 한 장
+OUT_DIR   = "group_hist"  # PNG 저장 폴더
+OUT_NAME  = "group_hist.png"  # 격자 모드 저장 파일명
+
+
+# ══════════════════════════════════════════════════════════════════
 # [Load]
 # ══════════════════════════════════════════════════════════════════
 def load_tsv(path: str) -> pd.DataFrame:
     """\\t 구분 txt 를 DataFrame 으로. (파이썬 엔진으로 관대하게 파싱)"""
     df = pd.read_csv(path, sep="\t", engine="python")
-    # 헤더 앞뒤 공백 제거 (엑셀/수기 편집 대비)
-    df.columns = [str(c).strip() for c in df.columns]
+    df.columns = [str(c).strip() for c in df.columns]   # 헤더 앞뒤 공백 제거
     return df
 
 
@@ -55,16 +61,15 @@ def validate_columns(df: pd.DataFrame, group_col: str, columns: list) -> None:
 # ══════════════════════════════════════════════════════════════════
 # [Plot]
 # ══════════════════════════════════════════════════════════════════
-def _draw_one(ax, df: pd.DataFrame, col: str, group_col: str,
-              bins: int, stat: str, kde: bool) -> None:
+def _draw_one(ax, df: pd.DataFrame, col: str, group_col: str) -> None:
     """한 축(ax)에 col 의 group 별 겹친 histogram 을 그린다."""
     sns.histplot(
         data=df,
         x=col,
         hue=group_col,
-        bins=bins,
-        stat=stat,           # count / density / probability / frequency
-        kde=kde,
+        bins=BINS,
+        stat=STAT,
+        kde=KDE,
         element="step",      # 여러 그룹이 겹쳐도 윤곽이 보이게
         common_norm=False,   # density/probability 를 그룹별로 각각 정규화 → 공정 비교
         alpha=0.45,
@@ -75,8 +80,7 @@ def _draw_one(ax, df: pd.DataFrame, col: str, group_col: str,
     ax.grid(True, ls=":", alpha=0.4)
 
 
-def plot_grid(df: pd.DataFrame, group_col: str, columns: list,
-              out_path: str, bins: int, stat: str, kde: bool) -> None:
+def plot_grid(df: pd.DataFrame, group_col: str, columns: list, out_path: str) -> None:
     """column 들을 격자로 배치해 한 장의 PNG 로 저장."""
     n = len(columns)
     ncols = min(3, n)
@@ -85,27 +89,24 @@ def plot_grid(df: pd.DataFrame, group_col: str, columns: list,
     fig, axes = plt.subplots(nrows, ncols, figsize=(6.2 * ncols, 4.6 * nrows),
                              squeeze=False)
     for i, col in enumerate(columns):
-        ax = axes[i // ncols][i % ncols]
-        _draw_one(ax, df, col, group_col, bins, stat, kde)
-    # 남는 빈 축 숨김
-    for j in range(n, nrows * ncols):
+        _draw_one(axes[i // ncols][i % ncols], df, col, group_col)
+    for j in range(n, nrows * ncols):          # 남는 빈 축 숨김
         axes[j // ncols][j % ncols].axis("off")
 
     n_groups = df[group_col].nunique()
     fig.suptitle(f"Group histogram  |  group='{group_col}' ({n_groups} groups)  "
-                 f"|  n={len(df)}  stat={stat}", fontsize=13)
+                 f"|  n={len(df)}  stat={STAT}", fontsize=13)
     fig.tight_layout(rect=(0, 0, 1, 0.97))
     fig.savefig(out_path, dpi=130)
     plt.close(fig)
     print(f"[saved] {out_path}")
 
 
-def plot_separate(df: pd.DataFrame, group_col: str, columns: list,
-                  out_dir: str, bins: int, stat: str, kde: bool) -> None:
+def plot_separate(df: pd.DataFrame, group_col: str, columns: list, out_dir: str) -> None:
     """column 마다 PNG 를 따로 저장."""
     for col in columns:
         fig, ax = plt.subplots(figsize=(7.5, 5.2))
-        _draw_one(ax, df, col, group_col, bins, stat, kde)
+        _draw_one(ax, df, col, group_col)
         safe = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in col)
         out_path = os.path.join(out_dir, f"hist_{safe}.png")
         fig.tight_layout()
@@ -118,42 +119,18 @@ def plot_separate(df: pd.DataFrame, group_col: str, columns: list,
 # [Main]
 # ══════════════════════════════════════════════════════════════════
 def main():
-    ap = argparse.ArgumentParser(
-        description="\\t 구분 txt 를 읽어 지정한 column 들의 group 별 histogram 비교",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    ap.add_argument("-f", "--file", required=True, help="\\t 구분 txt/tsv 경로")
-    ap.add_argument("-g", "--group-col", required=True,
-                    help="비교 기준 group column (범주형)")
-    ap.add_argument("-c", "--columns", required=True, nargs="+",
-                    help="histogram 을 그릴 수치형 column 목록 (공백 구분)")
-    ap.add_argument("--bins", type=int, default=30, help="히스토그램 구간 수")
-    ap.add_argument("--stat", default="count",
-                    choices=["count", "density", "probability", "frequency"],
-                    help="y축 통계량 (그룹 크기 다르면 density/probability 추천)")
-    ap.add_argument("--kde", action="store_true", help="KDE 곡선 겹쳐 그리기")
-    ap.add_argument("--separate", action="store_true",
-                    help="column 별로 PNG 를 따로 저장 (기본은 격자 한 장)")
-    ap.add_argument("--out-dir", default="group_hist", help="PNG 저장 폴더")
-    ap.add_argument("--out", default=None,
-                    help="격자 모드일 때 저장 파일명 (기본: <out-dir>/group_hist.png)")
-    args = ap.parse_args()
-
-    df = load_tsv(args.file)
-    validate_columns(df, args.group_col, args.columns)
-    print(f"[load] {args.file}  | rows={len(df)}  cols={len(df.columns)}  "
-          f"groups={df[args.group_col].nunique()} {sorted(df[args.group_col].unique().tolist())}")
+    df = load_tsv(FILE)
+    validate_columns(df, GROUP_COL, COLUMNS)
+    print(f"[load] {FILE}  | rows={len(df)}  cols={len(df.columns)}  "
+          f"groups={df[GROUP_COL].nunique()} {sorted(df[GROUP_COL].unique().tolist())}")
 
     sns.set_theme(style="whitegrid")
-    os.makedirs(args.out_dir, exist_ok=True)
+    os.makedirs(OUT_DIR, exist_ok=True)
 
-    if args.separate:
-        plot_separate(df, args.group_col, args.columns,
-                      args.out_dir, args.bins, args.stat, args.kde)
+    if SEPARATE:
+        plot_separate(df, GROUP_COL, COLUMNS, OUT_DIR)
     else:
-        out_path = args.out or os.path.join(args.out_dir, "group_hist.png")
-        plot_grid(df, args.group_col, args.columns,
-                  out_path, args.bins, args.stat, args.kde)
+        plot_grid(df, GROUP_COL, COLUMNS, os.path.join(OUT_DIR, OUT_NAME))
 
 
 if __name__ == "__main__":
