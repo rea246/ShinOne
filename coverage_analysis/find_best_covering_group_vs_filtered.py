@@ -68,6 +68,14 @@ OUTPUT_DIR = "coverage_plots"
 sns.set_theme(style="white", context="talk")
 
 
+def _read_table(path):
+    """CSV/TSV 자동 판별(구분자 sniff) + 열 이름 공백 제거.
+    filtered.csv 가 탭 구분(TSV)이어도, 콤마여도 동일하게 읽는다."""
+    df = pd.read_csv(path, sep=None, engine="python")
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
+
+
 def _match_any(series, words):
     s = series.astype(str).str.lower()
     m = np.zeros(len(series), dtype=bool)
@@ -80,8 +88,8 @@ def run():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     j = lambda f: os.path.join(OUTPUT_DIR, f)
 
-    S1 = pd.read_csv(SAMPLE1_SCATTER)
-    T_all = pd.read_csv(TARGET_FILTERED)
+    S1 = _read_table(SAMPLE1_SCATTER)
+    T_all = _read_table(TARGET_FILTERED)
     # Sample1 은 KP + gauge 필요, 타깃(filtered)은 KP 만 필요
     for c in KP_COLS + [GAUGE_COL]:
         if c not in S1.columns:
@@ -100,7 +108,7 @@ def run():
 
     # ystd (정규화 스케일) — 전체 Reference 기준. 없으면 sample1+타깃 합으로 추정
     if REF_SCATTER and os.path.exists(REF_SCATTER):
-        A = pd.read_csv(REF_SCATTER)
+        A = _read_table(REF_SCATTER)
         ystd = A[KP_COLS].to_numpy(float).std(axis=0)
     else:
         both = pd.concat([S1[KP_COLS], T_all[KP_COLS]])
