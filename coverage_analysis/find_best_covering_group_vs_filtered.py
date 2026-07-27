@@ -31,6 +31,8 @@ find_best_covering_group.py 의 변형: 타깃(Sample2)을 'filtered.csv' 로 �
 산출물
     group_target_coverage_filtered.csv : 그룹별 target_coverage / mean_nn_dist / n_patterns (내림차순)
     group_target_scatter_filtered.png  : 타깃(주황) + 최상위 그룹(색상) 겹침
+    group_top{N}_covered_targets.csv   : 그룹마다 '가장 잘 덮는'(최근접) target 패턴 N종을
+                                         INPUT TARGET 행 그대로 + group/rank/nn_dist/covered
 """
 
 import os
@@ -64,6 +66,7 @@ KP_COLS   = ["KP1", "KP2", "KP3"]
 RADIUS    = 0.2666           # 정규화 KP 반경 — coverage_domain_kpca run 리포트의 R 값과 맞출 것
 #   ⚠️ 모든 그룹이 ~100%로 포화(순위 구분 사라짐)하면 KP 퍼짐 대비 R 이 큼 → 값을 낮춰 재실행.
 TOPN_PLOT = 1                # 플롯에 강조할 상위 그룹 수
+TOPN_PER_GROUP = 3           # 그룹마다 '가장 잘 덮는' target 패턴 몇 개를 원본행 그대로 뽑을지
 OUTPUT_DIR = "coverage_plots"
 sns.set_theme(style="white", context="talk")
 
@@ -121,6 +124,8 @@ def run():
     Tn = Tk[Tf] / ystd
     if len(Tn) == 0:
         raise ValueError("타깃(filtered.csv)에 유효 KP 포인트 없음")
+    # Tn(순서) 과 1:1 정렬된 '원본 target 행' — top-N 출력 시 이 행을 그대로 뽑는다
+    T_use = T_all.iloc[np.where(Tf)[0]].reset_index(drop=True)
     print(f"[Target] filtered.csv: {len(Tn):,} 포인트 (유효행 기준)")
 
     # Sample1 후보 그룹 정의
@@ -133,6 +138,7 @@ def run():
 
     # 그룹별 타깃 커버리지 (반경 R 내에 그룹 패턴이 하나라도 있으면 그 타깃점은 '덮임')
     rows = []
+    top_parts = []                                  # 그룹별 top-N target 원본행 모음
     for g, gm in groups.items():
         Gk = S1.loc[gm, KP_COLS].to_numpy(float); Gf = np.isfinite(Gk).all(axis=1)
         Gn = Gk[Gf] / ystd
@@ -142,8 +148,24 @@ def run():
         rows.append({"group": g, "n_patterns": int(len(Gn)),
                      "target_coverage_pct": round(float((d <= RADIUS).mean()) * 100, 3),
                      "mean_nn_dist": round(float(d.mean()), 5)})
+        # '가장 잘 덮는' = 최근접 거리 최소. top-N target 을 원본행 그대로 추출
+        n_top = int(min(TOPN_PER_GROUP, len(Tn)))
+        order = np.argsort(d, kind="stable")[:n_top]
+        part = T_use.iloc[order].copy()
+        part.insert(0, "group", g)
+        part.insert(1, "rank_in_group", np.arange(1, n_top + 1))
+        part.insert(2, "nn_dist", np.round(d[order], 5))
+        part.insert(3, "covered", d[order] <= RADIUS)
+        top_parts.append(part)
     res = pd.DataFrame(rows).sort_values("target_coverage_pct", ascending=False).reset_index(drop=True)
     res.to_csv(j("group_target_coverage_filtered.csv"), index=False)
+
+    # 그룹별 top-N target 원본행 (INPUT TARGET 열 그대로 + group/rank/nn_dist/covered 앞에 부착)
+    if top_parts:
+        top_df = pd.concat(top_parts, axis=0, ignore_index=True)
+        top_df.to_csv(j(f"group_top{TOPN_PER_GROUP}_covered_targets.csv"), index=False)
+        print(f"[Save] group_top{TOPN_PER_GROUP}_covered_targets.csv "
+              f"({len(groups)}그룹 × 최대 {TOPN_PER_GROUP}행 = {len(top_df):,}행)")
 
     # 시각화
     Tplot = Tk[Tf]
@@ -169,6 +191,7 @@ def run():
         print(f"   {r['group']:>12}: target_cov {r['target_coverage_pct']:6.2f}%  "
               f"(n={int(r['n_patterns'])}, meanNN={r['mean_nn_dist']:.3f})")
     print("  → group_target_coverage_filtered.csv / group_target_scatter_filtered.png")
+    print(f"  → group_top{TOPN_PER_GROUP}_covered_targets.csv (그룹별 최근접 target {TOPN_PER_GROUP}종, 원본행)")
     print("=" * 60)
     return res
 
