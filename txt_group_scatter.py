@@ -20,11 +20,11 @@ ALPHA = 0.75
 
 WIDE_CSV_PATH = "group_wide.csv"   # 그룹별 x,y로 전개해서 저장할 csv 경로
 
-SHOW_GROUP_MEAN = True        # 그룹별 평균 표시 여부
-MEAN_MARKER = "X"
-MEAN_MARKER_SIZE = 300
+SHOW_GROUP_MEAN = True         # 그룹별 평균(Y 평균) 표시 여부
+MEAN_MARKER_SIDE = "right"     # "left"(x 시작점) 또는 "right"(오른쪽 끝)
+MEAN_MARKER_SIZE = 14
 MEAN_EDGE_COLOR = "black"
-MEAN_EDGE_WIDTH = 1.5
+MEAN_EDGE_WIDTH = 1.2
 # ================================================
 
 # 그룹 구분용 고정 팔레트 (최대 8개 그룹까지 색이 뚜렷하게 구분됨)
@@ -88,36 +88,44 @@ def main():
             edgecolor="white", linewidth=0.5,
         )
 
-        if SHOW_GROUP_MEAN:
-            ax.scatter(
-                sub[X_COL].mean(), sub[Y_COL].mean(),
-                color=color, marker=MEAN_MARKER, s=MEAN_MARKER_SIZE,
-                edgecolor=MEAN_EDGE_COLOR, linewidth=MEAN_EDGE_WIDTH,
-                zorder=3,
-            )
-
     ax.set_xlabel(X_COL)
     ax.set_ylabel(Y_COL)
-
-    legend_handles = [
-        Line2D([0], [0], marker="o", linestyle="", color=color, label=str(group))
-        for group, color in zip(groups, PALETTE)
-    ]
-    if SHOW_GROUP_MEAN:
-        legend_handles.append(
-            Line2D(
-                [0], [0], marker=MEAN_MARKER, linestyle="", color="none",
-                markerfacecolor="none", markeredgecolor=MEAN_EDGE_COLOR,
-                markeredgewidth=MEAN_EDGE_WIDTH, label="mean",
-            )
-        )
-    ax.legend(handles=legend_handles, title=GROUP_COL, frameon=False, loc="best")
     sns.despine(fig=fig, ax=ax)
 
     if X_LIM is not None:
         ax.set_xlim(*X_LIM)
     if Y_LIM is not None:
         ax.set_ylim(*Y_LIM)
+
+    legend_handles = [
+        Line2D([0], [0], marker="o", linestyle="", color=color, label=str(group))
+        for group, color in zip(groups, PALETTE)
+    ]
+
+    if SHOW_GROUP_MEAN:
+        # 왼쪽/오른쪽 축 가장자리에 그룹 평균(Y) 위치를 화살표 마커로 표시
+        mean_marker = "<" if MEAN_MARKER_SIDE == "right" else ">"
+        x_frac = 1.0 if MEAN_MARKER_SIDE == "right" else 0.0
+        trans = ax.get_yaxis_transform()  # x: axes fraction, y: data 좌표
+
+        for group, color in zip(groups, PALETTE):
+            sub = df[df[GROUP_COL] == group]
+            ax.plot(
+                x_frac, sub[Y_COL].mean(), transform=trans,
+                marker=mean_marker, markersize=MEAN_MARKER_SIZE,
+                color=color, markeredgecolor=MEAN_EDGE_COLOR, markeredgewidth=MEAN_EDGE_WIDTH,
+                clip_on=False, zorder=5,
+            )
+
+        legend_handles.append(
+            Line2D(
+                [0], [0], marker=mean_marker, linestyle="", color="none",
+                markerfacecolor="none", markeredgecolor=MEAN_EDGE_COLOR,
+                markeredgewidth=MEAN_EDGE_WIDTH, label="mean",
+            )
+        )
+
+    ax.legend(handles=legend_handles, title=GROUP_COL, frameon=False, loc="best")
 
     fig.tight_layout()
     plt.show()
