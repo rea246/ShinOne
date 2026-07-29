@@ -19,6 +19,12 @@ MARKER_SIZE = 60
 ALPHA = 0.75
 
 WIDE_CSV_PATH = "group_wide.csv"   # 그룹별 x,y로 전개해서 저장할 csv 경로
+
+SHOW_GROUP_MEAN = True        # 그룹별 평균 표시 여부
+MEAN_MARKER = "X"
+MEAN_MARKER_SIZE = 300
+MEAN_EDGE_COLOR = "black"
+MEAN_EDGE_WIDTH = 1.5
 # ================================================
 
 # 그룹 구분용 고정 팔레트 (최대 8개 그룹까지 색이 뚜렷하게 구분됨)
@@ -82,6 +88,14 @@ def main():
             edgecolor="white", linewidth=0.5,
         )
 
+        if SHOW_GROUP_MEAN:
+            ax.scatter(
+                sub[X_COL].mean(), sub[Y_COL].mean(),
+                color=color, marker=MEAN_MARKER, s=MEAN_MARKER_SIZE,
+                edgecolor=MEAN_EDGE_COLOR, linewidth=MEAN_EDGE_WIDTH,
+                zorder=3,
+            )
+
     ax.set_xlabel(X_COL)
     ax.set_ylabel(Y_COL)
 
@@ -89,6 +103,14 @@ def main():
         Line2D([0], [0], marker="o", linestyle="", color=color, label=str(group))
         for group, color in zip(groups, PALETTE)
     ]
+    if SHOW_GROUP_MEAN:
+        legend_handles.append(
+            Line2D(
+                [0], [0], marker=MEAN_MARKER, linestyle="", color="none",
+                markerfacecolor="none", markeredgecolor=MEAN_EDGE_COLOR,
+                markeredgewidth=MEAN_EDGE_WIDTH, label="mean",
+            )
+        )
     ax.legend(handles=legend_handles, title=GROUP_COL, frameon=False, loc="best")
     sns.despine(fig=fig, ax=ax)
 
