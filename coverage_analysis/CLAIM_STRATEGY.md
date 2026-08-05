@@ -1,121 +1,173 @@
-# 서술 방향 정리 — kPCA Coverage 기반 Pattern Selection
+# Experimental strategy — Reference-centered kPCA group weighting
 
-> 이 폴더의 `coverage_domain_kpca.py` / `find_reinforce_patterns.py` / `find_redundant_patterns.py`
-> 로 만드는 결과를 **어떤 주장 구조로 서술·방어할지** 정리한 문서. (코드 아님, 논리 설계)
+## 핵심 주장
 
-## 0. 목표와 전제
-
-- **목표**: sample2에서 ref 커버를 늘리는 패턴을 찾아 sample에 추가(`reinforce`),
-  sample에서 무의미한 패턴을 빼서(`redundant`) 모델 에러를 줄인다.
-- **가장 큰 전제**: **2000개 패턴으로 200,000+ 패턴을 대변**해야 한다.
-  → 패턴 하나의 커버가 매우 **soft**하다. reach 반경 `R = k번째 최근접거리 × R_MULT`,
-  `k = ceil(N_ref/N_sample) ≈ 100`. 즉 한 패턴이 ref 약 100점을 대변한다고 주장.
+이 연구는 kPCA coverage가 물리적 성능을 직접 나타낸다고 가정하지 않는다. kPCA는
+Reference와 Sample1 그룹 사이의 **기하학적 연관도**를 정의하는 표현공간으로만 사용한다.
+이 연관도로 만든 학습 가중치의 유효성은 독립적인 Mask contour 및 OPC simulation으로
+검증한다.
 
 ---
 
-## 1. 1차 주장 — "이렇게 하면 커버가 늘어난다" (안전, 보장됨)
+## 1. Reference 중심 비선형 표현공간
 
-같은 ref 프레임 + 같은 kPCA 투영 + 같은 R에서 reach 커버는 **단조(monotone)**다.
-패턴을 추가하면 덮는 ref 점은 늘거나 같음 → **수학적으로 보장** (= 가정 A2).
+Reference와 Sample1의 각 pattern을 동일한 21차원 feature vector로 변환한다. 결측값이나
+비유한 값을 포함한 pattern은 제외한다.
 
-- **왜 안전한가**: 이 상대비교는 **A1과 무관하게 견고**하다. "축이 물리를 반영하나?"라는
-  A1의 걱정은 sample1·sample2에 **똑같이** 적용된다(같은 프레임·축·R). 따라서
-  "sample2만 덮는 영역이 있다 → 붙이면 커버↑"는 프레임 일관된 진짜 사실.
-- **한계**: 단독으로는 얇다("gap 근처에 패턴 넣으면 당연히 늘지"라는 반박). → 2·3장이 펀치.
+Feature scaling과 RBF Kernel PCA는 Reference만으로 학습한다. Reference feature
+$\mathbf{x}$는 Reference 평균 $\boldsymbol{\mu}_R$와 표준편차
+$\boldsymbol{\sigma}_R$로 표준화한다.
+
+$$
+\widetilde{\mathbf{x}}
+=
+\frac{\mathbf{x}-\boldsymbol{\mu}_R}{\boldsymbol{\sigma}_R}
+$$
+
+RBF kernel은 다음과 같이 정의한다.
+
+$$
+K(\mathbf{x}_i,\mathbf{x}_j)
+=
+\exp\left(-\gamma\lVert\widetilde{\mathbf{x}}_i-
+\widetilde{\mathbf{x}}_j\rVert_2^2\right)
+$$
+
+$\gamma$는 Reference pairwise squared distance의 median heuristic으로 정한다.
+
+$$
+\gamma=
+\frac{1}{2\,\operatorname{median}_{i<j}
+\lVert\widetilde{\mathbf{x}}_i-\widetilde{\mathbf{x}}_j\rVert_2^2}
+$$
+
+학습된 Reference frame을 사용하여 Reference와 Sample1을 동일한 KPC1–3 공간에 투영한다.
+Sample1은 scaling이나 kPCA를 다시 fit하지 않고 transform만 수행한다. 이 공통 frame 덕분에
+그룹 간 거리 비교가 Sample1 구성에 따라 바뀌지 않는다.
+
+- 구현: `coverage_domain_kpca.py`
+- 현재 기본값: Reference reservoir 15,000개, kPCA landmark 최대 5,000개, random seed 0
+- 산출물: 고정 kPCA cache, Reference/Sample1의 KPC1–3 좌표
+- 해석 제한: 이 단계의 거리와 coverage는 물리적 중요도나 모델 성능을 의미하지 않는다.
 
 ---
 
-## 2. A1은 "계산 오류"가 아니라 "숫자의 물리적 의미"를 묻는 층
+## 2. 표현공간 구성 확인
 
-- 커버 계산 자체는 **오류 없음**(단조·프레임 일관, 정확히 계산됨).
-- A1이 겨냥하는 것: `coverage 95%`는 **kPCA-3 볼 공간에서의 95%**. 이게
-  *물리적으로 대표된 95%*인지는 A1에 달림.
-- 결론: **A1은 reinforce의 방향(↑)이 아니라, 절대 숫자와 정지 기준("2000이면 충분, 끝")을 겨냥.**
-- soft 커버(2000→200k)일수록 A1이 더 결정적: 큰 볼이 물리적으로 다른 패턴을 한데 묶어
-  "covered"로 부풀릴 수 있음. **커버가 soft할수록 부풀림 위험 ↑.**
+KPC1–3 공간을 downstream 점수에 사용하기 전에 다음을 확인한다.
 
-| 하려는 것 | 지금 되나 | A1 필요? |
-|---|---|---|
-| sample2 gap 패턴 찾기 (`reinforce`) | ✅ | ❌ |
-| 붙이면 measured coverage↑ | ✅ 보장 | ❌ |
-| 커버↑ = **모델에러↓** | ⚠️ A1 성립 시만 | ✅ |
-| "2000이면 물리공간 충분" | ⚠️ 절대해석 | ✅ |
+1. KPC1–3이 RKHS 전체 분산에서 차지하는 질량
+2. 각 KPC를 따라 변화하는 원본 feature의 조건부 평균
+3. KPC와 원본 feature 사이의 사후 상관관계(pseudo-loading)
+4. 특정 feature 하나 또는 noise가 축을 지배하는지 여부
+
+kPCA 축은 원본 feature의 선형결합이 아니므로 PCA loading처럼 해석하지 않는다.
+Pseudo-loading은 축의 정의가 아니라 사후 요약값으로만 사용한다.
+
+- 구현: `kpc_axis_explain.py`
+- 판정: KPC1–3의 분산질량이 충분하지 않으면 3차원 결과를 확정하지 않는다.
+- 추가 확인: KPC 차원 수, $\gamma$, landmark seed를 바꿨을 때 그룹 순위의 안정성을 비교한다.
+
+이 단계는 physics 검증이 아니라 **representation QA**다.
 
 ---
 
-## 3. 증거 서술 A (메인) — 페어 제거 대조
+## 3. Sample1 그룹의 Reference 연관도
 
-"뺐더니 성능 내려갔다"를 **단독**으로 쓰면 "데이터 줄여서 당연"이라 반박당함(count 교락).
-신호는 *하락 자체*가 아니라 **하락의 차이(간격)**에 있다.
+Sample1은 A–F 그룹으로 구성된다. 각 Reference target pattern에 대해 KPC 공간에서 가장
+가까운 Sample1 pattern top-K를 찾고, 역거리 비율로 총 1점의 vote를 분배한다.
 
-- **같은 100개씩** 제거, 어느 100개냐만 달리한다.
-- **Low 그룹 (유지돼야)**: `greedy 최소덮개가 빼도 된다고 판정한 집합(keep=False)`에서 100개.
-  ⚠️ 개별 `unique_contribution=0`을 그냥 모으면 서로 덮던 게 같이 빠져 헛하락(set-cover 함정).
-  → 반드시 **집합적으로** 뽑는다.
-- **High 그룹 (하락해야)**: `unique_contribution` **상위** 100 (밀집 ref의 유일 대변자).
-  ⚠️ 기준은 `n_covered`(총커버)가 아니라 **`unique_contribution`(유일기여)**.
-  총커버 커도 유일기여 0이면 빼도 커버 그대로 → 대조 흐려짐.
+$$
+v_{ij}
+=
+\frac{(d_{ij}+\epsilon)^{-1}}
+{\sum_{l\in\operatorname{NN}_K(i)}(d_{il}+\epsilon)^{-1}}
+$$
 
-**기대 결과 (이게 나오면 A1 신호):**
+Reference 전체에 대한 pattern vote를 그룹별로 합산하여 그룹 점수 $S_g$를 계산한다.
 
-| 뺀 100개 | 커버 | 모델(POR 대비) | 의미 |
+$$
+S_g=\sum_i\sum_{j\in g}v_{ij}
+$$
+
+- 구현: `group_reinforce_nnvote.py`
+- 기본 해석: $S_g$는 그룹 $g$의 pattern이 Reference 가까이에 얼마나 자주 위치하는지를
+  나타내는 **기하학적 연관도**다.
+- 금지된 해석: downstream 검증 전에는 이를 물리적 중요도 또는 모델 성능 기여도로 부르지 않는다.
+
+그룹 크기가 크면 최근접 이웃으로 선택될 기회도 증가한다. 따라서 학습 가중치에는 총점
+$S_g$를 그대로 사용하지 않고 그룹 pattern 수 $n_g$로 나눈 값을 사용한다.
+
+$$
+q_g=\frac{S_g}{n_g}
+$$
+
+Reference scatter가 없을 때 Sample1과 target으로 거리 scale을 다시 추정하면 공통 frame
+전제가 약해지므로, 최종 실험에서는 Reference 기반 scale을 필수로 사용한다.
+
+---
+
+## 4. Mask Process Model의 그룹 가중 학습
+
+그룹 연관도 $q_g$를 Mask Process Model의 pattern loss weight로 변환한다. 극단적인
+가중치를 줄이기 위해 완화 지수 $\alpha$를 적용할 수 있다.
+
+$$
+w_g\propto q_g^{\alpha},\qquad 0\leq\alpha\leq1
+$$
+
+전체 학습 loss scale이 POR와 같도록 가중치를 정규화한다.
+
+$$
+\sum_g n_g w_g=N
+$$
+
+필요하면 사전에 정한 범위로 $w_g$를 clipping한다. 가중치 효과와 데이터 제거 효과를
+분리하기 위해 첫 실험에서는 pattern을 제거하지 않는다.
+
+최소 대조실험은 다음과 같다.
+
+| Model | Training patterns | Weight | 목적 |
 |---|---|---|---|
-| Low (집합적 redundant) | ≈유지 | ≈유지 | 안전한 슬림화 |
-| High (유일기여 상위) | ↓ | ↓ | 중요했음 |
+| POR | 전체 Sample1 | Uniform | 기준 |
+| Weighted | POR와 동일 | kPCA group weight | 제안 방법 |
+| Shuffled-weight | POR와 동일 | 그룹 weight 무작위 치환 | 기하학 정보의 효과 통제 |
 
-- **두 그룹 다 정확히 100개** → "데이터 줄여서"는 양쪽 상쇄. 남는 차이 = **오직 지표가 고른 대상** = A1 신호.
-- **싸다**: 새 metrology 불필요, 이미 측정한 패턴의 부분집합으로 재학습만.
-  한 번의 페어 실험이 "슬림화 안전"과 "지표에 신호 있음"을 **동시에** 준다.
-
----
-
-## 4. 증거 서술 B (강화 follow-up) — 대표질량 가중 학습
-
-"커버 큰 영역에 가중 학습 → 모델 좋아졌다."
-
-- **장점**: **count 교락이 0.** 같은 데이터를 재가중만 하니 "수 늘려서"가 원천 차단 →
-  A1 신호를 가장 깨끗하게 분리.
-- ⚠️ **함정 1 — 가중 기준을 "대표질량"으로.** 그냥 밀집/다수 영역에 가중하면 majority만
-  좋아지고 **핫스팟(tail)이 죽는다** — OPC에선 tail이 수율을 죽이는 그 부분.
-  "이 패턴이 ref 몇 점을 대변하나(coverage mass)"로 가중해야 soft 전제와 논리가 붙음.
-- ⚠️ **함정 2 — tail 오차 별도 보고.** 평균오차만 쓰지 말고 최악군/핫스팟 오차를 별도로.
+세 모델은 학습 pattern 수, optimizer step, seed와 training budget을 동일하게 유지한다.
+Weighted model이 POR와 shuffled-weight보다 개선된 뒤에만 pruning을 후속 실험한다.
+Pruning 시에는 low-score 제거와 동일 개수 random 제거를 비교하며, 희귀 그룹을 전부
+삭제하지 않도록 그룹별 최소 pattern 수를 유지한다.
 
 ---
 
-## 5. 두 레버는 다른 것 — 섞지 말 것
+## 5. Mask contour 검증
 
-- `reinforce` = **데이터셋 변경**(gap 패턴 추가)
-- 가중학습(B) = **loss 변경**(기존 패턴 재가중)
+가중치 계산 및 모델 학습에 사용하지 않은 Reference holdout pattern을 동일 조건으로 mask
+simulation한다. POR와 Weighted model을 pattern 단위 paired comparison으로 평가한다.
 
-한 문장에 섞으면 원인 분리가 무너진다. A(제거)·B(가중)는 각각 독립 실험.
+- mean/median 및 p95·p99 contour error 또는 EPE
+- worst-pattern error와 hotspot 수
+- 개선 pattern 수와 악화 pattern 수
+- feature/KPC 영역별 개선·악화 분포
 
----
-
-## 6. 전부에 걸리는 단 하나의 단서
-
-"좋아졌다/유지됐다"를 **"커버됐지만 미측정"인 홀드아웃**에서 평가한다.
-fit한 자리(측정에 쓴 패턴)에서만 재면 순환논증 — 대변한다고 주장한 미측정 영역의 진위는 못 건드림.
-
----
-
-## 7. (참고) A1 정식 증명 route — 나중에
-
-- **다운스트림(강): augmented 모델이 POR보다 우수** + **"no singularity"를 홀드아웃에서** 확인.
-  이때 "no singularity"는 반드시 *커버됐지만 미측정*인 홀드아웃에서 재야 유효(6장).
-  - **필수 컨트롤**: 같은 개수를 reinforce로 고른 것 vs 랜덤/rule-based로 고른 것.
-    coverage-guided가 이겨야 "수"가 아니라 "선택(지표)"이 이긴 것 = A1.
-- **가장 싼 선행(회고적)**: 이미 측정된 패턴을 홀드아웃 → POR 모델의 그 패턴 실측오차를 꺼내
-  → **kPCA 커버 판정이 오차 크기를 예측하나** 확인. `covered` 홀드아웃 오차 < `uncovered` 오차면 A1 성립.
-  새 metrology 없이 지금 데이터로 가능. 여기서 신호 보이면 그때 비싼 새-모델 실험으로 확정.
+평균 오차만 감소하고 tail error가 증가하면 개선으로 판정하지 않는다. 가능하면 Reference를
+가중치 산출용과 평가용으로 분리한다.
 
 ---
 
-## 8. (참고) 현재 코드 상태
+## 6. OPC simulation 검증
 
-| 항목 | 상태 | 근거 |
-|---|---|---|
-| A2 단조성 | ✅ | reach/볼 커버(`R`, k-NN 예산 기반), 단조 |
-| A3 공통프레임 | ✅ | Reference reservoir에 KPCA 1회 fit → 캐시, sample은 투영만 |
-| A1-(a) 축/분산 커버 | ⚠️ 캐시로 산출 가능 | `pca.explained_variance_ratio_`는 캐시에 있음; kPCA는 캐시된 landmarks+gamma로 작은 재적합(고유값 질량비) — 대용량 재읽기 불필요 |
-| A1-(b) 잠재거리↔물리오차 | ❌ 불가 (데이터 문제) | 캐시·입력(21 feature + lot_id)에 **실측 EPE/에러 라벨 없음** → 3·7장의 다운스트림/회고 검증으로 대체 |
-| reinforce / redundant 도구 | ✅ 존재 | 단 importance가 실측에러 아니라 `ref_density` 대리 → A1-(b)와 같은 구멍 |
+Mask contour에서 유의미한 개선이 확인된 모델만 동일한 OPC recipe와 process condition으로
+평가한다. POR 대비 wafer EPE, PV band, process-window margin, hotspot과 worst-case pattern을
+비교한다. Mask에서 개선된 pattern이 wafer에서도 개선되는지를 추적하여 기하학적 그룹
+가중치가 실제 wafer 성능으로 이어지는지 최종 검증한다.
+
+---
+
+## 해석 원칙
+
+1. kPCA는 공통 비선형 표현공간을 제공한다.
+2. 최근접 투표 점수는 Reference와의 기하학적 연관도다.
+3. Mask/OPC 결과로 검증되기 전에는 해당 점수를 physics 중요도로 해석하지 않는다.
+4. 가중치와 pruning은 별도 실험으로 분리한다.
+5. 모든 성능 주장은 독립 holdout과 POR·placebo 대조를 기준으로 한다.
