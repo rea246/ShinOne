@@ -72,6 +72,18 @@ class TopologyClusteringTest(unittest.TestCase):
         self.assertEqual(topology.final_cluster_id(3, 2), "H0_3_T2")
         self.assertEqual(topology.final_cluster_id(-1, 2), "RARE_T2")
 
+    def test_community_summary_measures_normalized_space_dispersion(self):
+        labels = np.array([0, 0, 1], dtype=np.int32)
+        embedding = np.array([[0.0], [2.0], [10.0]], dtype=np.float32)
+        summaries = topology._community_summary(
+            0, labels, total_count=3, embedding=embedding
+        )
+
+        self.assertAlmostEqual(summaries[0]["centroid_distance_mean"], 1.0)
+        self.assertAlmostEqual(summaries[0]["centroid_distance_p95"], 1.0)
+        self.assertAlmostEqual(summaries[0]["centroid_distance_max"], 1.0)
+        self.assertAlmostEqual(summaries[1]["centroid_distance_p95"], 0.0)
+
     def test_outputs_preserve_rows_labels_and_schema(self):
         summaries = topology._community_summary(-1, np.array([0, 1]), total_count=2)
         with tempfile.TemporaryDirectory() as out_dir:
@@ -86,6 +98,10 @@ class TopologyClusteringTest(unittest.TestCase):
                 with np.load(Path(out_dir, "topology_labels.npz")) as labels:
                     np.testing.assert_array_equal(labels["rows"], [0, 1])
                     np.testing.assert_array_equal(labels["h0_labels"], [-1, -1])
+                    self.assertEqual(
+                        labels["population_fingerprint"].item(),
+                        topology.population_fingerprint(["a", "b"], [0, 1]),
+                    )
                 header = Path(out_dir, "topology_assignments.csv").read_text(
                     encoding="utf-8"
                 ).splitlines()[0]

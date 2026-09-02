@@ -11,11 +11,12 @@ Required in the research environment:
 Existing pipeline dependencies (numpy, scipy, scikit-learn, torch) are reused.
 FAISS GPU is used for exact kNN when available; otherwise an exact PyTorch CUDA
 backend uses the existing torch dependency before falling back to CPU search.
-Representative sampling intentionally remains a later pipeline stage.
+Representative sampling is intentionally separated into 7.select_representatives.py.
 """
 
 import csv
 import gc
+import hashlib
 import os
 import time
 
@@ -76,6 +77,21 @@ def coarse_group_name(h0_label):
 def final_cluster_id(h0_label, topology_label):
     prefix = "RARE" if int(h0_label) < 0 else f"H0_{int(h0_label)}"
     return f"{prefix}_T{int(topology_label)}"
+
+
+def _update_population_fingerprint(digest, global_row, key):
+    key_bytes = str(key).encode("utf-8")
+    digest.update(int(global_row).to_bytes(8, "little", signed=True))
+    digest.update(len(key_bytes).to_bytes(8, "little", signed=False))
+    digest.update(key_bytes)
+
+
+def population_fingerprint(keys, rows):
+    """Hash ordered global-row/key pairs to detect stale Stage-2 outputs."""
+    digest = hashlib.sha256()
+    for global_row in rows:
+        _update_population_fingerprint(digest, global_row, keys[int(global_row)])
+    return digest.hexdigest()
 
 
 def renumber_communities(labels):
@@ -688,18 +704,48 @@ def nearest_neighbor_diagnostics(knn, embedding, local_labels, global_rows,
     return rows
 
 
-def _community_summary(h0_label, local_labels, total_count):
+def _community_summary(h0_label, local_labels, total_count, embedding=None):
+    """Summarize communities and their spread in normalized topology space."""
     ids, counts = np.unique(local_labels, return_counts=True)
     coarse_count = len(local_labels)
-    return [{
-        "h0_label": int(h0_label),
-        "coarse_group": coarse_group_name(h0_label),
-        "topology_cluster": int(cid),
-        "final_cluster": final_cluster_id(h0_label, cid),
-        "pattern_count": int(count),
-        "fraction_in_coarse_group": float(count / coarse_count),
-        "fraction_in_total": float(count / total_count),
-    } for cid, count in zip(ids, counts)]
+    rows = []
+    for cid, count in zip(ids, counts):
+        if embedding is None:
+            distance_mean = distance_p95 = distance_max = float("nan")
+        else:
+            member_positions = np.flatnonzero(local_labels == cid)
+            centroid_sum = np.zeros(embedding.shape[1], dtype=np.float64)
+            for start in range(0, len(member_positions), NORMALIZE_BLOCK):
+                end = min(start + NORMALIZE_BLOCK, len(member_positions))
+                centroid_sum += embedding[member_positions[start:end]].sum(
+                    axis=0, dtype=np.float64
+                )
+            centroid = (centroid_sum / len(member_positions)).astype(np.float32)
+            distances = np.empty(len(member_positions), dtype=np.float32)
+            for start in range(0, len(member_positions), NORMALIZE_BLOCK):
+                end = min(start + NORMALIZE_BLOCK, len(member_positions))
+                values = embedding[member_positions[start:end]]
+                delta = values - centroid
+                distances[start:end] = np.sqrt(
+                    np.einsum("ij,ij->i", delta, delta)
+                )
+            distance_mean = float(distances.mean())
+            distance_p95 = float(np.percentile(distances, 95))
+            distance_max = float(distances.max())
+
+        rows.append({
+            "h0_label": int(h0_label),
+            "coarse_group": coarse_group_name(h0_label),
+            "topology_cluster": int(cid),
+            "final_cluster": final_cluster_id(h0_label, cid),
+            "pattern_count": int(count),
+            "fraction_in_coarse_group": float(count / coarse_count),
+            "fraction_in_total": float(count / total_count),
+            "centroid_distance_mean": distance_mean,
+            "centroid_distance_p95": distance_p95,
+            "centroid_distance_max": distance_max,
+        })
+    return rows
 
 
 def _print_group_diagnostics(h0_label, n, k, labels, edge_count):
@@ -720,6 +766,7 @@ def write_outputs(keys, rows, h0_labels, topology_labels, summaries, diagnostics
 
     assignment_path = os.path.join(OUT_DIR, "topology_assignments.csv")
     assignment_tmp = assignment_path + ".tmp"
+    fingerprint_digest = hashlib.sha256()
     with open(assignment_tmp, "w", newline="", encoding="utf-8") as fp:
         writer = csv.writer(fp)
         writer.writerow(["pattern_key", "original_h0_label", "coarse_group",
@@ -728,6 +775,9 @@ def write_outputs(keys, rows, h0_labels, topology_labels, summaries, diagnostics
         assignment_started = time.time()
         for written, (row, h0_label, topology_label) in enumerate(
                 zip(rows, h0_labels, topology_labels), start=1):
+            _update_population_fingerprint(
+                fingerprint_digest, row, keys[int(row)]
+            )
             writer.writerow([
                 str(keys[int(row)]), int(h0_label), coarse_group_name(h0_label),
                 int(topology_label), final_cluster_id(h0_label, topology_label),
@@ -743,8 +793,11 @@ def write_outputs(keys, rows, h0_labels, topology_labels, summaries, diagnostics
 
     summary_path = os.path.join(OUT_DIR, "topology_cluster_summary.csv")
     summary_tmp = summary_path + ".tmp"
-    summary_fields = ["h0_label", "coarse_group", "topology_cluster", "final_cluster",
-                      "pattern_count", "fraction_in_coarse_group", "fraction_in_total"]
+    summary_fields = [
+        "h0_label", "coarse_group", "topology_cluster", "final_cluster",
+        "pattern_count", "fraction_in_coarse_group", "fraction_in_total",
+        "centroid_distance_mean", "centroid_distance_p95", "centroid_distance_max",
+    ]
     with open(summary_tmp, "w", newline="", encoding="utf-8") as fp:
         writer = csv.DictWriter(fp, fieldnames=summary_fields)
         writer.writeheader()
@@ -763,8 +816,13 @@ def write_outputs(keys, rows, h0_labels, topology_labels, summaries, diagnostics
 
     labels_path = os.path.join(OUT_DIR, "topology_labels.npz")
     labels_tmp = labels_path + ".tmp.npz"
-    np.savez(labels_tmp, rows=rows, h0_labels=h0_labels,
-             topology_labels=topology_labels)
+    np.savez(
+        labels_tmp,
+        rows=rows,
+        h0_labels=h0_labels,
+        topology_labels=topology_labels,
+        population_fingerprint=np.asarray(fingerprint_digest.hexdigest()),
+    )
     os.replace(labels_tmp, labels_path)
 
     print("\n[Saved]", flush=True)
@@ -824,7 +882,18 @@ def main():
         _print_group_diagnostics(
             h0_label, len(positions), k, local_labels, adjacency.nnz // 2
         )
-        summaries.extend(_community_summary(h0_label, local_labels, len(rows)))
+        dispersion_started = time.time()
+        print("  [Community dispersion] START", flush=True)
+        summaries.extend(
+            _community_summary(
+                h0_label, local_labels, len(rows), embedding=embedding
+            )
+        )
+        print(
+            "  [Community dispersion] DONE "
+            f"elapsed={time.time() - dispersion_started:.1f}s",
+            flush=True,
+        )
         diagnostics.extend(nearest_neighbor_diagnostics(
             knn, embedding, local_labels, global_rows, keys, h0_label, rng
         ))

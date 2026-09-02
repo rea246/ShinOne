@@ -8,7 +8,7 @@
 
 > H0 HDBSCAN is used as a rare-aware coarse structural stratification, while full hierarchical GNN representations including h0, h1, h2, h3, and edge information are subsequently used to construct local similarity graphs and identify fine-grained topology communities without discarding low-density structural patterns.
 
-이번 구현 범위는 최종 topology community 산출까지이다. 고정 예산 1,000개의 대표 패턴 선택과 상용툴 결과 비교는 후속 실험 단계로 분리한다.
+현재 구현 범위는 최종 topology community 산출과 고정 예산 1,000개의 대표 패턴 선택까지이다. 상용툴 결과와의 coverage 비교는 후속 실험 단계로 분리한다.
 
 ## 2. Dataset and candidate population
 
@@ -138,7 +138,7 @@ rare : RARE_T<topology_label>
 | `RANDOM_SEED` | 42 | reproducibility |
 | Block weights | all 1.0 | no learned/manual hierarchy weighting |
 | Normalization chunk | 250,000 | bounded scaler working memory |
-| kNN query chunk | 50,000 | bounded query-result memory |
+| kNN query chunk | 10,000 | bounded query-result memory and progress visibility |
 
 Baseline parameter는 최종 성능 최적값이 아니라 sensitivity analysis의 기준점이다. 상용툴 선택 결과를 관찰한 뒤 clustering parameter를 조정하지 않는다.
 
@@ -192,7 +192,12 @@ final_cluster
 pattern_count
 fraction_in_coarse_group
 fraction_in_total
+centroid_distance_mean
+centroid_distance_p95
+centroid_distance_max
 ```
+
+마지막 세 값은 Stage-2와 동일한 normalized full-topology space에서 각 community centroid까지의 Euclidean distance를 요약한다. 이 중 P95는 representative quota의 topology dispersion 항으로 사용한다.
 
 ### 9.3 Nearest-neighbor inspection
 
@@ -211,21 +216,40 @@ same_final_cluster
 
 ### 9.4 Machine-readable labels
 
-`topology_labels.npz`는 후속 representative selection이 사용할 `rows`, `h0_labels`, `topology_labels`를 보존한다.
+`topology_labels.npz`는 후속 representative selection이 사용할 `rows`, `h0_labels`, `topology_labels`와 ordered global-row/pattern-key SHA-256 fingerprint를 보존한다. Stage 3은 현재 cache의 fingerprint가 일치하지 않으면 중단하여 stale label-to-pattern mapping을 방지한다.
 
-## 10. Representative selection under a fixed budget
+## 10. Stage 3: representative selection under a fixed budget
 
-Clustering은 population을 partition하지만 1,000개 pattern을 직접 선택하지 않는다. 고정 예산 representative selection은 별도 단계로 수행한다.
+`7.select_representatives.py`는 Stage-2 partition을 변경하지 않고, 그 결과를 입력으로 정확히 1,000개의 실제 pattern key를 선택한다.
 
-1. 모든 final community에 minimum quota를 배정한다.
-2. rare community도 dense community와 동일하게 minimum quota 대상에 포함한다.
-3. 남은 budget을 community size 및 uncovered topology volume을 고려하여 배분한다.
-4. 각 community 내부에서는 medoid만 반복 선택하지 않고 coverage-based 또는 farthest-point selection을 적용한다.
-5. 선택 결과가 정확히 1,000개의 unique pattern key인지 검증한다.
+### 10.1 Community quota
+
+Community `c`의 크기를 `n_c`, normalized topology centroid까지 거리의 P95를 `r_c`, community 수를 `C`, 전체 budget을 `B=1000`이라고 한다. Baseline minimum floor는 3이며, budget이 부족할 때도 모든 community를 보존하도록 다음 유효 floor를 먼저 계산한다.
+
+\[
+m_{\mathrm{eff}}=\min\left(3,\max\left(1,\left\lfloor\frac{B}{C}\right\rfloor\right)\right),
+\qquad q_c^{(0)}=\min(n_c,m_{\mathrm{eff}}).
+\]
+
+Rare community도 dense community와 동일한 minimum quota 대상이다. 남은 budget은 다음 baseline weight로 배분한다.
+
+\[
+a_c=n_c^{0.5}\,\max(r_c,0.1\,\mathrm{median}(r_{c'}>0)).
+\]
+
+제곱근 size 항은 큰 community가 budget을 독점하는 것을 완화하고, P95 dispersion 항은 넓게 퍼진 topology community에 더 많은 coverage point를 준다. 모든 P95가 0이면 dispersion factor는 동일한 1로 처리한다. 배분은 community size를 초과하지 않는 deterministic largest-remainder 방식이며 최종 quota 합을 정확히 1,000으로 검증한다.
+
+### 10.2 Within-community selection
+
+각 community에서 normalized full-topology centroid에 가장 가까운 실제 pattern을 첫 exemplar로 선택한다. 이는 $O(N^2)$ exact medoid가 아니라 centroid-nearest exemplar임을 명시한다. 이후 centroid distance의 80th percentile을 기준으로 central pool과 boundary pool을 나누고, quota의 약 80%/20%를 각각 배정한다. 각 pool에서는 이미 선택된 집합까지의 최소 거리가 최대인 실제 member를 순차 선택하는 deterministic farthest-point selection을 사용한다.
+
+따라서 출력은 합성 centroid나 임베딩 벡터가 아니라 `hkeys_features.pt`에 존재하는 원본 pattern key이다. 선택 후 정확히 1,000개인지, `global_row`와 `pattern_key`가 모두 unique인지 검증한다. CUDA PyTorch가 있으면 farthest-point distance 갱신에 GPU를 사용하고, 그렇지 않으면 NumPy CPU로 동일한 선택 절차를 수행한다.
 
 Final community 수가 1,000보다 많으면 community당 최소 1개 조건과 budget이 양립하지 않는다. 이 경우 selection 전에 resolution을 재검토하거나, 사전에 정의한 small-community consolidation rule을 적용해야 한다.
 
-예상 selection manifest는 다음과 같다.
+### 10.3 Outputs
+
+`topology_clustering_out/representative_1000.csv`
 
 ```text
 pattern_key
@@ -234,8 +258,13 @@ h0_label
 topology_cluster
 final_cluster
 selection_rank
+global_selection_rank
 selection_reason
+distance_to_centroid
+distance_to_nearest_prior
 ```
+
+추가로 community별 배분 근거를 담은 `representative_quota.csv`, machine-readable row/label을 담은 `representative_1000.npz`, 설정과 실제 backend를 담은 `representative_selection_metadata.json`을 저장한다.
 
 ## 11. Comparison with a commercial-tool selection
 
@@ -286,6 +315,7 @@ P95와 P99는 low-density structural direction의 coverage를 평가하는 핵�
 - Feature extraction in `4.h0_clustering.py`: CUDA가 있으면 GPU 사용
 - HDBSCAN and Stage-1 KNN assignment: `n_jobs=-1` 또는 `core_dist_n_jobs=-1`로 multi-CPU 사용
 - Stage-2 exact kNN: `auto`에서 FAISS GPU → PyTorch CUDA → FAISS CPU(OpenMP) → scikit-learn multi-CPU 순으로 사용
+- Stage-3 farthest-point selection: PyTorch CUDA가 있으면 GPU, 아니면 NumPy CPU 사용
 - Scaling과 kNN query는 block processing으로 peak working memory를 제한
 - Sparse adjacency는 \(O(Nk)\) storage 사용
 
@@ -302,6 +332,7 @@ Stage-2는 GPU에서도 full-population exact search를 유지하므로 계산 �
 ```bash
 python 4.h0_clustering.py
 python 6.topology_clustering.py
+python 7.select_representatives.py
 ```
 
 Stage 2의 필수 추가 dependency는 `python-igraph`와 `leidenalg`이다. 기존 pipeline dependency인 NumPy, SciPy, scikit-learn, PyTorch도 필요하다. CUDA 지원 FAISS가 설치되어 있으면 가장 먼저 사용하며, 없으면 PyTorch CUDA exact backend가 GPU를 사용한다.
@@ -312,9 +343,8 @@ pip install python-igraph leidenalg
 
 ## 15. Scope and limitations
 
-현재 구현은 topology community 생성까지 검증한다. 다음 항목은 아직 결과로 주장하지 않는다.
+현재 구현은 topology community 생성과 정확히 1,000개의 representative manifest 생성까지 검증한다. 다음 항목은 아직 결과로 주장하지 않는다.
 
-- fixed-budget 1,000-pattern representative selection
 - 상용툴 1,000개와의 coverage comparison
 - 자동 parameter sweep 및 최적값
 - approximate kNN의 recall/community stability 검증
