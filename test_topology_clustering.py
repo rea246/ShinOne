@@ -25,6 +25,37 @@ class TopologyClusteringTest(unittest.TestCase):
         np.testing.assert_array_equal(src, [0, 0, 1, 1])
         np.testing.assert_array_equal(dst, [2, 1, 0, 2])
 
+    def test_torch_exact_backend_matches_sklearn_across_blocks(self):
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("PyTorch is not installed in this test environment")
+        from sklearn.neighbors import NearestNeighbors
+
+        rng = np.random.default_rng(123)
+        embedding = rng.normal(size=(23, 7)).astype(np.float32)
+        original_query_block = topology.TORCH_GPU_QUERY_BLOCK
+        original_reference_block = topology.TORCH_GPU_REFERENCE_BLOCK
+        topology.TORCH_GPU_QUERY_BLOCK = 4
+        topology.TORCH_GPU_REFERENCE_BLOCK = 6
+        try:
+            backend = topology._TorchExactKNN(embedding, torch, device="cpu")
+            actual_distances, actual_neighbors = backend.kneighbors(
+                embedding, n_neighbors=6, return_distance=True
+            )
+        finally:
+            topology.TORCH_GPU_QUERY_BLOCK = original_query_block
+            topology.TORCH_GPU_REFERENCE_BLOCK = original_reference_block
+
+        expected = NearestNeighbors(
+            n_neighbors=6, metric="euclidean", algorithm="brute"
+        ).fit(embedding)
+        expected_distances, expected_neighbors = expected.kneighbors(embedding)
+        np.testing.assert_array_equal(actual_neighbors, expected_neighbors)
+        np.testing.assert_allclose(
+            actual_distances, expected_distances, rtol=1e-5, atol=1e-5
+        )
+
     def test_similarity_decreases_with_distance(self):
         distance = np.array([0.1, 1.0], dtype=np.float32)
         src = np.array([0, 0], dtype=np.int32)

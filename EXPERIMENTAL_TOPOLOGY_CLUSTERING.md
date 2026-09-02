@@ -285,17 +285,17 @@ P95와 P99는 low-density structural direction의 coverage를 평가하는 핵�
 
 - Feature extraction in `4.h0_clustering.py`: CUDA가 있으면 GPU 사용
 - HDBSCAN and Stage-1 KNN assignment: `n_jobs=-1` 또는 `core_dist_n_jobs=-1`로 multi-CPU 사용
-- Stage-2 kNN: scikit-learn `NearestNeighbors(n_jobs=-1)`로 multi-CPU 사용
+- Stage-2 exact kNN: `auto`에서 FAISS GPU → PyTorch CUDA → FAISS CPU(OpenMP) → scikit-learn multi-CPU 순으로 사용
 - Scaling과 kNN query는 block processing으로 peak working memory를 제한
 - Sparse adjacency는 \(O(Nk)\) storage 사용
 
 ### 13.2 Current limitations
 
-Stage-2 kNN은 현재 GPU를 사용하지 않는다. 40차원 exact sklearn search가 brute-force로 선택되면 대규모 coarse group에서 주요 시간 병목이 될 수 있다. Leiden은 native CPU implementation을 사용하며 coarse group은 memory peak를 제한하기 위해 순차 처리한다.
+Stage-2는 GPU에서도 full-population exact search를 유지하므로 계산 복잡도 자체는 \(O(N^2)\)이다. FAISS GPU가 없더라도 기존 PyTorch CUDA를 이용한 blocked matrix search가 A100 등 CUDA device를 사용한다. Leiden은 native CPU implementation을 사용하며 coarse group은 memory peak를 제한하기 위해 순차 처리한다.
 
 ### 13.3 Planned acceleration path
 
-과학적 정의를 유지하는 첫 번째 가속 옵션은 FAISS `GpuIndexFlatL2`를 이용한 exact Euclidean kNN이다. CUDA/FAISS가 없으면 현재 sklearn multi-CPU 경로로 fallback한다. Approximate IVF/HNSW를 사용할 경우에는 exact subset 대비 recall@k를 보고하고 graph 및 community 결과에 미치는 영향을 별도로 검증한다.
+과학적 정의를 유지하는 첫 번째 가속인 FAISS `GpuIndexFlatL2` exact Euclidean kNN과 PyTorch CUDA exact fallback을 구현했다. 추가 가속을 위해 approximate IVF/HNSW를 사용할 경우에는 exact subset 대비 recall@k를 보고하고 graph 및 community 결과에 미치는 영향을 별도로 검증한다.
 
 ## 14. Execution
 
@@ -304,7 +304,7 @@ python 4.h0_clustering.py
 python 6.topology_clustering.py
 ```
 
-Stage 2의 추가 dependency는 `python-igraph`와 `leidenalg`이다. 기존 pipeline dependency인 NumPy, SciPy, scikit-learn, PyTorch도 필요하다.
+Stage 2의 필수 추가 dependency는 `python-igraph`와 `leidenalg`이다. 기존 pipeline dependency인 NumPy, SciPy, scikit-learn, PyTorch도 필요하다. CUDA 지원 FAISS가 설치되어 있으면 가장 먼저 사용하며, 없으면 PyTorch CUDA exact backend가 GPU를 사용한다.
 
 ```bash
 pip install python-igraph leidenalg
@@ -317,7 +317,7 @@ pip install python-igraph leidenalg
 - fixed-budget 1,000-pattern representative selection
 - 상용툴 1,000개와의 coverage comparison
 - 자동 parameter sweep 및 최적값
-- Stage-2 GPU kNN
+- approximate kNN의 recall/community stability 검증
 - full production dataset에서의 runtime과 peak memory
 
 따라서 본 문서는 완결된 성능 결과가 아니라, 결과 생성 전에 고정해야 할 experimental protocol과 구현 경계를 정의한다.

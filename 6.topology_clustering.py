@@ -9,6 +9,8 @@ Required in the research environment:
     pip install python-igraph leidenalg
 
 Existing pipeline dependencies (numpy, scipy, scikit-learn, torch) are reused.
+FAISS GPU is used for exact kNN when available; otherwise an exact PyTorch CUDA
+backend uses the existing torch dependency before falling back to CPU search.
 Representative sampling intentionally remains a later pipeline stage.
 """
 
@@ -34,9 +36,20 @@ EDGE_WEIGHT_MODE = "local_gaussian"  # local_gaussian | inverse_distance | binar
 MUTUAL_KNN = False
 RANDOM_SEED = 42
 
-# Bounds peak RAM without changing the exact sklearn kNN result.
+# Bounds peak RAM without changing the exact kNN definition.
 NORMALIZE_BLOCK = 250_000
 KNN_QUERY_BLOCK = 10_000
+
+# Exact search backend priority in auto mode:
+# FAISS GPU -> PyTorch CUDA -> FAISS CPU (OpenMP) -> sklearn CPU (all cores).
+KNN_BACKEND = "auto"  # auto | faiss_gpu | torch_gpu | faiss_cpu | sklearn
+GPU_DEVICE = 0
+
+# PyTorch CUDA is the dependency-free GPU fallback when FAISS GPU is absent.
+# It keeps exact full-population L2 search while bounding the temporary distance
+# matrix. These values use about 1 GiB for one 2,048 x 131,072 float32 tile.
+TORCH_GPU_QUERY_BLOCK = 2_048
+TORCH_GPU_REFERENCE_BLOCK = 131_072
 
 DIAGNOSTIC_ANCHORS = 5
 DIAGNOSTIC_NEIGHBORS = 5
@@ -101,6 +114,13 @@ def _validate_config():
         raise ValueError("LEIDEN_RESOLUTION must be > 0")
     if NORMALIZE_BLOCK < 1 or KNN_QUERY_BLOCK < 1:
         raise ValueError("block sizes must be >= 1")
+    valid_backends = {"auto", "faiss_gpu", "torch_gpu", "faiss_cpu", "sklearn"}
+    if KNN_BACKEND not in valid_backends:
+        raise ValueError(f"KNN_BACKEND must be one of {sorted(valid_backends)}")
+    if GPU_DEVICE < 0:
+        raise ValueError("GPU_DEVICE must be >= 0")
+    if TORCH_GPU_QUERY_BLOCK < 1 or TORCH_GPU_REFERENCE_BLOCK < 1:
+        raise ValueError("PyTorch GPU block sizes must be >= 1")
     if set(BLOCK_WEIGHTS) != set(FEATURE_BLOCKS):
         raise ValueError(f"BLOCK_WEIGHTS keys must be {FEATURE_BLOCKS}")
     if any(BLOCK_WEIGHTS[name] <= 0 for name in FEATURE_BLOCKS):
@@ -225,13 +245,265 @@ def _nonself_edges(query_ids, neighbor_ids, distances, k):
             distances[row_pos, col_pos].astype(np.float32, copy=False))
 
 
+def _optional_import(module_name):
+    try:
+        return __import__(module_name), None
+    except (ImportError, OSError) as exc:
+        return None, exc
+
+
+class _FaissExactKNN:
+    """sklearn-like exact L2 adapter backed by FAISS CPU or GPU."""
+
+    def __init__(self, embedding, faiss, use_gpu, gpu_device=0):
+        self._faiss = faiss
+        self._resources = None
+        self._n_samples = len(embedding)
+        dim = embedding.shape[1]
+        index = faiss.IndexFlatL2(dim)
+
+        if use_gpu:
+            self._resources = faiss.StandardGpuResources()
+            clone_options = faiss.GpuClonerOptions()
+            clone_options.useFloat16 = False
+            index = faiss.index_cpu_to_gpu(
+                self._resources, int(gpu_device), index, clone_options
+            )
+            self._fit_method = (
+                f"faiss_gpu_exact(device={gpu_device}, float32, exhaustive)"
+            )
+        else:
+            cpu_threads = max(1, os.cpu_count() or 1)
+            if hasattr(faiss, "omp_set_num_threads"):
+                faiss.omp_set_num_threads(cpu_threads)
+            self._fit_method = (
+                f"faiss_cpu_exact(OpenMP_threads={cpu_threads}, exhaustive)"
+            )
+
+        self._index = index
+        self._index.add(np.ascontiguousarray(embedding, dtype=np.float32))
+
+    def kneighbors(self, queries, n_neighbors, return_distance=True):
+        if n_neighbors > self._n_samples:
+            raise ValueError("n_neighbors exceeds fitted population")
+        query_array = np.ascontiguousarray(queries, dtype=np.float32)
+        squared_distances, neighbors = self._index.search(query_array, n_neighbors)
+        if not return_distance:
+            return neighbors
+        # IndexFlatL2 returns squared L2. The original sklearn path returns L2,
+        # so sqrt is required to preserve the graph weighting definition.
+        squared_distances = np.asarray(squared_distances, dtype=np.float32)
+        np.maximum(squared_distances, 0.0, out=squared_distances)
+        np.sqrt(squared_distances, out=squared_distances)
+        return squared_distances, neighbors
+
+
+class _TorchExactKNN:
+    """Exact blocked L2 search on CUDA, retaining only top-k per query."""
+
+    def __init__(self, embedding, torch, device):
+        self._torch = torch
+        self._device = torch.device(device)
+        self._n_samples = len(embedding)
+        self._vectors = torch.from_numpy(
+            np.ascontiguousarray(embedding, dtype=np.float32)
+        ).to(self._device)
+        self._norms = (self._vectors * self._vectors).sum(dim=1)
+        if self._device.type == "cuda":
+            torch.cuda.synchronize(self._device)
+            device_name = torch.cuda.get_device_name(self._device)
+            self._fit_method = (
+                f"torch_cuda_exact(device={self._device.index}, {device_name}, "
+                "float32, tf32=False, exhaustive)"
+            )
+        else:
+            self._fit_method = "torch_cpu_exact(float32, exhaustive)"
+
+    def kneighbors(self, queries, n_neighbors, return_distance=True):
+        if n_neighbors > self._n_samples:
+            raise ValueError("n_neighbors exceeds fitted population")
+
+        torch = self._torch
+        query_array = np.ascontiguousarray(queries, dtype=np.float32)
+        result_distances = np.empty(
+            (len(query_array), n_neighbors), dtype=np.float32
+        )
+        result_neighbors = np.empty(
+            (len(query_array), n_neighbors), dtype=np.int64
+        )
+
+        cuda_matmul = getattr(torch.backends.cuda, "matmul", None)
+        previous_tf32 = None
+        if self._device.type == "cuda" and cuda_matmul is not None:
+            previous_tf32 = cuda_matmul.allow_tf32
+            cuda_matmul.allow_tf32 = False
+
+        try:
+            with torch.inference_mode():
+                for query_start in range(0, len(query_array), TORCH_GPU_QUERY_BLOCK):
+                    query_end = min(
+                        query_start + TORCH_GPU_QUERY_BLOCK, len(query_array)
+                    )
+                    query_tensor = torch.from_numpy(
+                        query_array[query_start:query_end]
+                    ).to(self._device)
+                    query_norms = (query_tensor * query_tensor).sum(
+                        dim=1, keepdim=True
+                    )
+                    query_count = len(query_tensor)
+                    best_distances = torch.full(
+                        (query_count, n_neighbors),
+                        float("inf"),
+                        dtype=torch.float32,
+                        device=self._device,
+                    )
+                    best_neighbors = torch.full(
+                        (query_count, n_neighbors),
+                        -1,
+                        dtype=torch.int64,
+                        device=self._device,
+                    )
+
+                    for reference_start in range(
+                            0, self._n_samples, TORCH_GPU_REFERENCE_BLOCK):
+                        reference_end = min(
+                            reference_start + TORCH_GPU_REFERENCE_BLOCK,
+                            self._n_samples,
+                        )
+                        references = self._vectors[reference_start:reference_end]
+                        squared_distances = (
+                            query_norms
+                            + self._norms[reference_start:reference_end].unsqueeze(0)
+                        )
+                        squared_distances.addmm_(
+                            query_tensor, references.T, beta=1.0, alpha=-2.0
+                        )
+                        squared_distances.clamp_min_(0.0)
+
+                        block_k = min(n_neighbors, reference_end - reference_start)
+                        block_distances, block_neighbors = torch.topk(
+                            squared_distances,
+                            block_k,
+                            dim=1,
+                            largest=False,
+                            sorted=True,
+                        )
+                        block_neighbors += reference_start
+                        merged_distances = torch.cat(
+                            (best_distances, block_distances), dim=1
+                        )
+                        merged_neighbors = torch.cat(
+                            (best_neighbors, block_neighbors), dim=1
+                        )
+                        best_distances, selection = torch.topk(
+                            merged_distances,
+                            n_neighbors,
+                            dim=1,
+                            largest=False,
+                            sorted=True,
+                        )
+                        best_neighbors = torch.gather(
+                            merged_neighbors, dim=1, index=selection
+                        )
+
+                    best_distances.sqrt_()
+                    result_distances[query_start:query_end] = (
+                        best_distances.cpu().numpy()
+                    )
+                    result_neighbors[query_start:query_end] = (
+                        best_neighbors.cpu().numpy()
+                    )
+        finally:
+            if previous_tf32 is not None:
+                cuda_matmul.allow_tf32 = previous_tf32
+
+        if return_distance:
+            return result_distances, result_neighbors
+        return result_neighbors
+
+
+def _make_exact_knn_index(embedding, query_neighbors):
+    """Select the fastest available exhaustive float32 L2 backend."""
+    requested = KNN_BACKEND
+    faiss, faiss_error = _optional_import("faiss")
+
+    if requested in {"auto", "faiss_gpu"}:
+        gpu_ready = (
+            faiss is not None
+            and hasattr(faiss, "StandardGpuResources")
+            and hasattr(faiss, "index_cpu_to_gpu")
+            and hasattr(faiss, "get_num_gpus")
+            and faiss.get_num_gpus() > GPU_DEVICE
+        )
+        if gpu_ready:
+            try:
+                return _FaissExactKNN(
+                    embedding, faiss, use_gpu=True, gpu_device=GPU_DEVICE
+                )
+            except Exception as exc:
+                if requested == "faiss_gpu":
+                    raise
+                print(
+                    f"  ⚠ [Exact kNN] FAISS GPU initialization failed: {exc}",
+                    flush=True,
+                )
+        elif requested == "faiss_gpu":
+            detail = faiss_error or "FAISS GPU bindings/device not available"
+            raise SystemExit(f"KNN_BACKEND='faiss_gpu' 사용 불가: {detail}")
+
+    if requested in {"auto", "torch_gpu"}:
+        torch, torch_error = _optional_import("torch")
+        gpu_ready = (
+            torch is not None
+            and torch.cuda.is_available()
+            and torch.cuda.device_count() > GPU_DEVICE
+        )
+        if gpu_ready:
+            try:
+                return _TorchExactKNN(
+                    embedding, torch, device=f"cuda:{GPU_DEVICE}"
+                )
+            except Exception as exc:
+                if requested == "torch_gpu":
+                    raise
+                print(
+                    f"  ⚠ [Exact kNN] PyTorch CUDA initialization failed: {exc}",
+                    flush=True,
+                )
+        elif requested == "torch_gpu":
+            detail = torch_error or "CUDA device not available to PyTorch"
+            raise SystemExit(f"KNN_BACKEND='torch_gpu' 사용 불가: {detail}")
+
+    if requested in {"auto", "faiss_cpu"} and faiss is not None:
+        try:
+            return _FaissExactKNN(embedding, faiss, use_gpu=False)
+        except Exception as exc:
+            if requested == "faiss_cpu":
+                raise
+            print(
+                f"  ⚠ [Exact kNN] FAISS CPU initialization failed: {exc}",
+                flush=True,
+            )
+    elif requested == "faiss_cpu":
+        raise SystemExit(f"KNN_BACKEND='faiss_cpu' 사용 불가: {faiss_error}")
+
+    try:
+        from sklearn.neighbors import NearestNeighbors
+    except ImportError as exc:
+        raise SystemExit("exact kNN backend 필요: torch, faiss 또는 scikit-learn") from exc
+    knn = NearestNeighbors(
+        n_neighbors=query_neighbors, metric="euclidean", n_jobs=-1
+    )
+    knn.fit(embedding)
+    return knn
+
+
 def build_knn_graph(embedding):
     """Build an undirected sparse union/mutual kNN graph in bounded query RAM."""
     try:
         from scipy.sparse import csr_matrix
-        from sklearn.neighbors import NearestNeighbors
     except ImportError as exc:
-        raise SystemExit("SciPy/scikit-learn 필요: pip install scipy scikit-learn") from exc
+        raise SystemExit("SciPy 필요: pip install scipy") from exc
 
     n = len(embedding)
     dim = embedding.shape[1]
@@ -255,9 +527,8 @@ def build_knn_graph(embedding):
             "the dominant bottleneck",
             flush=True,
         )
-    knn = NearestNeighbors(n_neighbors=query_neighbors, metric="euclidean", n_jobs=-1)
     fit_started = time.time()
-    knn.fit(embedding)
+    knn = _make_exact_knn_index(embedding, query_neighbors)
     print(
         f"  [Exact kNN] fit DONE method={getattr(knn, '_fit_method', 'unknown')}, "
         f"elapsed={time.time() - fit_started:.1f}s",
@@ -524,6 +795,11 @@ def main():
     print(f"k={K_NEIGHBORS}, resolution={LEIDEN_RESOLUTION}, "
           f"edge={EDGE_WEIGHT_MODE}, mutual={MUTUAL_KNN}, seed={RANDOM_SEED}",
           flush=True)
+    print(
+        f"kNN backend={KNN_BACKEND}, gpu_device={GPU_DEVICE}, "
+        f"torch_gpu_tiles={TORCH_GPU_QUERY_BLOCK:,}x{TORCH_GPU_REFERENCE_BLOCK:,}",
+        flush=True,
+    )
 
     scalers = fit_block_scalers(features, rows)
     topology_labels = np.full(len(rows), -1, dtype=np.int32)
