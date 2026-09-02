@@ -13,6 +13,7 @@ Representative sampling intentionally remains a later pipeline stage.
 """
 
 import csv
+import gc
 import os
 import time
 
@@ -35,7 +36,7 @@ RANDOM_SEED = 42
 
 # Bounds peak RAM without changing the exact sklearn kNN result.
 NORMALIZE_BLOCK = 250_000
-KNN_QUERY_BLOCK = 50_000
+KNN_QUERY_BLOCK = 10_000
 
 DIAGNOSTIC_ANCHORS = 5
 DIAGNOSTIC_NEIGHBORS = 5
@@ -168,7 +169,8 @@ def fit_block_scalers(features, rows):
         raise SystemExit("scikit-learn 필요: pip install scikit-learn") from exc
 
     scalers = {}
-    print("\n[Normalization] Stage-1 전체 population 기준 block별 StandardScaler")
+    print("\n[Normalization] Stage-1 전체 population 기준 block별 StandardScaler",
+          flush=True)
     for name in FEATURE_BLOCKS:
         scaler = StandardScaler()
         for start in range(0, len(rows), NORMALIZE_BLOCK):
@@ -178,16 +180,24 @@ def fit_block_scalers(features, rows):
                 raise ValueError(f"{name} block에 NaN/Inf가 있음 (rows {start}:{start + len(values)})")
             scaler.partial_fit(values)
         scalers[name] = scaler
-        print(f"  {name:<4} dim={features[name].shape[1]}")
+        print(f"  {name:<4} dim={features[name].shape[1]}", flush=True)
     return scalers
 
 
 def make_normalized_embedding(features, scalers, global_rows, dims):
     """Materialize one coarse group's block-normalized full embedding."""
+    started = time.time()
     total_dim = sum(dims.values())
-    result = np.empty((len(global_rows), total_dim), dtype=np.float32)
-    for start in range(0, len(global_rows), NORMALIZE_BLOCK):
-        end = min(start + NORMALIZE_BLOCK, len(global_rows))
+    total_rows = len(global_rows)
+    embedding_mib = total_rows * total_dim * np.dtype(np.float32).itemsize / (1024 ** 2)
+    print(
+        f"  [Embedding] START rows={total_rows:,}, total_dim={total_dim:,}, "
+        f"estimated_memory={embedding_mib:,.1f} MiB",
+        flush=True,
+    )
+    result = np.empty((total_rows, total_dim), dtype=np.float32)
+    for start in range(0, total_rows, NORMALIZE_BLOCK):
+        end = min(start + NORMALIZE_BLOCK, total_rows)
         parts = []
         for name in FEATURE_BLOCKS:
             values = _take_feature_rows(features[name], global_rows[start:end])
@@ -196,6 +206,12 @@ def make_normalized_embedding(features, scalers, global_rows, dims):
             values *= np.sqrt(BLOCK_WEIGHTS[name] / dims[name])
             parts.append(values)
         result[start:end] = np.concatenate(parts, axis=1)
+        print(
+            f"  [Embedding] {end:,}/{total_rows:,} "
+            f"({end / total_rows:.1%}), elapsed={time.time() - started:.1f}s",
+            flush=True,
+        )
+    print(f"  [Embedding] DONE elapsed={time.time() - started:.1f}s", flush=True)
     return result
 
 
@@ -218,13 +234,35 @@ def build_knn_graph(embedding):
         raise SystemExit("SciPy/scikit-learn 필요: pip install scipy scikit-learn") from exc
 
     n = len(embedding)
+    dim = embedding.shape[1]
     if n <= 1:
+        print(f"  [Exact kNN] START rows={n:,}, dim={dim:,}, k=0", flush=True)
+        print(f"  [Exact kNN] rough distance candidates (N^2)={n * n:,}", flush=True)
+        print("  [Exact kNN] DONE (skipped: fewer than 2 rows)", flush=True)
         return csr_matrix((n, n), dtype=np.float32), None, 0
 
     k = min(K_NEIGHBORS, n - 1)
     query_neighbors = min(n, k + 1)
+    distance_candidates = n * n
+    print(f"  [Exact kNN] START rows={n:,}, dim={dim:,}, k={k}", flush=True)
+    print(
+        f"  [Exact kNN] rough distance candidates (N^2)={distance_candidates:,}",
+        flush=True,
+    )
+    if distance_candidates >= 1_000_000_000:
+        print(
+            "  ⚠ [Exact kNN] N^2 candidates >= 1e9; exact neighbor search may be "
+            "the dominant bottleneck",
+            flush=True,
+        )
     knn = NearestNeighbors(n_neighbors=query_neighbors, metric="euclidean", n_jobs=-1)
+    fit_started = time.time()
     knn.fit(embedding)
+    print(
+        f"  [Exact kNN] fit DONE method={getattr(knn, '_fit_method', 'unknown')}, "
+        f"elapsed={time.time() - fit_started:.1f}s",
+        flush=True,
+    )
 
     capacity = n * k
     src = np.empty(capacity, dtype=np.int32)
@@ -232,9 +270,12 @@ def build_knn_graph(embedding):
     distance = np.empty(capacity, dtype=np.float32)
     local_scale = np.zeros(n, dtype=np.float32)
     cursor = 0
+    query_started = time.time()
 
     for start in range(0, n, KNN_QUERY_BLOCK):
         end = min(start + KNN_QUERY_BLOCK, n)
+        block_started = time.time()
+        print(f"  [Exact kNN] QUERY START {start:,}:{end:,} / {n:,}", flush=True)
         query_ids = np.arange(start, end, dtype=np.int32)
         dist_block, neighbor_block = knn.kneighbors(
             embedding[start:end], n_neighbors=query_neighbors, return_distance=True
@@ -248,36 +289,80 @@ def build_knn_graph(embedding):
         distance[cursor:cursor + count] = distance_block
         np.maximum.at(local_scale, src_block, distance_block)
         cursor += count
+        total_elapsed = time.time() - query_started
+        completed_rows = end
+        average_rows_per_sec = (
+            completed_rows / total_elapsed if total_elapsed > 0 else float("inf")
+        )
+        print(
+            f"  [Exact kNN] QUERY DONE {end:,}/{n:,}, {end / n:.1%}, "
+            f"block_elapsed={time.time() - block_started:.1f}s, "
+            f"total_elapsed={total_elapsed:.1f}s, "
+            f"average_rows/sec={average_rows_per_sec:,.1f}",
+            flush=True,
+        )
 
     src, dst, distance = src[:cursor], dst[:cursor], distance[:cursor]
     positive = local_scale[local_scale > 0]
     fallback = float(np.median(positive)) if len(positive) else 1.0
     local_scale[local_scale <= 0] = fallback
+    graph_started = time.time()
+    print("  [Graph assembly] edge weighting START", flush=True)
     weights = edge_weights(EDGE_WEIGHT_MODE, distance, src, dst, local_scale)
+    print(
+        f"  [Graph assembly] edge weighting DONE elapsed={time.time() - graph_started:.1f}s",
+        flush=True,
+    )
 
+    csr_started = time.time()
     directed = csr_matrix((weights, (src, dst)), shape=(n, n), dtype=np.float32)
     del src, dst, distance, weights, local_scale
     directed.sum_duplicates()
+    print(
+        f"  [Graph assembly] CSR creation DONE elapsed={time.time() - csr_started:.1f}s",
+        flush=True,
+    )
+    symmetrize_started = time.time()
     adjacency = directed.minimum(directed.T) if MUTUAL_KNN else directed.maximum(directed.T)
     del directed
     adjacency.setdiag(0)
     adjacency.eliminate_zeros()
+    print(
+        f"  [Graph assembly] symmetrization DONE "
+        f"elapsed={time.time() - symmetrize_started:.1f}s, "
+        f"total_assembly_elapsed={time.time() - graph_started:.1f}s",
+        flush=True,
+    )
+    print(f"  [Graph assembly] undirected edges={adjacency.nnz // 2:,}", flush=True)
     return adjacency.tocsr(), knn, k
 
 
 def run_leiden(adjacency):
     n = adjacency.shape[0]
     if n <= 1:
+        print(
+            f"  [Leiden] DONE (skipped: vertices={n:,}, edges=0)",
+            flush=True,
+        )
         return np.zeros(n, dtype=np.int32)
     if adjacency.nnz == 0:
-        print("  ⚠ kNN edge 없음: 각 pattern을 singleton community로 보존")
+        print("  ⚠ kNN edge 없음: 각 pattern을 singleton community로 보존", flush=True)
         return np.arange(n, dtype=np.int32)
 
     igraph = _import_or_exit("igraph", "python-igraph")
     leidenalg = _import_or_exit("leidenalg")
+    conversion_started = time.time()
+    print("  [Leiden] igraph conversion START", flush=True)
     graph = igraph.Graph.Weighted_Adjacency(
         adjacency, mode="undirected", attr="weight", loops=False
     )
+    print(
+        f"  [Leiden] igraph conversion DONE elapsed={time.time() - conversion_started:.1f}s, "
+        f"vertices={graph.vcount():,}, edges={graph.ecount():,}",
+        flush=True,
+    )
+    partition_started = time.time()
+    print("  [Leiden] partition START", flush=True)
     partition = leidenalg.find_partition(
         graph,
         leidenalg.RBConfigurationVertexPartition,
@@ -286,12 +371,21 @@ def run_leiden(adjacency):
         n_iterations=-1,
         seed=int(RANDOM_SEED),
     )
+    print(
+        f"  [Leiden] partition DONE elapsed={time.time() - partition_started:.1f}s",
+        flush=True,
+    )
     return renumber_communities(partition.membership)
 
 
 def nearest_neighbor_diagnostics(knn, embedding, local_labels, global_rows,
                                  keys, h0_label, rng):
+    started = time.time()
     if knn is None or len(embedding) <= 1 or DIAGNOSTIC_ANCHORS < 1:
+        print(
+            f"  [Diagnostics] DONE elapsed={time.time() - started:.1f}s (skipped)",
+            flush=True,
+        )
         return []
     anchors = rng.choice(
         len(embedding), min(DIAGNOSTIC_ANCHORS, len(embedding)), replace=False
@@ -316,6 +410,10 @@ def nearest_neighbor_diagnostics(knn, embedding, local_labels, global_rows,
                 "distance": float(distance),
                 "same_final_cluster": bool(local_labels[anchor] == local_labels[neighbor]),
             })
+    print(
+        f"  [Diagnostics] DONE elapsed={time.time() - started:.1f}s, rows={len(rows):,}",
+        flush=True,
+    )
     return rows
 
 
@@ -335,16 +433,18 @@ def _community_summary(h0_label, local_labels, total_count):
 
 def _print_group_diagnostics(h0_label, n, k, labels, edge_count):
     counts = np.unique(labels, return_counts=True)[1]
-    print(f"  Coarse group          : {coarse_group_name(h0_label)}")
-    print(f"  Number of patterns    : {n:,}")
-    print(f"  k / undirected edges  : {k} / {edge_count:,}")
-    print(f"  Leiden communities    : {len(counts):,}")
+    print(f"  Coarse group          : {coarse_group_name(h0_label)}", flush=True)
+    print(f"  Number of patterns    : {n:,}", flush=True)
+    print(f"  k / undirected edges  : {k} / {edge_count:,}", flush=True)
+    print(f"  Leiden communities    : {len(counts):,}", flush=True)
     print("  community size        : "
           f"min={counts.min():,}, median={np.median(counts):,.1f}, "
-          f"mean={counts.mean():,.1f}, max={counts.max():,}")
+          f"mean={counts.mean():,.1f}, max={counts.max():,}", flush=True)
 
 
 def write_outputs(keys, rows, h0_labels, topology_labels, summaries, diagnostics):
+    started = time.time()
+    print("\n[Output] writing START", flush=True)
     os.makedirs(OUT_DIR, exist_ok=True)
 
     assignment_path = os.path.join(OUT_DIR, "topology_assignments.csv")
@@ -353,11 +453,21 @@ def write_outputs(keys, rows, h0_labels, topology_labels, summaries, diagnostics
         writer = csv.writer(fp)
         writer.writerow(["pattern_key", "original_h0_label", "coarse_group",
                          "topology_cluster", "final_cluster"])
-        for row, h0_label, topology_label in zip(rows, h0_labels, topology_labels):
+        total_rows = len(rows)
+        assignment_started = time.time()
+        for written, (row, h0_label, topology_label) in enumerate(
+                zip(rows, h0_labels, topology_labels), start=1):
             writer.writerow([
                 str(keys[int(row)]), int(h0_label), coarse_group_name(h0_label),
                 int(topology_label), final_cluster_id(h0_label, topology_label),
             ])
+            if written % 250_000 == 0 or written == total_rows:
+                print(
+                    f"  [Output] topology_assignments.csv {written:,}/{total_rows:,} "
+                    f"({written / total_rows:.1%}), "
+                    f"elapsed={time.time() - assignment_started:.1f}s",
+                    flush=True,
+                )
     os.replace(assignment_tmp, assignment_path)
 
     summary_path = os.path.join(OUT_DIR, "topology_cluster_summary.csv")
@@ -386,9 +496,10 @@ def write_outputs(keys, rows, h0_labels, topology_labels, summaries, diagnostics
              topology_labels=topology_labels)
     os.replace(labels_tmp, labels_path)
 
-    print("\n[Saved]")
+    print("\n[Saved]", flush=True)
     for path in (assignment_path, summary_path, diagnostic_path, labels_path):
-        print(f"  {path}")
+        print(f"  {path}", flush=True)
+    print(f"[Output] writing DONE elapsed={time.time() - started:.1f}s", flush=True)
 
 
 def main():
@@ -402,24 +513,32 @@ def main():
     coarse_groups = dense_groups + ([-1] if (h0_labels < 0).any() else [])
     rare_count = int((h0_labels < 0).sum())
 
-    print("=" * 72)
-    print("Stage 2: hierarchical full-topology kNN + Leiden")
-    print("=" * 72)
-    print(f"Total patterns             : {len(rows):,}")
-    print(f"Number of H0 coarse groups : {len(dense_groups)}")
-    print(f"Rare/noise patterns        : {rare_count:,}")
-    print(f"Rare fraction              : {rare_count / len(rows):.2%}")
-    print(f"Feature dimensions         : {dims} (total={sum(dims.values())})")
+    print("=" * 72, flush=True)
+    print("Stage 2: hierarchical full-topology kNN + Leiden", flush=True)
+    print("=" * 72, flush=True)
+    print(f"Total patterns             : {len(rows):,}", flush=True)
+    print(f"Number of H0 coarse groups : {len(dense_groups)}", flush=True)
+    print(f"Rare/noise patterns        : {rare_count:,}", flush=True)
+    print(f"Rare fraction              : {rare_count / len(rows):.2%}", flush=True)
+    print(f"Feature dimensions         : {dims} (total={sum(dims.values())})", flush=True)
     print(f"k={K_NEIGHBORS}, resolution={LEIDEN_RESOLUTION}, "
-          f"edge={EDGE_WEIGHT_MODE}, mutual={MUTUAL_KNN}, seed={RANDOM_SEED}")
+          f"edge={EDGE_WEIGHT_MODE}, mutual={MUTUAL_KNN}, seed={RANDOM_SEED}",
+          flush=True)
 
     scalers = fit_block_scalers(features, rows)
     topology_labels = np.full(len(rows), -1, dtype=np.int32)
     summaries, diagnostics = [], []
 
-    for h0_label in coarse_groups:
-        print("\n" + "-" * 72)
+    total_groups = len(coarse_groups)
+    for group_index, h0_label in enumerate(coarse_groups, start=1):
+        group_started = time.time()
         positions = np.where(h0_labels == h0_label)[0]
+        print("\n" + "-" * 72, flush=True)
+        print(
+            f"[Group {group_index}/{total_groups}] START "
+            f"coarse_group={coarse_group_name(h0_label)}, patterns={len(positions):,}",
+            flush=True,
+        )
         global_rows = rows[positions]
         embedding = make_normalized_embedding(features, scalers, global_rows, dims)
         adjacency, knn, k = build_knn_graph(embedding)
@@ -434,21 +553,28 @@ def main():
             knn, embedding, local_labels, global_rows, keys, h0_label, rng
         ))
         del embedding, adjacency, knn, local_labels
+        gc.collect()
+        print(
+            f"[Group {group_index}/{total_groups}] DONE "
+            f"coarse_group={coarse_group_name(h0_label)}, "
+            f"elapsed={time.time() - group_started:.1f}s",
+            flush=True,
+        )
 
     if (topology_labels < 0).any():
         raise RuntimeError("일부 pattern에 Stage-2 community가 배정되지 않음")
 
     sizes = np.asarray([row["pattern_count"] for row in summaries])
     rare_communities = sum(row["h0_label"] < 0 for row in summaries)
-    print("\n" + "=" * 72)
-    print(f"Total final communities    : {len(summaries):,}")
-    print(f"Largest final community    : {sizes.max():,}")
-    print(f"Smallest final community   : {sizes.min():,}")
-    print(f"Rare-group community count : {rare_communities:,}")
-    print("=" * 72)
+    print("\n" + "=" * 72, flush=True)
+    print(f"Total final communities    : {len(summaries):,}", flush=True)
+    print(f"Largest final community    : {sizes.max():,}", flush=True)
+    print(f"Smallest final community   : {sizes.min():,}", flush=True)
+    print(f"Rare-group community count : {rare_communities:,}", flush=True)
+    print("=" * 72, flush=True)
 
     write_outputs(keys, rows, h0_labels, topology_labels, summaries, diagnostics)
-    print(f"완료: {time.time() - started:.1f}s")
+    print(f"완료: {time.time() - started:.1f}s", flush=True)
 
 
 if __name__ == "__main__":
