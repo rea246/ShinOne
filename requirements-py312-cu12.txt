@@ -1,0 +1,29 @@
+# ShinOne runtime for Linux, CPython 3.12, and CUDA 12.
+#
+# Keep the RAPIDS packages on the same calendar release.  RAPIDS 26.08 is the
+# current Python 3.12-compatible target used by the Stage-2 cuGraph backend.
+
+# Core numerical/data stack
+numpy
+scipy
+pandas
+scikit-learn>=1.3
+
+# Analysis and plotting
+matplotlib
+seaborn
+
+# Geometry preprocessing and GNN training/inference
+klayout
+torch
+torch-geometric
+hdbscan
+
+# CUDA 12 topology clustering
+cupy-cuda12x>=14,<15
+cudf-cu12==26.8.*
+cugraph-cu12==26.8.*
+
+# Explicit CPU validation/fallback backend for Stage 2
+python-igraph
+leidenalg

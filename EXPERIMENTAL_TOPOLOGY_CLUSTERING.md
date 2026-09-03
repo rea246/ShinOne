@@ -332,6 +332,23 @@ Stage-2는 GPU에서도 full-population exact search를 유지하므로 계산 �
 
 ## 14. Execution
 
+Python 3.12 / CUDA 12 venv의 전체 프로젝트 dependency는 한 번에 설치할 수 있다.
+인자 없이 실행하면 현재 설정된 사내 pip index를 사용한다. wheel을 반입한
+환경에서는 모든 transitive dependency wheel을 같은 디렉터리에 둔 뒤 그 경로를
+인자로 전달한다. 설치 스크립트는 source build를 허용하지 않으므로 호환 wheel이
+없을 때 `metadata-generation-failed` 대신 누락 package를 바로 확인할 수 있다.
+
+```bash
+# 사내 pip index 사용
+./install-py312-cu12.sh
+
+# 완전 offline wheel directory 사용
+./install-py312-cu12.sh /path/to/wheels
+```
+
+패키지 목록은 `requirements-py312-cu12.txt`에서 관리한다. 설치 후 스크립트가
+모든 직접 import, PyTorch CUDA, CuPy GPU device를 검증한다.
+
 ```bash
 python 4.h0_clustering.py
 python 6.topology_clustering.py
