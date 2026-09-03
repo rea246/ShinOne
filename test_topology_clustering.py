@@ -72,6 +72,88 @@ class TopologyClusteringTest(unittest.TestCase):
         self.assertEqual(topology.final_cluster_id(3, 2), "H0_3_T2")
         self.assertEqual(topology.final_cluster_id(-1, 2), "RARE_T2")
 
+    def test_cugraph_labels_restore_vertex_order_and_isolates(self):
+        labels = topology._labels_from_vertex_partitions(
+            vertices=np.array([3, 0, 1]),
+            partitions=np.array([8, 4, 4]),
+            total_vertices=4,
+        )
+        np.testing.assert_array_equal(labels, [0, 0, 2, 1])
+
+    def test_cugraph_adapter_passes_symmetric_csr_and_restores_labels(self):
+        from scipy.sparse import csr_matrix
+
+        adjacency = csr_matrix(
+            np.array([
+                [0.0, 1.0, 0.0, 0.0],
+                [1.0, 0.0, 2.0, 0.0],
+                [0.0, 2.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0],
+            ], dtype=np.float32)
+        )
+
+        class FakeSeries:
+            def __init__(self, values):
+                self.values = np.asarray(values)
+
+            def to_numpy(self):
+                return self.values
+
+        class FakeCudf:
+            Series = FakeSeries
+
+        class FakeDevice:
+            def __init__(self, index):
+                self.index = index
+
+            def use(self):
+                self.used = True
+
+        class FakeStream:
+            def synchronize(self):
+                return None
+
+        class FakeCuda:
+            Device = FakeDevice
+
+            @staticmethod
+            def get_current_stream():
+                return FakeStream()
+
+        class FakeCupy:
+            cuda = FakeCuda()
+
+        class FakeGraph:
+            def __init__(self, directed):
+                self.directed = directed
+
+            def from_cudf_adjlist(
+                self, offsets, indices, weights, renumber, symmetrize
+            ):
+                np.testing.assert_array_equal(offsets.values, [0, 1, 3, 4, 4])
+                np.testing.assert_array_equal(indices.values, [1, 0, 2, 1])
+                np.testing.assert_allclose(weights.values, [1.0, 1.0, 2.0, 2.0])
+                self.options = (renumber, symmetrize)
+
+        class FakeCugraph:
+            Graph = FakeGraph
+
+            @staticmethod
+            def leiden(graph, max_iter, resolution, random_state):
+                assert graph.options == (False, False)
+                assert max_iter == topology.CUGRAPH_MAX_ITERATIONS
+                assert resolution == topology.LEIDEN_RESOLUTION
+                assert random_state == topology.RANDOM_SEED
+                return {
+                    "vertex": FakeSeries([2, 0, 1, 3]),
+                    "partition": FakeSeries([5, 5, 5, 9]),
+                }, 0.75
+
+        labels = topology._run_cugraph_leiden(
+            adjacency, FakeCugraph(), FakeCudf(), FakeCupy()
+        )
+        np.testing.assert_array_equal(labels, [0, 0, 0, 1])
+
     def test_community_summary_measures_normalized_space_dispersion(self):
         labels = np.array([0, 0, 1], dtype=np.int32)
         embedding = np.array([[0.0], [2.0], [10.0]], dtype=np.float32)

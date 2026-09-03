@@ -118,7 +118,7 @@ w_{ij}=\exp\left(-\frac{d(i,j)^2}{s_i s_j}\right).
 
 ### 6.3 Leiden partition
 
-각 sparse kNN graph에 weighted Leiden community detection을 적용한다. 구현은 resolution parameter를 갖는 `RBConfigurationVertexPartition`을 사용하며, 수렴할 때까지 iteration하고 random seed를 고정한다.
+각 sparse kNN graph에 weighted Leiden community detection을 적용한다. 기본 backend는 A100을 사용하는 RAPIDS cuGraph이며, 대칭 CSR의 vertex, edge, weight를 그대로 GPU graph로 전달한다. `resolution=1.0`에서는 기존 `RBConfigurationVertexPartition`과 동일한 modularity objective를 최적화한다. cuGraph iteration은 최대 100회로 제한하고 random seed를 고정한다. CPU `leidenalg`은 명시적으로 선택할 수 있는 검증용 backend로만 남기며 2회 iteration으로 제한한다.
 
 동일한 Stage-1 group 내부의 Leiden community는 크기 내림차순으로 재번호하여 label permutation을 제거한다. 최종 cluster ID는 다음 규칙을 따른다.
 
@@ -133,6 +133,8 @@ rare : RARE_T<topology_label>
 |---|---:|---|
 | `K_NEIGHBORS` | 20 | local topology graph degree |
 | `LEIDEN_RESOLUTION` | 1.0 | community granularity |
+| `LEIDEN_BACKEND` | `cugraph` | A100 weighted Leiden |
+| `CUGRAPH_MAX_ITERATIONS` | 100 | bounded GPU Leiden levels/iterations |
 | `EDGE_WEIGHT_MODE` | `local_gaussian` | distance-to-similarity mapping |
 | `MUTUAL_KNN` | `False` | union-kNN baseline |
 | `RANDOM_SEED` | 42 | reproducibility |
@@ -315,13 +317,14 @@ P95와 P99는 low-density structural direction의 coverage를 평가하는 핵�
 - Feature extraction in `4.h0_clustering.py`: CUDA가 있으면 GPU 사용
 - HDBSCAN and Stage-1 KNN assignment: `n_jobs=-1` 또는 `core_dist_n_jobs=-1`로 multi-CPU 사용
 - Stage-2 exact kNN: `auto`에서 FAISS GPU → PyTorch CUDA → FAISS CPU(OpenMP) → scikit-learn multi-CPU 순으로 사용
+- Stage-2 Leiden: symmetric weighted CSR을 RAPIDS cuGraph로 전송하여 A100에서 수행
 - Stage-3 farthest-point selection: PyTorch CUDA가 있으면 GPU, 아니면 NumPy CPU 사용
 - Scaling과 kNN query는 block processing으로 peak working memory를 제한
 - Sparse adjacency는 \(O(Nk)\) storage 사용
 
 ### 13.2 Current limitations
 
-Stage-2는 GPU에서도 full-population exact search를 유지하므로 계산 복잡도 자체는 \(O(N^2)\)이다. FAISS GPU가 없더라도 기존 PyTorch CUDA를 이용한 blocked matrix search가 A100 등 CUDA device를 사용한다. Leiden은 native CPU implementation을 사용하며 coarse group은 memory peak를 제한하기 위해 순차 처리한다.
+Stage-2는 GPU에서도 full-population exact search를 유지하므로 계산 복잡도 자체는 \(O(N^2)\)이다. FAISS GPU가 없더라도 기존 PyTorch CUDA를 이용한 blocked matrix search가 A100 등 CUDA device를 사용한다. Leiden도 cuGraph를 통해 같은 A100을 사용하며 coarse group은 memory peak를 제한하기 위해 순차 처리한다. GPU와 CPU Leiden 구현은 같은 objective를 사용하더라도 최적화 순서와 부동소수점 차이로 community assignment가 bit-identical하지 않을 수 있다.
 
 ### 13.3 Planned acceleration path
 
@@ -335,11 +338,11 @@ python 6.topology_clustering.py
 python 7.select_representatives.py
 ```
 
-Stage 2의 필수 추가 dependency는 `python-igraph`와 `leidenalg`이다. 기존 pipeline dependency인 NumPy, SciPy, scikit-learn, PyTorch도 필요하다. CUDA 지원 FAISS가 설치되어 있으면 가장 먼저 사용하며, 없으면 PyTorch CUDA exact backend가 GPU를 사용한다.
+Stage 2의 기본 Leiden backend에는 CUDA 버전과 호환되는 RAPIDS `cugraph`, `cudf`, `cupy`가 필요하다. RAPIDS 설치는 환경의 Python/CUDA 조합에 맞는 공식 release selector를 사용한다. 기존 pipeline dependency인 NumPy, SciPy, scikit-learn, PyTorch도 필요하다. CUDA 지원 FAISS가 설치되어 있으면 exact kNN에 가장 먼저 사용하며, 없으면 PyTorch CUDA exact backend가 GPU를 사용한다.
 
-```bash
-pip install python-igraph leidenalg
-```
+<https://docs.rapids.ai/install/>
+
+CPU 검증 backend를 명시적으로 사용할 때만 `python-igraph`와 `leidenalg`가 필요하다.
 
 ## 15. Scope and limitations
 

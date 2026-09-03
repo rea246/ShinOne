@@ -5,8 +5,8 @@ Reads the full Stage-1 H0 labels and the cached hierarchical GNN blocks, then
 runs an independent kNN + Leiden partition inside every dense H0 group and the
 preserved HDBSCAN noise/rare group.
 
-Required in the research environment:
-    pip install python-igraph leidenalg
+Required for the default GPU Leiden backend:
+    RAPIDS cuGraph, cuDF, and CuPy matching the installed CUDA version
 
 Existing pipeline dependencies (numpy, scipy, scikit-learn, torch) are reused.
 FAISS GPU is used for exact kNN when available; otherwise an exact PyTorch CUDA
@@ -33,6 +33,9 @@ OUT_DIR = os.path.join(_here, "topology_clustering_out")
 
 K_NEIGHBORS = 20
 LEIDEN_RESOLUTION = 1.0
+LEIDEN_BACKEND = "cugraph"  # cugraph | leidenalg
+CUGRAPH_MAX_ITERATIONS = 100
+CPU_LEIDEN_ITERATIONS = 2
 EDGE_WEIGHT_MODE = "local_gaussian"  # local_gaussian | inverse_distance | binary
 MUTUAL_KNN = False
 RANDOM_SEED = 42
@@ -128,6 +131,10 @@ def _validate_config():
         raise ValueError("K_NEIGHBORS must be >= 1")
     if LEIDEN_RESOLUTION <= 0:
         raise ValueError("LEIDEN_RESOLUTION must be > 0")
+    if LEIDEN_BACKEND not in {"cugraph", "leidenalg"}:
+        raise ValueError("LEIDEN_BACKEND must be cugraph or leidenalg")
+    if CUGRAPH_MAX_ITERATIONS < 1 or CPU_LEIDEN_ITERATIONS < 1:
+        raise ValueError("Leiden iteration limits must be >= 1")
     if NORMALIZE_BLOCK < 1 or KNN_QUERY_BLOCK < 1:
         raise ValueError("block sizes must be >= 1")
     valid_backends = {"auto", "faiss_gpu", "torch_gpu", "faiss_cpu", "sklearn"}
@@ -624,6 +631,177 @@ def build_knn_graph(embedding):
     return adjacency.tocsr(), knn, k
 
 
+def _run_leidenalg_cpu(adjacency):
+    """Bounded CPU implementation retained for explicit fallback/validation."""
+    igraph = _import_or_exit("igraph", "python-igraph")
+    leidenalg = _import_or_exit("leidenalg")
+    conversion_started = time.time()
+    print("  [Leiden][CPU] igraph conversion START", flush=True)
+    graph = igraph.Graph.Weighted_Adjacency(
+        adjacency, mode="undirected", attr="weight", loops=False
+    )
+    print(
+        f"  [Leiden][CPU] igraph conversion DONE "
+        f"elapsed={time.time() - conversion_started:.1f}s, "
+        f"vertices={graph.vcount():,}, edges={graph.ecount():,}",
+        flush=True,
+    )
+    partition_started = time.time()
+    print(
+        f"  [Leiden][CPU] partition START iterations={CPU_LEIDEN_ITERATIONS}",
+        flush=True,
+    )
+    partition = leidenalg.find_partition(
+        graph,
+        leidenalg.RBConfigurationVertexPartition,
+        weights="weight",
+        resolution_parameter=float(LEIDEN_RESOLUTION),
+        n_iterations=int(CPU_LEIDEN_ITERATIONS),
+        seed=int(RANDOM_SEED),
+    )
+    print(
+        f"  [Leiden][CPU] partition DONE "
+        f"elapsed={time.time() - partition_started:.1f}s",
+        flush=True,
+    )
+    return renumber_communities(partition.membership)
+
+
+def _require_cugraph_stack():
+    modules = {}
+    failures = []
+    for module_name in ("cugraph", "cudf", "cupy"):
+        module, error = _optional_import(module_name)
+        if module is None:
+            failures.append(f"{module_name}: {error}")
+        else:
+            modules[module_name] = module
+    if failures:
+        raise SystemExit(
+            "LEIDEN_BACKEND='cugraph'에 RAPIDS cuGraph/cuDF/CuPy가 필요합니다. "
+            "CUDA 버전에 맞춰 설치하세요 (https://docs.rapids.ai/install/). "
+            + "; ".join(failures)
+        )
+
+    cupy = modules["cupy"]
+    try:
+        device_count = int(cupy.cuda.runtime.getDeviceCount())
+    except Exception as exc:
+        raise SystemExit(f"cuGraph CUDA device 확인 실패: {exc}") from exc
+    if device_count <= GPU_DEVICE:
+        raise SystemExit(
+            f"LEIDEN_BACKEND='cugraph': GPU_DEVICE={GPU_DEVICE} 사용 불가 "
+            f"(CUDA devices={device_count})"
+        )
+    return modules["cugraph"], modules["cudf"], cupy
+
+
+def _cudf_series_to_numpy(series, cupy):
+    if hasattr(series, "to_cupy"):
+        return np.asarray(cupy.asnumpy(series.to_cupy()))
+    return np.asarray(series.to_numpy())
+
+
+def _labels_from_vertex_partitions(vertices, partitions, total_vertices):
+    """Restore cuGraph's vertex-labelled result, preserving any isolates."""
+    vertices = np.asarray(vertices, dtype=np.int64)
+    partitions = np.asarray(partitions, dtype=np.int64)
+    if vertices.ndim != 1 or partitions.ndim != 1:
+        raise ValueError("cuGraph vertex/partition output must be 1D")
+    if len(vertices) != len(partitions):
+        raise ValueError("cuGraph vertex/partition lengths differ")
+    if len(vertices) and (
+        vertices.min() < 0 or vertices.max() >= total_vertices
+    ):
+        raise ValueError("cuGraph returned an out-of-range vertex ID")
+    if len(np.unique(vertices)) != len(vertices):
+        raise ValueError("cuGraph returned duplicate vertex IDs")
+    if len(partitions) and (partitions < 0).any():
+        raise ValueError("cuGraph returned a negative partition ID")
+
+    labels = np.full(total_vertices, -1, dtype=np.int64)
+    labels[vertices] = partitions
+    isolates = np.flatnonzero(labels < 0)
+    if len(isolates):
+        next_partition = int(partitions.max()) + 1 if len(partitions) else 0
+        labels[isolates] = np.arange(
+            next_partition, next_partition + len(isolates), dtype=np.int64
+        )
+    return renumber_communities(labels)
+
+
+def _run_cugraph_leiden(adjacency, cugraph, cudf, cupy):
+    """Run weighted undirected Leiden directly from the symmetric CSR on GPU."""
+    total_vertices = adjacency.shape[0]
+    if (
+        total_vertices > np.iinfo(np.int32).max
+        or adjacency.nnz > np.iinfo(np.int32).max
+    ):
+        graph_index_dtype = np.int64
+    else:
+        graph_index_dtype = np.int32
+
+    cupy.cuda.Device(GPU_DEVICE).use()
+    conversion_started = time.time()
+    print(
+        f"  [Leiden][cuGraph] CSR transfer START device={GPU_DEVICE}, "
+        f"vertices={total_vertices:,}, undirected_edges={adjacency.nnz // 2:,}",
+        flush=True,
+    )
+    offsets = cudf.Series(
+        np.asarray(adjacency.indptr, dtype=graph_index_dtype)
+    )
+    indices = cudf.Series(
+        np.asarray(adjacency.indices, dtype=graph_index_dtype)
+    )
+    weights = cudf.Series(np.asarray(adjacency.data, dtype=np.float32))
+    graph = cugraph.Graph(directed=False)
+    graph.from_cudf_adjlist(
+        offsets,
+        indices,
+        weights,
+        renumber=False,
+        symmetrize=False,
+    )
+    cupy.cuda.get_current_stream().synchronize()
+    print(
+        f"  [Leiden][cuGraph] CSR transfer DONE "
+        f"elapsed={time.time() - conversion_started:.1f}s",
+        flush=True,
+    )
+    del offsets, indices, weights
+
+    partition_started = time.time()
+    print(
+        f"  [Leiden][cuGraph] partition START max_iter={CUGRAPH_MAX_ITERATIONS}, "
+        f"resolution={LEIDEN_RESOLUTION}, seed={RANDOM_SEED}, "
+        f"version={getattr(cugraph, '__version__', 'unknown')}",
+        flush=True,
+    )
+    parts, modularity_score = cugraph.leiden(
+        graph,
+        max_iter=int(CUGRAPH_MAX_ITERATIONS),
+        resolution=float(LEIDEN_RESOLUTION),
+        random_state=int(RANDOM_SEED),
+    )
+    cupy.cuda.get_current_stream().synchronize()
+    vertices = _cudf_series_to_numpy(parts["vertex"], cupy)
+    partitions = _cudf_series_to_numpy(parts["partition"], cupy)
+    labels = _labels_from_vertex_partitions(
+        vertices, partitions, total_vertices
+    )
+    print(
+        f"  [Leiden][cuGraph] partition DONE "
+        f"elapsed={time.time() - partition_started:.1f}s, "
+        f"modularity={float(modularity_score):.8f}, "
+        f"communities={len(np.unique(labels)):,}",
+        flush=True,
+    )
+    del graph, parts, vertices, partitions
+    gc.collect()
+    return labels
+
+
 def run_leiden(adjacency):
     n = adjacency.shape[0]
     if n <= 1:
@@ -636,33 +814,10 @@ def run_leiden(adjacency):
         print("  ⚠ kNN edge 없음: 각 pattern을 singleton community로 보존", flush=True)
         return np.arange(n, dtype=np.int32)
 
-    igraph = _import_or_exit("igraph", "python-igraph")
-    leidenalg = _import_or_exit("leidenalg")
-    conversion_started = time.time()
-    print("  [Leiden] igraph conversion START", flush=True)
-    graph = igraph.Graph.Weighted_Adjacency(
-        adjacency, mode="undirected", attr="weight", loops=False
-    )
-    print(
-        f"  [Leiden] igraph conversion DONE elapsed={time.time() - conversion_started:.1f}s, "
-        f"vertices={graph.vcount():,}, edges={graph.ecount():,}",
-        flush=True,
-    )
-    partition_started = time.time()
-    print("  [Leiden] partition START", flush=True)
-    partition = leidenalg.find_partition(
-        graph,
-        leidenalg.RBConfigurationVertexPartition,
-        weights="weight",
-        resolution_parameter=float(LEIDEN_RESOLUTION),
-        n_iterations=-1,
-        seed=int(RANDOM_SEED),
-    )
-    print(
-        f"  [Leiden] partition DONE elapsed={time.time() - partition_started:.1f}s",
-        flush=True,
-    )
-    return renumber_communities(partition.membership)
+    if LEIDEN_BACKEND == "cugraph":
+        cugraph, cudf, cupy = _require_cugraph_stack()
+        return _run_cugraph_leiden(adjacency, cugraph, cudf, cupy)
+    return _run_leidenalg_cpu(adjacency)
 
 
 def nearest_neighbor_diagnostics(knn, embedding, local_labels, global_rows,
@@ -856,6 +1011,12 @@ def main():
     print(
         f"kNN backend={KNN_BACKEND}, gpu_device={GPU_DEVICE}, "
         f"torch_gpu_tiles={TORCH_GPU_QUERY_BLOCK:,}x{TORCH_GPU_REFERENCE_BLOCK:,}",
+        flush=True,
+    )
+    print(
+        f"Leiden backend={LEIDEN_BACKEND}, "
+        f"cugraph_max_iter={CUGRAPH_MAX_ITERATIONS}, "
+        f"cpu_iterations={CPU_LEIDEN_ITERATIONS}",
         flush=True,
     )
 
