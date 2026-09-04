@@ -1,7 +1,9 @@
 import importlib.util
+import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 import numpy as np
 
@@ -13,6 +15,34 @@ SPEC.loader.exec_module(topology)
 
 
 class TopologyClusteringTest(unittest.TestCase):
+    def test_stratified_sample_allocation_is_exact_and_retains_groups(self):
+        sizes = np.array([2, 8, 90], dtype=np.int64)
+        allocation = topology.allocate_stratified_sample_counts(sizes, 20)
+        self.assertEqual(int(allocation.sum()), 20)
+        self.assertTrue((allocation >= 1).all())
+        self.assertTrue((allocation <= sizes).all())
+        np.testing.assert_array_equal(
+            topology.allocate_stratified_sample_counts(sizes, 100), sizes
+        )
+
+    def test_resolution_selection_accepts_symmetric_five_percent_band(self):
+        resolution, in_tolerance = topology.choose_resolution(
+            {0.5: 940, 0.7: 1_030, 1.0: 1_100},
+            target=1_000,
+            tolerance=0.05,
+        )
+        self.assertEqual(resolution, 0.7)
+        self.assertTrue(in_tolerance)
+
+    def test_majority_vote_is_deterministic_on_ties(self):
+        labels = np.array([
+            [2, 1, 2, 1, 3],
+            [4, 4, 7, 8, 9],
+        ], dtype=np.int32)
+        np.testing.assert_array_equal(
+            topology.majority_vote_labels(labels), [1, 4]
+        )
+
     def test_community_ids_are_deterministic_and_largest_first(self):
         labels = topology.renumber_communities([7, 2, 7, 9, 2, 7])
         np.testing.assert_array_equal(labels, [0, 1, 0, 2, 1, 0])
@@ -166,6 +196,27 @@ class TopologyClusteringTest(unittest.TestCase):
         self.assertAlmostEqual(summaries[0]["centroid_distance_max"], 1.0)
         self.assertAlmostEqual(summaries[1]["centroid_distance_p95"], 0.0)
 
+    def test_integrated_representatives_are_real_centroid_nearest_members(self):
+        labels = np.array([0, 0, 1, 1], dtype=np.int32)
+        embedding = np.array([[0.0], [2.0], [10.0], [14.0]], dtype=np.float32)
+        summaries, representatives = topology.summarize_and_select_representatives(
+            h0_label=0,
+            local_labels=labels,
+            total_count=4,
+            embedding=embedding,
+            global_rows=np.arange(4, dtype=np.int64),
+            keys=["p0", "p1", "p2", "p3"],
+        )
+
+        self.assertEqual(len(summaries), 2)
+        self.assertEqual(
+            [row["pattern_key"] for row in representatives], ["p0", "p2"]
+        )
+        self.assertTrue(all(
+            row["selection_reason"] == "centroid_nearest_full_population"
+            for row in representatives
+        ))
+
     def test_outputs_preserve_rows_labels_and_schema(self):
         summaries = topology._community_summary(-1, np.array([0, 1]), total_count=2)
         with tempfile.TemporaryDirectory() as out_dir:
@@ -193,6 +244,129 @@ class TopologyClusteringTest(unittest.TestCase):
                 )
             finally:
                 topology.OUT_DIR = original_out_dir
+
+    def test_integrated_outputs_include_representatives_and_metadata(self):
+        labels = np.array([0, 0], dtype=np.int32)
+        summaries = topology._community_summary(
+            0, labels, total_count=2, embedding=np.array([[0.0], [2.0]])
+        )
+        representatives = [{
+            "pattern_key": "a",
+            "global_row": 0,
+            "h0_label": 0,
+            "topology_cluster": 0,
+            "final_cluster": "H0_0_T0",
+            "representative_rank": 1,
+            "community_pattern_count": 2,
+            "selection_reason": "centroid_nearest_full_population",
+            "distance_to_centroid": 1.0,
+        }]
+        with tempfile.TemporaryDirectory() as out_dir:
+            original_out_dir = topology.OUT_DIR
+            topology.OUT_DIR = out_dir
+            try:
+                topology.write_outputs(
+                    keys=["a", "b"],
+                    rows=np.array([0, 1]),
+                    h0_labels=np.array([0, 0]),
+                    topology_labels=labels,
+                    summaries=summaries,
+                    diagnostics=[],
+                    representatives=representatives,
+                    metadata={"selected_resolution": 0.7},
+                    sample_rows=np.array([0]),
+                )
+                self.assertTrue(
+                    Path(out_dir, "topology_representatives.csv").exists()
+                )
+                self.assertTrue(
+                    Path(out_dir, "topology_run_metadata.json").exists()
+                )
+                with np.load(Path(out_dir, "topology_labels.npz")) as saved:
+                    np.testing.assert_array_equal(saved["sample_rows"], [0])
+                    self.assertAlmostEqual(float(saved["selected_resolution"]), 0.7)
+            finally:
+                topology.OUT_DIR = original_out_dir
+
+    def test_integrated_main_runs_sample_assign_and_representative_pipeline(self):
+        from scipy.sparse import csr_matrix
+
+        keys = [f"p{index}" for index in range(6)]
+        rows = np.arange(6, dtype=np.int64)
+        h0_labels = np.array([0, 0, 0, 0, -1, -1], dtype=np.int32)
+        dims = {name: 1 for name in topology.FEATURE_BLOCKS}
+
+        class FakeIndex:
+            _fit_method = "fake_exact"
+
+            def __init__(self, references):
+                self.references = np.asarray(references, dtype=np.float32)
+
+            def kneighbors(self, queries, n_neighbors, return_distance=True):
+                queries = np.asarray(queries, dtype=np.float32)
+                distances = np.abs(
+                    queries[:, None, 0] - self.references[None, :, 0]
+                )
+                neighbors = np.argsort(distances, axis=1)[:, :n_neighbors]
+                selected = np.take_along_axis(distances, neighbors, axis=1)
+                return selected.astype(np.float32), neighbors.astype(np.int64)
+
+        def fake_embedding(_features, _scalers, global_rows, _dims):
+            return np.asarray(global_rows, dtype=np.float32)[:, None]
+
+        def fake_build_knn(embedding):
+            n = len(embedding)
+            return (
+                csr_matrix((n, n), dtype=np.float32),
+                FakeIndex(embedding),
+                min(1, max(0, n - 1)),
+            )
+
+        def fake_leiden_resolutions(adjacency, resolutions):
+            n = adjacency.shape[0]
+            results = {}
+            for resolution in resolutions:
+                if float(resolution) == 1.0 and n >= 3:
+                    results[float(resolution)] = np.array(
+                        [0, 0, 1], dtype=np.int32
+                    )
+                else:
+                    results[float(resolution)] = np.zeros(n, dtype=np.int32)
+            return results
+
+        with tempfile.TemporaryDirectory() as out_dir, mock.patch.multiple(
+            topology,
+            OUT_DIR=out_dir,
+            SAMPLE_BUDGET=4,
+            ASSIGN_NEIGHBORS=3,
+            COMMUNITY_TARGET=3,
+            COMMUNITY_TOLERANCE=0.05,
+            LEIDEN_RESOLUTION_CANDIDATES=(0.5, 1.0),
+            load_inputs=mock.Mock(
+                return_value=({}, keys, rows, h0_labels, dims)
+            ),
+            fit_block_scalers=mock.Mock(return_value={}),
+            make_normalized_embedding=mock.Mock(side_effect=fake_embedding),
+            build_knn_graph=mock.Mock(side_effect=fake_build_knn),
+            run_leiden_resolutions=mock.Mock(
+                side_effect=fake_leiden_resolutions
+            ),
+            _make_exact_knn_index=mock.Mock(
+                side_effect=lambda embedding, _neighbors: FakeIndex(embedding)
+            ),
+        ):
+            topology.main()
+            metadata = json.loads(
+                Path(out_dir, "topology_run_metadata.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(metadata["selected_resolution"], 1.0)
+            self.assertEqual(metadata["final_communities"], 3)
+            self.assertEqual(metadata["representative_patterns"], 3)
+            with np.load(Path(out_dir, "topology_labels.npz")) as saved:
+                self.assertTrue((saved["topology_labels"] >= 0).all())
+                self.assertEqual(len(saved["sample_rows"]), 4)
 
 
 if __name__ == "__main__":

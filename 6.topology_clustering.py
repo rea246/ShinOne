@@ -1,22 +1,23 @@
 """
-Stage 2 hierarchical topology clustering.
+Integrated sampled topology clustering and representative extraction.
 
-Reads the full Stage-1 H0 labels and the cached hierarchical GNN blocks, then
-runs an independent kNN + Leiden partition inside every dense H0 group and the
-preserved HDBSCAN noise/rare group.
+Reads the full Stage-1 H0 labels and cached hierarchical GNN blocks.  A
+deterministic stratified sample is clustered inside each H0 coarse group, the
+full population is assigned to the sampled Leiden communities by 5-NN, and one
+real centroid-nearest pattern is emitted for every final community.
 
 Required for the default GPU Leiden backend:
     RAPIDS cuGraph, cuDF, and CuPy matching the installed CUDA version
 
 Existing pipeline dependencies (numpy, scipy, scikit-learn, torch) are reused.
-FAISS GPU is used for exact kNN when available; otherwise an exact PyTorch CUDA
-backend uses the existing torch dependency before falling back to CPU search.
-Representative sampling is intentionally separated into 7.select_representatives.py.
+FAISS GPU is used for exact search when available; otherwise an exact PyTorch
+CUDA backend uses the existing torch dependency before falling back to CPU.
 """
 
 import csv
 import gc
 import hashlib
+import json
 import os
 import time
 
@@ -32,7 +33,11 @@ H0_LABELS_PATH = os.path.join(_here, "h0_clustering_out", "h0_labels_full.npz")
 OUT_DIR = os.path.join(_here, "topology_clustering_out")
 
 K_NEIGHBORS = 20
+# Kept as the direct-call default for run_leiden() and compatibility tests.
 LEIDEN_RESOLUTION = 1.0
+LEIDEN_RESOLUTION_CANDIDATES = (
+    0.25, 0.35, 0.50, 0.70, 0.85, 1.00, 1.20, 1.50, 2.00,
+)
 LEIDEN_BACKEND = "cugraph"  # cugraph | leidenalg
 CUGRAPH_MAX_ITERATIONS = 100
 CPU_LEIDEN_ITERATIONS = 2
@@ -40,7 +45,13 @@ EDGE_WEIGHT_MODE = "local_gaussian"  # local_gaussian | inverse_distance | binar
 MUTUAL_KNN = False
 RANDOM_SEED = 42
 
-# Bounds peak RAM without changing the exact kNN definition.
+# Sampled Stage-2 and integrated representative extraction.
+SAMPLE_BUDGET = 100_000
+ASSIGN_NEIGHBORS = 5
+COMMUNITY_TARGET = 1_000
+COMMUNITY_TOLERANCE = 0.05
+
+# Bounds peak RAM for each exact sample-search or assignment query.
 NORMALIZE_BLOCK = 250_000
 KNN_QUERY_BLOCK = 10_000
 
@@ -97,6 +108,76 @@ def population_fingerprint(keys, rows):
     return digest.hexdigest()
 
 
+def allocate_stratified_sample_counts(group_sizes, sample_budget):
+    """Allocate an exact proportional sample while retaining every H0 group."""
+    sizes = np.asarray(group_sizes, dtype=np.int64)
+    if sizes.ndim != 1 or len(sizes) == 0 or (sizes < 1).any():
+        raise ValueError("group_sizes must be a non-empty 1D array of positive values")
+    if sample_budget < 1:
+        raise ValueError("sample_budget must be >= 1")
+
+    total = int(sizes.sum())
+    budget = min(int(sample_budget), total)
+    if budget < len(sizes):
+        raise ValueError(
+            f"sample budget {budget:,}개로 H0 group {len(sizes):,}개를 "
+            "각각 한 번 이상 sampling할 수 없음"
+        )
+    if budget == total:
+        return sizes.copy()
+
+    allocation = np.ones(len(sizes), dtype=np.int64)
+    capacity = sizes - 1
+    remaining = budget - len(sizes)
+    if remaining:
+        ideal = remaining * capacity.astype(np.float64) / capacity.sum()
+        additions = np.floor(ideal).astype(np.int64)
+        allocation += additions
+        leftover = remaining - int(additions.sum())
+        if leftover:
+            order = sorted(
+                range(len(sizes)),
+                key=lambda index: (
+                    -(ideal[index] - additions[index]),
+                    -int(capacity[index]),
+                    index,
+                ),
+            )
+            for index in order:
+                if leftover == 0:
+                    break
+                if allocation[index] < sizes[index]:
+                    allocation[index] += 1
+                    leftover -= 1
+
+    if int(allocation.sum()) != budget or (allocation > sizes).any():
+        raise RuntimeError("stratified sample allocation failed")
+    return allocation
+
+
+def choose_resolution(community_counts, target, tolerance):
+    """Choose the sampled partition closest to target, preferring tolerance."""
+    if target < 1 or not 0 <= tolerance < 1:
+        raise ValueError("target must be >= 1 and tolerance must be in [0, 1)")
+    if not community_counts:
+        raise ValueError("community_counts must not be empty")
+    lower = target * (1.0 - tolerance)
+    upper = target * (1.0 + tolerance)
+    in_tolerance = [
+        resolution for resolution, count in community_counts.items()
+        if lower <= count <= upper
+    ]
+    candidates = in_tolerance or list(community_counts)
+    selected = min(
+        candidates,
+        key=lambda resolution: (
+            abs(community_counts[resolution] - target),
+            -float(resolution),
+        ),
+    )
+    return float(selected), bool(in_tolerance)
+
+
 def renumber_communities(labels):
     """Return deterministic IDs: largest community first, then old ID."""
     labels = np.asarray(labels, dtype=np.int64)
@@ -131,12 +212,25 @@ def _validate_config():
         raise ValueError("K_NEIGHBORS must be >= 1")
     if LEIDEN_RESOLUTION <= 0:
         raise ValueError("LEIDEN_RESOLUTION must be > 0")
+    if (
+        not LEIDEN_RESOLUTION_CANDIDATES
+        or any(value <= 0 for value in LEIDEN_RESOLUTION_CANDIDATES)
+        or len(set(LEIDEN_RESOLUTION_CANDIDATES))
+        != len(LEIDEN_RESOLUTION_CANDIDATES)
+    ):
+        raise ValueError("LEIDEN_RESOLUTION_CANDIDATES must be unique and > 0")
     if LEIDEN_BACKEND not in {"cugraph", "leidenalg"}:
         raise ValueError("LEIDEN_BACKEND must be cugraph or leidenalg")
     if CUGRAPH_MAX_ITERATIONS < 1 or CPU_LEIDEN_ITERATIONS < 1:
         raise ValueError("Leiden iteration limits must be >= 1")
     if NORMALIZE_BLOCK < 1 or KNN_QUERY_BLOCK < 1:
         raise ValueError("block sizes must be >= 1")
+    if SAMPLE_BUDGET < 1 or ASSIGN_NEIGHBORS < 1:
+        raise ValueError("SAMPLE_BUDGET and ASSIGN_NEIGHBORS must be >= 1")
+    if COMMUNITY_TARGET < 1 or not 0 <= COMMUNITY_TOLERANCE < 1:
+        raise ValueError(
+            "COMMUNITY_TARGET must be >= 1 and COMMUNITY_TOLERANCE in [0, 1)"
+        )
     valid_backends = {"auto", "faiss_gpu", "torch_gpu", "faiss_cpu", "sklearn"}
     if KNN_BACKEND not in valid_backends:
         raise ValueError(f"KNN_BACKEND must be one of {sorted(valid_backends)}")
@@ -631,10 +725,32 @@ def build_knn_graph(embedding):
     return adjacency.tocsr(), knn, k
 
 
-def _run_leidenalg_cpu(adjacency):
-    """Bounded CPU implementation retained for explicit fallback/validation."""
-    igraph = _import_or_exit("igraph", "python-igraph")
-    leidenalg = _import_or_exit("leidenalg")
+def _run_leidenalg_partition(graph, leidenalg, resolution):
+    partition_started = time.time()
+    print(
+        f"  [Leiden][CPU] partition START resolution={resolution:g}, "
+        f"iterations={CPU_LEIDEN_ITERATIONS}",
+        flush=True,
+    )
+    partition = leidenalg.find_partition(
+        graph,
+        leidenalg.RBConfigurationVertexPartition,
+        weights="weight",
+        resolution_parameter=float(resolution),
+        n_iterations=int(CPU_LEIDEN_ITERATIONS),
+        seed=int(RANDOM_SEED),
+    )
+    labels = renumber_communities(partition.membership)
+    print(
+        f"  [Leiden][CPU] partition DONE "
+        f"resolution={resolution:g}, elapsed={time.time() - partition_started:.1f}s, "
+        f"communities={len(np.unique(labels)):,}",
+        flush=True,
+    )
+    return labels
+
+
+def _igraph_from_csr(adjacency, igraph):
     conversion_started = time.time()
     print("  [Leiden][CPU] igraph conversion START", flush=True)
     graph = igraph.Graph.Weighted_Adjacency(
@@ -646,25 +762,18 @@ def _run_leidenalg_cpu(adjacency):
         f"vertices={graph.vcount():,}, edges={graph.ecount():,}",
         flush=True,
     )
-    partition_started = time.time()
-    print(
-        f"  [Leiden][CPU] partition START iterations={CPU_LEIDEN_ITERATIONS}",
-        flush=True,
-    )
-    partition = leidenalg.find_partition(
-        graph,
-        leidenalg.RBConfigurationVertexPartition,
-        weights="weight",
-        resolution_parameter=float(LEIDEN_RESOLUTION),
-        n_iterations=int(CPU_LEIDEN_ITERATIONS),
-        seed=int(RANDOM_SEED),
-    )
-    print(
-        f"  [Leiden][CPU] partition DONE "
-        f"elapsed={time.time() - partition_started:.1f}s",
-        flush=True,
-    )
-    return renumber_communities(partition.membership)
+    return graph
+
+
+def _run_leidenalg_cpu(adjacency, resolution=None):
+    """Bounded CPU implementation retained for explicit fallback/validation."""
+    resolution = LEIDEN_RESOLUTION if resolution is None else float(resolution)
+    igraph = _import_or_exit("igraph", "python-igraph")
+    leidenalg = _import_or_exit("leidenalg")
+    graph = _igraph_from_csr(adjacency, igraph)
+    labels = _run_leidenalg_partition(graph, leidenalg, resolution)
+    del graph
+    return labels
 
 
 def _require_cugraph_stack():
@@ -730,8 +839,8 @@ def _labels_from_vertex_partitions(vertices, partitions, total_vertices):
     return renumber_communities(labels)
 
 
-def _run_cugraph_leiden(adjacency, cugraph, cudf, cupy):
-    """Run weighted undirected Leiden directly from the symmetric CSR on GPU."""
+def _cugraph_from_csr(adjacency, cugraph, cudf, cupy):
+    """Transfer one symmetric weighted CSR and return a reusable GPU graph."""
     total_vertices = adjacency.shape[0]
     if (
         total_vertices > np.iinfo(np.int32).max
@@ -770,18 +879,22 @@ def _run_cugraph_leiden(adjacency, cugraph, cudf, cupy):
         flush=True,
     )
     del offsets, indices, weights
+    return graph
 
+
+def _run_cugraph_partition(
+        graph, total_vertices, resolution, cugraph, cupy):
     partition_started = time.time()
     print(
         f"  [Leiden][cuGraph] partition START max_iter={CUGRAPH_MAX_ITERATIONS}, "
-        f"resolution={LEIDEN_RESOLUTION}, seed={RANDOM_SEED}, "
+        f"resolution={resolution:g}, seed={RANDOM_SEED}, "
         f"version={getattr(cugraph, '__version__', 'unknown')}",
         flush=True,
     )
     parts, modularity_score = cugraph.leiden(
         graph,
         max_iter=int(CUGRAPH_MAX_ITERATIONS),
-        resolution=float(LEIDEN_RESOLUTION),
+        resolution=float(resolution),
         random_state=int(RANDOM_SEED),
     )
     cupy.cuda.get_current_stream().synchronize()
@@ -792,32 +905,81 @@ def _run_cugraph_leiden(adjacency, cugraph, cudf, cupy):
     )
     print(
         f"  [Leiden][cuGraph] partition DONE "
-        f"elapsed={time.time() - partition_started:.1f}s, "
+        f"resolution={resolution:g}, elapsed={time.time() - partition_started:.1f}s, "
         f"modularity={float(modularity_score):.8f}, "
         f"communities={len(np.unique(labels)):,}",
         flush=True,
     )
-    del graph, parts, vertices, partitions
+    del parts, vertices, partitions
+    return labels
+
+
+def _run_cugraph_leiden(
+        adjacency, cugraph, cudf, cupy, resolution=None):
+    """Run one weighted undirected Leiden partition from a symmetric CSR."""
+    resolution = LEIDEN_RESOLUTION if resolution is None else float(resolution)
+    graph = _cugraph_from_csr(adjacency, cugraph, cudf, cupy)
+    labels = _run_cugraph_partition(
+        graph, adjacency.shape[0], resolution, cugraph, cupy
+    )
+    del graph
     gc.collect()
     return labels
 
 
-def run_leiden(adjacency):
+def run_leiden_resolutions(adjacency, resolutions):
+    """Evaluate resolution candidates while reusing one converted graph."""
+    resolutions = tuple(float(value) for value in resolutions)
+    if not resolutions or any(value <= 0 for value in resolutions):
+        raise ValueError("resolutions must contain positive values")
+    if len(set(resolutions)) != len(resolutions):
+        raise ValueError("resolutions must be unique")
+
     n = adjacency.shape[0]
     if n <= 1:
         print(
             f"  [Leiden] DONE (skipped: vertices={n:,}, edges=0)",
             flush=True,
         )
-        return np.zeros(n, dtype=np.int32)
+        return {
+            resolution: np.zeros(n, dtype=np.int32)
+            for resolution in resolutions
+        }
     if adjacency.nnz == 0:
         print("  ⚠ kNN edge 없음: 각 pattern을 singleton community로 보존", flush=True)
-        return np.arange(n, dtype=np.int32)
+        return {
+            resolution: np.arange(n, dtype=np.int32)
+            for resolution in resolutions
+        }
 
     if LEIDEN_BACKEND == "cugraph":
         cugraph, cudf, cupy = _require_cugraph_stack()
-        return _run_cugraph_leiden(adjacency, cugraph, cudf, cupy)
-    return _run_leidenalg_cpu(adjacency)
+        graph = _cugraph_from_csr(adjacency, cugraph, cudf, cupy)
+        results = {
+            resolution: _run_cugraph_partition(
+                graph, n, resolution, cugraph, cupy
+            )
+            for resolution in resolutions
+        }
+        del graph
+    else:
+        igraph = _import_or_exit("igraph", "python-igraph")
+        leidenalg = _import_or_exit("leidenalg")
+        graph = _igraph_from_csr(adjacency, igraph)
+        results = {
+            resolution: _run_leidenalg_partition(
+                graph, leidenalg, resolution
+            )
+            for resolution in resolutions
+        }
+        del graph
+    gc.collect()
+    return results
+
+
+def run_leiden(adjacency, resolution=None):
+    resolution = LEIDEN_RESOLUTION if resolution is None else float(resolution)
+    return run_leiden_resolutions(adjacency, (resolution,))[resolution]
 
 
 def nearest_neighbor_diagnostics(knn, embedding, local_labels, global_rows,
@@ -857,6 +1019,226 @@ def nearest_neighbor_diagnostics(knn, embedding, local_labels, global_rows,
         flush=True,
     )
     return rows
+
+
+def majority_vote_labels(neighbor_labels):
+    """Vectorized uniform kNN vote; ties resolve to the smallest label."""
+    labels = np.asarray(neighbor_labels, dtype=np.int32)
+    if labels.ndim != 2 or labels.shape[1] < 1:
+        raise ValueError("neighbor_labels must be a non-empty 2D array")
+    ordered = np.sort(labels, axis=1)
+    best = ordered[:, 0].copy()
+    best_count = np.zeros(len(ordered), dtype=np.int16)
+    for column in range(ordered.shape[1]):
+        candidate = ordered[:, column]
+        count = np.sum(ordered == candidate[:, None], axis=1)
+        replace = count > best_count
+        best[replace] = candidate[replace]
+        best_count[replace] = count[replace]
+    return best
+
+
+def assign_full_population(
+        sample_embedding, sample_labels, full_embedding,
+        sample_local_positions):
+    """Assign every group member to sampled communities with exact 5-NN."""
+    sample_embedding = np.ascontiguousarray(sample_embedding, dtype=np.float32)
+    sample_labels = np.asarray(sample_labels, dtype=np.int32)
+    sample_local_positions = np.asarray(sample_local_positions, dtype=np.int64)
+    if len(sample_embedding) != len(sample_labels):
+        raise ValueError("sample embedding/label lengths differ")
+    if len(sample_local_positions) != len(sample_labels):
+        raise ValueError("sample positions/label lengths differ")
+    if len(full_embedding) < len(sample_embedding):
+        raise ValueError("sample cannot be larger than full population")
+
+    if (
+        len(sample_embedding) == len(full_embedding)
+        and np.array_equal(sample_local_positions, np.arange(len(full_embedding)))
+    ):
+        print("  [Assignment] skipped: entire group was sampled", flush=True)
+        return sample_labels.copy(), None, "identity_all_sampled"
+
+    neighbors = min(ASSIGN_NEIGHBORS, len(sample_embedding))
+    fit_started = time.time()
+    knn = _make_exact_knn_index(sample_embedding, neighbors)
+    backend = getattr(knn, "_fit_method", "unknown")
+    print(
+        f"  [Assignment] index READY references={len(sample_embedding):,}, "
+        f"k={neighbors}, method={backend}, elapsed={time.time() - fit_started:.1f}s",
+        flush=True,
+    )
+
+    labels = np.empty(len(full_embedding), dtype=np.int32)
+    started = time.time()
+    for start in range(0, len(full_embedding), KNN_QUERY_BLOCK):
+        end = min(start + KNN_QUERY_BLOCK, len(full_embedding))
+        block_started = time.time()
+        print(
+            f"  [Assignment] QUERY START {start:,}:{end:,} / "
+            f"{len(full_embedding):,}",
+            flush=True,
+        )
+        _, neighbor_ids = knn.kneighbors(
+            full_embedding[start:end],
+            n_neighbors=neighbors,
+            return_distance=True,
+        )
+        labels[start:end] = majority_vote_labels(sample_labels[neighbor_ids])
+        total_elapsed = time.time() - started
+        print(
+            f"  [Assignment] QUERY DONE {end:,}/{len(full_embedding):,}, "
+            f"{end / len(full_embedding):.1%}, "
+            f"block_elapsed={time.time() - block_started:.1f}s, "
+            f"total_elapsed={total_elapsed:.1f}s, "
+            f"average_rows/sec={end / total_elapsed:,.1f}",
+            flush=True,
+        )
+
+    # Sample vertices define the learned communities and retain their own labels.
+    labels[sample_local_positions] = sample_labels
+    labels = renumber_communities(labels)
+    print(
+        f"  [Assignment] DONE elapsed={time.time() - started:.1f}s, "
+        f"communities={len(np.unique(labels)):,}",
+        flush=True,
+    )
+    return labels, knn, backend
+
+
+def sampled_assignment_diagnostics(
+        knn, full_embedding, full_labels, full_global_rows,
+        sample_labels, sample_global_rows, keys, h0_label, rng):
+    """Inspect full-population anchors against their sampled reference neighbors."""
+    started = time.time()
+    if knn is None or DIAGNOSTIC_ANCHORS < 1:
+        print(
+            f"  [Diagnostics] DONE elapsed={time.time() - started:.1f}s (skipped)",
+            flush=True,
+        )
+        return []
+    anchors = rng.choice(
+        len(full_embedding), min(DIAGNOSTIC_ANCHORS, len(full_embedding)),
+        replace=False,
+    )
+    n_query = min(len(sample_global_rows), DIAGNOSTIC_NEIGHBORS + 1)
+    distances, neighbors = knn.kneighbors(
+        full_embedding[anchors], n_neighbors=n_query, return_distance=True
+    )
+    rows = []
+    for query_row, anchor in enumerate(anchors.tolist()):
+        anchor_global_row = int(full_global_rows[anchor])
+        rank = 0
+        for neighbor, distance in zip(
+                neighbors[query_row].tolist(), distances[query_row].tolist()):
+            neighbor_global_row = int(sample_global_rows[neighbor])
+            if neighbor_global_row == anchor_global_row:
+                continue
+            rank += 1
+            rows.append({
+                "coarse_group": coarse_group_name(h0_label),
+                "anchor_key": str(keys[anchor_global_row]),
+                "neighbor_rank": rank,
+                "neighbor_key": str(keys[neighbor_global_row]),
+                "distance": float(distance),
+                "same_final_cluster": bool(
+                    full_labels[anchor] == sample_labels[neighbor]
+                ),
+            })
+            if rank == DIAGNOSTIC_NEIGHBORS:
+                break
+    print(
+        f"  [Diagnostics] DONE elapsed={time.time() - started:.1f}s, "
+        f"rows={len(rows):,}",
+        flush=True,
+    )
+    return rows
+
+
+def summarize_and_select_representatives(
+        h0_label, local_labels, total_count, embedding, global_rows, keys):
+    """Compute full-population statistics and one real centroid-nearest member."""
+    started = time.time()
+    labels = np.asarray(local_labels, dtype=np.int32)
+    ids = np.unique(labels)
+    if not np.array_equal(ids, np.arange(len(ids), dtype=ids.dtype)):
+        raise ValueError("local community labels must be contiguous from zero")
+    community_count = len(ids)
+    counts = np.bincount(labels, minlength=community_count).astype(np.int64)
+
+    centroid_sums = np.empty(
+        (community_count, embedding.shape[1]), dtype=np.float64
+    )
+    for dimension in range(embedding.shape[1]):
+        centroid_sums[:, dimension] = np.bincount(
+            labels,
+            weights=embedding[:, dimension],
+            minlength=community_count,
+        )
+    centroids = (centroid_sums / counts[:, None]).astype(np.float32)
+    del centroid_sums
+
+    distances = np.empty(len(embedding), dtype=np.float32)
+    distance_sums = np.zeros(community_count, dtype=np.float64)
+    distance_max = np.zeros(community_count, dtype=np.float32)
+    for start in range(0, len(embedding), NORMALIZE_BLOCK):
+        end = min(start + NORMALIZE_BLOCK, len(embedding))
+        block_labels = labels[start:end]
+        delta = embedding[start:end] - centroids[block_labels]
+        block_distances = np.sqrt(np.einsum("ij,ij->i", delta, delta))
+        distances[start:end] = block_distances
+        distance_sums += np.bincount(
+            block_labels,
+            weights=block_distances,
+            minlength=community_count,
+        )
+        np.maximum.at(distance_max, block_labels, block_distances)
+
+    order = np.argsort(labels, kind="stable")
+    boundaries = np.concatenate(([0], np.cumsum(counts)))
+    summaries = []
+    representatives = []
+    for community in range(community_count):
+        members = order[boundaries[community]:boundaries[community + 1]]
+        member_distances = distances[members]
+        representative_local = int(members[np.argmin(member_distances)])
+        final_cluster = final_cluster_id(h0_label, community)
+        summaries.append({
+            "h0_label": int(h0_label),
+            "coarse_group": coarse_group_name(h0_label),
+            "topology_cluster": community,
+            "final_cluster": final_cluster,
+            "pattern_count": int(counts[community]),
+            "fraction_in_coarse_group": float(
+                counts[community] / len(labels)
+            ),
+            "fraction_in_total": float(counts[community] / total_count),
+            "centroid_distance_mean": float(
+                distance_sums[community] / counts[community]
+            ),
+            "centroid_distance_p95": float(
+                np.percentile(member_distances, 95)
+            ),
+            "centroid_distance_max": float(distance_max[community]),
+        })
+        global_row = int(global_rows[representative_local])
+        representatives.append({
+            "pattern_key": str(keys[global_row]),
+            "global_row": global_row,
+            "h0_label": int(h0_label),
+            "topology_cluster": community,
+            "final_cluster": final_cluster,
+            "community_pattern_count": int(counts[community]),
+            "selection_reason": "centroid_nearest_full_population",
+            "distance_to_centroid": float(distances[representative_local]),
+        })
+
+    print(
+        f"  [Summary/representatives] DONE communities={community_count:,}, "
+        f"elapsed={time.time() - started:.1f}s",
+        flush=True,
+    )
+    return summaries, representatives
 
 
 def _community_summary(h0_label, local_labels, total_count, embedding=None):
@@ -907,14 +1289,16 @@ def _print_group_diagnostics(h0_label, n, k, labels, edge_count):
     counts = np.unique(labels, return_counts=True)[1]
     print(f"  Coarse group          : {coarse_group_name(h0_label)}", flush=True)
     print(f"  Number of patterns    : {n:,}", flush=True)
-    print(f"  k / undirected edges  : {k} / {edge_count:,}", flush=True)
+    print(f"  sample k / graph edges: {k} / {edge_count:,}", flush=True)
     print(f"  Leiden communities    : {len(counts):,}", flush=True)
     print("  community size        : "
           f"min={counts.min():,}, median={np.median(counts):,.1f}, "
           f"mean={counts.mean():,.1f}, max={counts.max():,}", flush=True)
 
 
-def write_outputs(keys, rows, h0_labels, topology_labels, summaries, diagnostics):
+def write_outputs(
+        keys, rows, h0_labels, topology_labels, summaries, diagnostics,
+        representatives=None, metadata=None, sample_rows=None):
     started = time.time()
     print("\n[Output] writing START", flush=True)
     os.makedirs(OUT_DIR, exist_ok=True)
@@ -971,17 +1355,70 @@ def write_outputs(keys, rows, h0_labels, topology_labels, summaries, diagnostics
 
     labels_path = os.path.join(OUT_DIR, "topology_labels.npz")
     labels_tmp = labels_path + ".tmp.npz"
-    np.savez(
-        labels_tmp,
-        rows=rows,
-        h0_labels=h0_labels,
-        topology_labels=topology_labels,
-        population_fingerprint=np.asarray(fingerprint_digest.hexdigest()),
-    )
+    labels_payload = {
+        "rows": rows,
+        "h0_labels": h0_labels,
+        "topology_labels": topology_labels,
+        "population_fingerprint": np.asarray(fingerprint_digest.hexdigest()),
+    }
+    if sample_rows is not None:
+        labels_payload["sample_rows"] = np.asarray(sample_rows, dtype=np.int64)
+    if metadata is not None and "selected_resolution" in metadata:
+        labels_payload["selected_resolution"] = np.asarray(
+            metadata["selected_resolution"], dtype=np.float64
+        )
+    np.savez(labels_tmp, **labels_payload)
     os.replace(labels_tmp, labels_path)
 
+    saved_paths = [assignment_path, summary_path, diagnostic_path, labels_path]
+    if representatives is not None:
+        representative_path = os.path.join(
+            OUT_DIR, "topology_representatives.csv"
+        )
+        representative_tmp = representative_path + ".tmp"
+        representative_fields = [
+            "pattern_key", "global_row", "h0_label", "topology_cluster",
+            "final_cluster", "representative_rank", "community_pattern_count",
+            "selection_reason", "distance_to_centroid",
+        ]
+        with open(representative_tmp, "w", newline="", encoding="utf-8") as fp:
+            writer = csv.DictWriter(fp, fieldnames=representative_fields)
+            writer.writeheader()
+            writer.writerows(representatives)
+        os.replace(representative_tmp, representative_path)
+
+        representative_labels_path = os.path.join(
+            OUT_DIR, "topology_representatives.npz"
+        )
+        representative_labels_tmp = representative_labels_path + ".tmp.npz"
+        np.savez(
+            representative_labels_tmp,
+            rows=np.asarray(
+                [row["global_row"] for row in representatives], dtype=np.int64
+            ),
+            h0_labels=np.asarray(
+                [row["h0_label"] for row in representatives], dtype=np.int32
+            ),
+            topology_labels=np.asarray(
+                [row["topology_cluster"] for row in representatives],
+                dtype=np.int32,
+            ),
+        )
+        os.replace(representative_labels_tmp, representative_labels_path)
+        saved_paths.extend((representative_path, representative_labels_path))
+
+    if metadata is not None:
+        metadata = dict(metadata)
+        metadata["population_fingerprint"] = fingerprint_digest.hexdigest()
+        metadata_path = os.path.join(OUT_DIR, "topology_run_metadata.json")
+        metadata_tmp = metadata_path + ".tmp"
+        with open(metadata_tmp, "w", encoding="utf-8") as fp:
+            json.dump(metadata, fp, ensure_ascii=False, indent=2)
+        os.replace(metadata_tmp, metadata_path)
+        saved_paths.append(metadata_path)
+
     print("\n[Saved]", flush=True)
-    for path in (assignment_path, summary_path, diagnostic_path, labels_path):
+    for path in saved_paths:
         print(f"  {path}", flush=True)
     print(f"[Output] writing DONE elapsed={time.time() - started:.1f}s", flush=True)
 
@@ -997,17 +1434,44 @@ def main():
     coarse_groups = dense_groups + ([-1] if (h0_labels < 0).any() else [])
     rare_count = int((h0_labels < 0).sum())
 
+    positions_by_group = {
+        h0_label: np.flatnonzero(h0_labels == h0_label)
+        for h0_label in coarse_groups
+    }
+    group_sizes = np.asarray(
+        [len(positions_by_group[h0_label]) for h0_label in coarse_groups],
+        dtype=np.int64,
+    )
+    sample_counts = allocate_stratified_sample_counts(group_sizes, SAMPLE_BUDGET)
+    actual_sample_count = int(sample_counts.sum())
+    tolerance_min = int(np.ceil(COMMUNITY_TARGET * (1.0 - COMMUNITY_TOLERANCE)))
+    tolerance_max = int(np.floor(COMMUNITY_TARGET * (1.0 + COMMUNITY_TOLERANCE)))
+
     print("=" * 72, flush=True)
-    print("Stage 2: hierarchical full-topology kNN + Leiden", flush=True)
+    print("Integrated sampled topology clustering + representatives", flush=True)
     print("=" * 72, flush=True)
     print(f"Total patterns             : {len(rows):,}", flush=True)
+    print(f"Sample patterns            : {actual_sample_count:,}", flush=True)
     print(f"Number of H0 coarse groups : {len(dense_groups)}", flush=True)
     print(f"Rare/noise patterns        : {rare_count:,}", flush=True)
     print(f"Rare fraction              : {rare_count / len(rows):.2%}", flush=True)
     print(f"Feature dimensions         : {dims} (total={sum(dims.values())})", flush=True)
-    print(f"k={K_NEIGHBORS}, resolution={LEIDEN_RESOLUTION}, "
-          f"edge={EDGE_WEIGHT_MODE}, mutual={MUTUAL_KNN}, seed={RANDOM_SEED}",
-          flush=True)
+    print(
+        f"k={K_NEIGHBORS}, assign_k={ASSIGN_NEIGHBORS}, "
+        f"edge={EDGE_WEIGHT_MODE}, mutual={MUTUAL_KNN}, seed={RANDOM_SEED}",
+        flush=True,
+    )
+    print(
+        f"Community target           : {COMMUNITY_TARGET:,} "
+        f"(tolerance={COMMUNITY_TOLERANCE:.1%}, "
+        f"range={tolerance_min:,}..{tolerance_max:,})",
+        flush=True,
+    )
+    print(
+        "Resolution candidates       : "
+        + ", ".join(f"{value:g}" for value in LEIDEN_RESOLUTION_CANDIDATES),
+        flush=True,
+    )
     print(
         f"kNN backend={KNN_BACKEND}, gpu_device={GPU_DEVICE}, "
         f"torch_gpu_tiles={TORCH_GPU_QUERY_BLOCK:,}x{TORCH_GPU_REFERENCE_BLOCK:,}",
@@ -1021,44 +1485,67 @@ def main():
     )
 
     scalers = fit_block_scalers(features, rows)
-    topology_labels = np.full(len(rows), -1, dtype=np.int32)
-    summaries, diagnostics = [], []
-
+    resolution_counts = {
+        float(resolution): 0
+        for resolution in LEIDEN_RESOLUTION_CANDIDATES
+    }
+    sample_models = []
+    sample_backends = set()
     total_groups = len(coarse_groups)
-    for group_index, h0_label in enumerate(coarse_groups, start=1):
+    print("\n[Phase 1/2] sampled kNN graphs and Leiden resolution search", flush=True)
+    for group_index, (h0_label, sample_count) in enumerate(
+            zip(coarse_groups, sample_counts.tolist()), start=1):
         group_started = time.time()
-        positions = np.where(h0_labels == h0_label)[0]
+        positions = positions_by_group[h0_label]
+        if sample_count == len(positions):
+            sample_local_positions = np.arange(len(positions), dtype=np.int64)
+        else:
+            sample_local_positions = np.sort(
+                rng.choice(len(positions), size=sample_count, replace=False)
+            ).astype(np.int64, copy=False)
+        sample_population_positions = positions[sample_local_positions]
+        sample_global_rows = rows[sample_population_positions]
         print("\n" + "-" * 72, flush=True)
         print(
             f"[Group {group_index}/{total_groups}] START "
-            f"coarse_group={coarse_group_name(h0_label)}, patterns={len(positions):,}",
+            f"coarse_group={coarse_group_name(h0_label)}, "
+            f"patterns={len(positions):,}, sample={sample_count:,}",
             flush=True,
         )
-        global_rows = rows[positions]
-        embedding = make_normalized_embedding(features, scalers, global_rows, dims)
-        adjacency, knn, k = build_knn_graph(embedding)
-        local_labels = run_leiden(adjacency)
-        topology_labels[positions] = local_labels
-
-        _print_group_diagnostics(
-            h0_label, len(positions), k, local_labels, adjacency.nnz // 2
+        sample_embedding = make_normalized_embedding(
+            features, scalers, sample_global_rows, dims
         )
-        dispersion_started = time.time()
-        print("  [Community dispersion] START", flush=True)
-        summaries.extend(
-            _community_summary(
-                h0_label, local_labels, len(rows), embedding=embedding
-            )
+        adjacency, sample_knn, k = build_knn_graph(sample_embedding)
+        sample_backend = getattr(sample_knn, "_fit_method", "none")
+        sample_backends.add(sample_backend)
+        edge_count = int(adjacency.nnz // 2)
+        labels_by_resolution = run_leiden_resolutions(
+            adjacency, LEIDEN_RESOLUTION_CANDIDATES
         )
+        group_counts = {}
+        for resolution, labels in labels_by_resolution.items():
+            count = int(labels.max()) + 1 if len(labels) else 0
+            group_counts[resolution] = count
+            resolution_counts[resolution] += count
         print(
-            "  [Community dispersion] DONE "
-            f"elapsed={time.time() - dispersion_started:.1f}s",
+            "  [Resolution counts] "
+            + ", ".join(
+                f"{resolution:g}={group_counts[resolution]:,}"
+                for resolution in LEIDEN_RESOLUTION_CANDIDATES
+            ),
             flush=True,
         )
-        diagnostics.extend(nearest_neighbor_diagnostics(
-            knn, embedding, local_labels, global_rows, keys, h0_label, rng
-        ))
-        del embedding, adjacency, knn, local_labels
+        sample_models.append({
+            "h0_label": int(h0_label),
+            "sample_local_positions": sample_local_positions,
+            "sample_global_rows": sample_global_rows,
+            "sample_embedding": sample_embedding,
+            "labels_by_resolution": labels_by_resolution,
+            "sample_k": int(k),
+            "sample_edges": edge_count,
+            "sample_backend": sample_backend,
+        })
+        del adjacency, sample_knn
         gc.collect()
         print(
             f"[Group {group_index}/{total_groups}] DONE "
@@ -1067,8 +1554,125 @@ def main():
             flush=True,
         )
 
+    selected_resolution, within_tolerance = choose_resolution(
+        resolution_counts,
+        target=COMMUNITY_TARGET,
+        tolerance=COMMUNITY_TOLERANCE,
+    )
+    selected_sample_communities = resolution_counts[selected_resolution]
+    print("\n" + "=" * 72, flush=True)
+    print("Resolution search result", flush=True)
+    for resolution in LEIDEN_RESOLUTION_CANDIDATES:
+        marker = "  <-- selected" if resolution == selected_resolution else ""
+        print(
+            f"  resolution={resolution:g}: "
+            f"communities={resolution_counts[resolution]:,}{marker}",
+            flush=True,
+        )
+    if within_tolerance:
+        print(
+            f"Selected resolution={selected_resolution:g}, "
+            f"communities={selected_sample_communities:,} "
+            f"(inside {tolerance_min:,}..{tolerance_max:,})",
+            flush=True,
+        )
+    else:
+        print(
+            f"⚠ No candidate produced {tolerance_min:,}..{tolerance_max:,}; "
+            f"selected closest resolution={selected_resolution:g}, "
+            f"communities={selected_sample_communities:,}",
+            flush=True,
+        )
+    print("=" * 72, flush=True)
+
+    topology_labels = np.full(len(rows), -1, dtype=np.int32)
+    summaries, diagnostics, representatives = [], [], []
+    assignment_backends = set()
+    print("\n[Phase 2/2] full-population assignment and representatives", flush=True)
+    for group_index, model in enumerate(sample_models, start=1):
+        group_started = time.time()
+        h0_label = model["h0_label"]
+        positions = positions_by_group[h0_label]
+        global_rows = rows[positions]
+        sample_local_positions = model["sample_local_positions"]
+        sample_labels = model["labels_by_resolution"][selected_resolution]
+        print("\n" + "-" * 72, flush=True)
+        print(
+            f"[Assign group {group_index}/{total_groups}] START "
+            f"coarse_group={coarse_group_name(h0_label)}, "
+            f"patterns={len(positions):,}, "
+            f"sample={len(sample_local_positions):,}",
+            flush=True,
+        )
+        full_embedding = make_normalized_embedding(
+            features, scalers, global_rows, dims
+        )
+        local_labels, assignment_knn, assignment_backend = assign_full_population(
+            model["sample_embedding"],
+            sample_labels,
+            full_embedding,
+            sample_local_positions,
+        )
+        assignment_backends.add(assignment_backend)
+        topology_labels[positions] = local_labels
+
+        group_summaries, group_representatives = (
+            summarize_and_select_representatives(
+                h0_label,
+                local_labels,
+                len(rows),
+                full_embedding,
+                global_rows,
+                keys,
+            )
+        )
+        summaries.extend(group_summaries)
+        representatives.extend(group_representatives)
+        sample_final_labels = local_labels[sample_local_positions]
+        diagnostics.extend(sampled_assignment_diagnostics(
+            assignment_knn,
+            full_embedding,
+            local_labels,
+            global_rows,
+            sample_final_labels,
+            model["sample_global_rows"],
+            keys,
+            h0_label,
+            rng,
+        ))
+        _print_group_diagnostics(
+            h0_label,
+            len(positions),
+            model["sample_k"],
+            local_labels,
+            model["sample_edges"],
+        )
+        del (
+            full_embedding, local_labels, assignment_knn,
+            sample_final_labels, group_summaries, group_representatives,
+            model["sample_embedding"], model["labels_by_resolution"],
+        )
+        gc.collect()
+        print(
+            f"[Assign group {group_index}/{total_groups}] DONE "
+            f"coarse_group={coarse_group_name(h0_label)}, "
+            f"elapsed={time.time() - group_started:.1f}s",
+            flush=True,
+        )
+
     if (topology_labels < 0).any():
-        raise RuntimeError("일부 pattern에 Stage-2 community가 배정되지 않음")
+        raise RuntimeError("일부 pattern에 topology community가 배정되지 않음")
+    if len(representatives) != len(summaries):
+        raise RuntimeError("community와 representative 수가 다름")
+    if len(summaries) != selected_sample_communities:
+        raise RuntimeError(
+            "sample partition community 수와 full assignment community 수가 다름"
+        )
+    representative_rows = [row["global_row"] for row in representatives]
+    if len(set(representative_rows)) != len(representative_rows):
+        raise RuntimeError("representative global_row가 중복됨")
+    for rank, representative in enumerate(representatives, start=1):
+        representative["representative_rank"] = rank
 
     sizes = np.asarray([row["pattern_count"] for row in summaries])
     rare_communities = sum(row["h0_label"] < 0 for row in summaries)
@@ -1077,9 +1681,64 @@ def main():
     print(f"Largest final community    : {sizes.max():,}", flush=True)
     print(f"Smallest final community   : {sizes.min():,}", flush=True)
     print(f"Rare-group community count : {rare_communities:,}", flush=True)
+    print(f"Representative patterns    : {len(representatives):,}", flush=True)
+    print(
+        f"Target tolerance satisfied : "
+        f"{tolerance_min <= len(representatives) <= tolerance_max}",
+        flush=True,
+    )
     print("=" * 72, flush=True)
 
-    write_outputs(keys, rows, h0_labels, topology_labels, summaries, diagnostics)
+    sample_rows = np.concatenate([
+        model["sample_global_rows"] for model in sample_models
+    ]).astype(np.int64, copy=False)
+    if (
+        len(sample_rows) != actual_sample_count
+        or len(np.unique(sample_rows)) != len(sample_rows)
+    ):
+        raise RuntimeError("sample row 수가 잘못되었거나 중복됨")
+    metadata = {
+        "method": "stratified_sample_leiden_full_5nn_assignment",
+        "total_patterns": int(len(rows)),
+        "sample_budget": int(SAMPLE_BUDGET),
+        "actual_sample_patterns": actual_sample_count,
+        "assignment_neighbors": int(ASSIGN_NEIGHBORS),
+        "community_target": int(COMMUNITY_TARGET),
+        "community_tolerance": float(COMMUNITY_TOLERANCE),
+        "community_tolerance_min": tolerance_min,
+        "community_tolerance_max": tolerance_max,
+        "selected_resolution": float(selected_resolution),
+        "selected_resolution_inside_tolerance": bool(within_tolerance),
+        "resolution_community_counts": {
+            f"{resolution:g}": int(resolution_counts[resolution])
+            for resolution in LEIDEN_RESOLUTION_CANDIDATES
+        },
+        "final_communities": int(len(summaries)),
+        "representative_patterns": int(len(representatives)),
+        "sample_knn_backends": sorted(sample_backends),
+        "assignment_knn_backends": sorted(assignment_backends),
+        "leiden_backend": LEIDEN_BACKEND,
+        "leiden_max_iterations": int(CUGRAPH_MAX_ITERATIONS),
+        "k_neighbors": int(K_NEIGHBORS),
+        "edge_weight_mode": EDGE_WEIGHT_MODE,
+        "mutual_knn": bool(MUTUAL_KNN),
+        "random_seed": int(RANDOM_SEED),
+        "feature_dimensions": dims,
+        "feature_blocks": list(FEATURE_BLOCKS),
+        "block_weights": BLOCK_WEIGHTS,
+        "elapsed_seconds_before_output": float(time.time() - started),
+    }
+    write_outputs(
+        keys,
+        rows,
+        h0_labels,
+        topology_labels,
+        summaries,
+        diagnostics,
+        representatives=representatives,
+        metadata=metadata,
+        sample_rows=sample_rows,
+    )
     print(f"완료: {time.time() - started:.1f}s", flush=True)
 
 

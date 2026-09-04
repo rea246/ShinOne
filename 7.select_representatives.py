@@ -1,5 +1,9 @@
 """
-Stage 3 fixed-budget representative selection.
+Legacy Stage 3 fixed-budget representative selection.
+
+The current baseline integrates representative extraction into
+6.topology_clustering.py. This file is retained only to reproduce or reprocess
+older exact-budget Stage-2 outputs and is not part of the default execution.
 
 Consumes the Stage-2 topology labels and selects exactly 1,000 real pattern
 keys. Every final topology community receives a minimum quota; remaining slots
