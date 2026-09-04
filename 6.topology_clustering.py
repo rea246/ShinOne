@@ -20,9 +20,38 @@ import hashlib
 import json
 import math
 import os
+import sys
 import time
+import traceback
 
 import numpy as np
+
+
+class _TeeStream:
+    """Mirror text to the original terminal stream and a live run-log file."""
+
+    def __init__(self, terminal, log_file):
+        self.terminal = terminal
+        self.log_file = log_file
+
+    @property
+    def encoding(self):
+        return getattr(self.terminal, "encoding", "utf-8")
+
+    def write(self, text):
+        self.terminal.write(text)
+        self.log_file.write(text)
+        return len(text)
+
+    def flush(self):
+        self.terminal.flush()
+        self.log_file.flush()
+
+    def isatty(self):
+        return bool(getattr(self.terminal, "isatty", lambda: False)())
+
+    def fileno(self):
+        return self.terminal.fileno()
 
 
 # ============================================================================
@@ -1496,7 +1525,7 @@ def write_outputs(
     print(f"[Output] writing DONE elapsed={time.time() - started:.1f}s", flush=True)
 
 
-def main():
+def main(run_log_path=None):
     _validate_config()
     np.random.seed(RANDOM_SEED)
     rng = np.random.default_rng(RANDOM_SEED)
@@ -1896,6 +1925,10 @@ def main():
         "feature_dimensions": dims,
         "feature_blocks": list(FEATURE_BLOCKS),
         "block_weights": BLOCK_WEIGHTS,
+        "run_log_path": (
+            os.path.relpath(run_log_path, _here)
+            if run_log_path is not None else None
+        ),
         "elapsed_seconds_before_output": float(time.time() - started),
     }
     write_outputs(
@@ -1912,5 +1945,49 @@ def main():
     print(f"완료: {time.time() - started:.1f}s", flush=True)
 
 
+def run_with_persistent_log():
+    """Run the pipeline while teeing Python stdout/stderr to a live file."""
+    log_dir = os.path.join(OUT_DIR, "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    log_path = os.path.join(
+        log_dir,
+        f"topology_clustering_{timestamp}_pid{os.getpid()}.log",
+    )
+    terminal_stdout = sys.stdout
+    terminal_stderr = sys.stderr
+    exit_code = 0
+
+    with open(log_path, "w", encoding="utf-8", buffering=1) as log_file:
+        sys.stdout = _TeeStream(terminal_stdout, log_file)
+        sys.stderr = _TeeStream(terminal_stderr, log_file)
+        try:
+            print(f"[Run log] {log_path}", flush=True)
+            main(run_log_path=log_path)
+        except KeyboardInterrupt:
+            print("\n[Interrupted] KeyboardInterrupt", file=sys.stderr, flush=True)
+            exit_code = 130
+        except SystemExit as exc:
+            if isinstance(exc.code, str):
+                print(exc.code, file=sys.stderr, flush=True)
+                exit_code = 1
+            elif exc.code is None:
+                exit_code = 0
+            else:
+                exit_code = int(exc.code)
+        except Exception:
+            traceback.print_exc()
+            exit_code = 1
+        finally:
+            print(
+                f"[Run log] CLOSED exit_code={exit_code} path={log_path}",
+                flush=True,
+            )
+            sys.stdout = terminal_stdout
+            sys.stderr = terminal_stderr
+
+    return exit_code
+
+
 if __name__ == "__main__":
-    main()
+    raise SystemExit(run_with_persistent_log())

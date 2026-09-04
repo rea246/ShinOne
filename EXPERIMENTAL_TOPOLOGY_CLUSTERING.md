@@ -224,6 +224,29 @@ oversampling, novelty detection, uncovered-pattern promotion 또는 iterative re
 
 모든 결과는 `topology_clustering_out/`에 저장된다.
 
+```mermaid
+flowchart TD
+    A["hkeys_features.pt"] --> C["Load and validate inputs"]
+    B["h0_labels_full.npz"] --> C
+    C --> D["Fit full-population block scalers"]
+    D --> E["H0-stratified 100K sample"]
+    E --> F["Normalize sample and exact kNN graph"]
+    F --> G["Scaled Leiden resolution search: 950–1050"]
+    G --> H["Normalize full population"]
+    H --> I["Same-H0 exact 5-NN assignment"]
+    I --> J["Full centroids and nearest real representatives"]
+    J --> K["Assignments and labels"]
+    J --> L["Summaries and diagnostics"]
+    J --> M["Representatives and run metadata"]
+    C -. "stdout and stderr from every stage" .-> N["logs/topology_clustering_TIMESTAMP_pidPID.log"]
+    G -.-> N
+    J -.-> N
+```
+
+프로그램 시작 즉시 `topology_clustering_out/logs/`에 timestamp log를 만들고 모든
+Python stdout/stderr를 화면과 파일에 동시에 기록한다. 정상 종료뿐 아니라 exception과
+`KeyboardInterrupt`도 해당 시점까지 보존된다.
+
 ### 10.1 Full assignments
 
 `topology_assignments.csv`
@@ -286,7 +309,8 @@ distance_to_centroid
 neighbor의 distance 및 동일 final community 여부를 기록한다.
 
 `topology_run_metadata.json`은 sample size, resolution별 community 수, 선택된
-resolution, 실제 representative 수, backend 및 전체 parameter를 기록한다.
+resolution, 실제 representative 수, backend, 전체 parameter 및 해당 run log 경로를
+기록한다.
 
 ## 11. Comparison with REF representatives
 

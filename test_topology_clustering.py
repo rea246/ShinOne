@@ -15,6 +15,25 @@ SPEC.loader.exec_module(topology)
 
 
 class TopologyClusteringTest(unittest.TestCase):
+    def test_persistent_run_log_captures_console_output(self):
+        observed_paths = []
+
+        def fake_main(run_log_path=None):
+            observed_paths.append(run_log_path)
+            print("pipeline checkpoint", flush=True)
+
+        with tempfile.TemporaryDirectory() as out_dir, mock.patch.multiple(
+            topology,
+            OUT_DIR=out_dir,
+            main=mock.Mock(side_effect=fake_main),
+        ):
+            self.assertEqual(topology.run_with_persistent_log(), 0)
+            self.assertEqual(len(observed_paths), 1)
+            log_path = Path(observed_paths[0])
+            content = log_path.read_text(encoding="utf-8")
+            self.assertIn("pipeline checkpoint", content)
+            self.assertIn("[Run log] CLOSED exit_code=0", content)
+
     def test_stratified_sample_allocation_is_exact_and_retains_groups(self):
         sizes = np.array([2, 8, 90], dtype=np.int64)
         allocation = topology.allocate_stratified_sample_counts(sizes, 20)
