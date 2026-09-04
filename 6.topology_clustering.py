@@ -18,6 +18,7 @@ import csv
 import gc
 import hashlib
 import json
+import math
 import os
 import time
 
@@ -38,6 +39,9 @@ LEIDEN_RESOLUTION = 1.0
 LEIDEN_RESOLUTION_CANDIDATES = (
     0.25, 0.35, 0.50, 0.70, 0.85, 1.00, 1.20, 1.50, 2.00,
 )
+LEIDEN_RESOLUTION_SEARCH_ROUNDS = 12
+LEIDEN_RESOLUTION_MIN = 1.0e-4
+LEIDEN_RESOLUTION_MAX = 4_096.0
 LEIDEN_BACKEND = "cugraph"  # cugraph | leidenalg
 CUGRAPH_MAX_ITERATIONS = 100
 CPU_LEIDEN_ITERATIONS = 2
@@ -178,6 +182,68 @@ def choose_resolution(community_counts, target, tolerance):
     return float(selected), bool(in_tolerance)
 
 
+def next_resolution_candidate(
+        community_counts, target, minimum_resolution, maximum_resolution):
+    """Propose one unseen resolution that moves community count toward target."""
+    if not community_counts:
+        raise ValueError("community_counts must not be empty")
+    if target < 1:
+        raise ValueError("target must be >= 1")
+    if minimum_resolution <= 0 or maximum_resolution <= minimum_resolution:
+        raise ValueError("invalid resolution search bounds")
+
+    ordered = sorted(
+        (float(resolution), int(count))
+        for resolution, count in community_counts.items()
+    )
+    if any(count == target for _, count in ordered):
+        return None
+
+    crossings = []
+    for left, right in zip(ordered, ordered[1:]):
+        if (left[1] - target) * (right[1] - target) < 0:
+            crossings.append((left, right))
+
+    if crossings:
+        (left_resolution, left_count), (right_resolution, right_count) = min(
+            crossings,
+            key=lambda pair: (
+                abs(math.log(pair[1][0] / pair[0][0])),
+                abs(pair[0][1] - target) + abs(pair[1][1] - target),
+            ),
+        )
+        fraction = (target - left_count) / (right_count - left_count)
+        candidate = math.exp(
+            math.log(left_resolution)
+            + fraction * math.log(right_resolution / left_resolution)
+        )
+        if not left_resolution < candidate < right_resolution:
+            candidate = math.sqrt(left_resolution * right_resolution)
+    elif max(count for _, count in ordered) < target:
+        candidate = ordered[-1][0] * 2.0
+    elif min(count for _, count in ordered) > target:
+        candidate = ordered[0][0] / 2.0
+    else:
+        below = min(
+            ((resolution, count) for resolution, count in ordered if count < target),
+            key=lambda item: target - item[1],
+        )
+        above = min(
+            ((resolution, count) for resolution, count in ordered if count > target),
+            key=lambda item: item[1] - target,
+        )
+        candidate = math.sqrt(below[0] * above[0])
+
+    candidate = min(max(candidate, minimum_resolution), maximum_resolution)
+    candidate = float(f"{candidate:.12g}")
+    if any(
+        math.isclose(candidate, resolution, rel_tol=1.0e-10, abs_tol=0.0)
+        for resolution, _ in ordered
+    ):
+        return None
+    return candidate
+
+
 def renumber_communities(labels):
     """Return deterministic IDs: largest community first, then old ID."""
     labels = np.asarray(labels, dtype=np.int64)
@@ -219,6 +285,13 @@ def _validate_config():
         != len(LEIDEN_RESOLUTION_CANDIDATES)
     ):
         raise ValueError("LEIDEN_RESOLUTION_CANDIDATES must be unique and > 0")
+    if LEIDEN_RESOLUTION_SEARCH_ROUNDS < 0:
+        raise ValueError("LEIDEN_RESOLUTION_SEARCH_ROUNDS must be >= 0")
+    if (
+        LEIDEN_RESOLUTION_MIN <= 0
+        or LEIDEN_RESOLUTION_MAX <= LEIDEN_RESOLUTION_MIN
+    ):
+        raise ValueError("invalid adaptive Leiden resolution bounds")
     if LEIDEN_BACKEND not in {"cugraph", "leidenalg"}:
         raise ValueError("LEIDEN_BACKEND must be cugraph or leidenalg")
     if CUGRAPH_MAX_ITERATIONS < 1 or CPU_LEIDEN_ITERATIONS < 1:
@@ -1444,6 +1517,20 @@ def main():
     )
     sample_counts = allocate_stratified_sample_counts(group_sizes, SAMPLE_BUDGET)
     actual_sample_count = int(sample_counts.sum())
+    sample_resolution_scale = max(1.0, len(rows) / actual_sample_count)
+    resolution_candidates = tuple(sorted(set(
+        [float(LEIDEN_RESOLUTION)]
+        + [
+            min(
+                max(
+                    float(value) * sample_resolution_scale,
+                    LEIDEN_RESOLUTION_MIN,
+                ),
+                LEIDEN_RESOLUTION_MAX,
+            )
+            for value in LEIDEN_RESOLUTION_CANDIDATES
+        ]
+    )))
     tolerance_min = int(np.ceil(COMMUNITY_TARGET * (1.0 - COMMUNITY_TOLERANCE)))
     tolerance_max = int(np.floor(COMMUNITY_TARGET * (1.0 + COMMUNITY_TOLERANCE)))
 
@@ -1468,8 +1555,19 @@ def main():
         flush=True,
     )
     print(
-        "Resolution candidates       : "
+        "Base resolution candidates  : "
         + ", ".join(f"{value:g}" for value in LEIDEN_RESOLUTION_CANDIDATES),
+        flush=True,
+    )
+    print(f"Sample resolution scale    : {sample_resolution_scale:.6g}", flush=True)
+    print(
+        "Scaled resolution candidates: "
+        + ", ".join(f"{value:g}" for value in resolution_candidates),
+        flush=True,
+    )
+    print(
+        f"Adaptive resolution search : rounds={LEIDEN_RESOLUTION_SEARCH_ROUNDS}, "
+        f"bounds={LEIDEN_RESOLUTION_MIN:g}..{LEIDEN_RESOLUTION_MAX:g}",
         flush=True,
     )
     print(
@@ -1487,7 +1585,7 @@ def main():
     scalers = fit_block_scalers(features, rows)
     resolution_counts = {
         float(resolution): 0
-        for resolution in LEIDEN_RESOLUTION_CANDIDATES
+        for resolution in resolution_candidates
     }
     sample_models = []
     sample_backends = set()
@@ -1520,7 +1618,7 @@ def main():
         sample_backends.add(sample_backend)
         edge_count = int(adjacency.nnz // 2)
         labels_by_resolution = run_leiden_resolutions(
-            adjacency, LEIDEN_RESOLUTION_CANDIDATES
+            adjacency, resolution_candidates
         )
         group_counts = {}
         for resolution, labels in labels_by_resolution.items():
@@ -1531,7 +1629,7 @@ def main():
             "  [Resolution counts] "
             + ", ".join(
                 f"{resolution:g}={group_counts[resolution]:,}"
-                for resolution in LEIDEN_RESOLUTION_CANDIDATES
+                for resolution in resolution_candidates
             ),
             flush=True,
         )
@@ -1540,12 +1638,13 @@ def main():
             "sample_local_positions": sample_local_positions,
             "sample_global_rows": sample_global_rows,
             "sample_embedding": sample_embedding,
+            "adjacency": adjacency,
             "labels_by_resolution": labels_by_resolution,
             "sample_k": int(k),
             "sample_edges": edge_count,
             "sample_backend": sample_backend,
         })
-        del adjacency, sample_knn
+        del sample_knn
         gc.collect()
         print(
             f"[Group {group_index}/{total_groups}] DONE "
@@ -1559,10 +1658,60 @@ def main():
         target=COMMUNITY_TARGET,
         tolerance=COMMUNITY_TOLERANCE,
     )
+    resolution_search_rounds = 0
+    while (
+        not within_tolerance
+        and resolution_search_rounds < LEIDEN_RESOLUTION_SEARCH_ROUNDS
+    ):
+        candidate = next_resolution_candidate(
+            resolution_counts,
+            target=COMMUNITY_TARGET,
+            minimum_resolution=LEIDEN_RESOLUTION_MIN,
+            maximum_resolution=LEIDEN_RESOLUTION_MAX,
+        )
+        if candidate is None:
+            break
+
+        resolution_search_rounds += 1
+        print(
+            f"\n[Adaptive resolution {resolution_search_rounds}/"
+            f"{LEIDEN_RESOLUTION_SEARCH_ROUNDS}] START resolution={candidate:g}",
+            flush=True,
+        )
+        candidate_count = 0
+        for group_index, model in enumerate(sample_models, start=1):
+            labels = run_leiden_resolutions(
+                model["adjacency"], (candidate,)
+            )[candidate]
+            model["labels_by_resolution"][candidate] = labels
+            group_count = int(labels.max()) + 1 if len(labels) else 0
+            candidate_count += group_count
+            print(
+                f"  [Adaptive group {group_index}/{total_groups}] "
+                f"coarse_group={coarse_group_name(model['h0_label'])}, "
+                f"communities={group_count:,}",
+                flush=True,
+            )
+        resolution_counts[candidate] = candidate_count
+        selected_resolution, within_tolerance = choose_resolution(
+            resolution_counts,
+            target=COMMUNITY_TARGET,
+            tolerance=COMMUNITY_TOLERANCE,
+        )
+        print(
+            f"[Adaptive resolution {resolution_search_rounds}/"
+            f"{LEIDEN_RESOLUTION_SEARCH_ROUNDS}] DONE "
+            f"resolution={candidate:g}, communities={candidate_count:,}, "
+            f"best={selected_resolution:g}/"
+            f"{resolution_counts[selected_resolution]:,}, "
+            f"inside_tolerance={within_tolerance}",
+            flush=True,
+        )
+
     selected_sample_communities = resolution_counts[selected_resolution]
     print("\n" + "=" * 72, flush=True)
     print("Resolution search result", flush=True)
-    for resolution in LEIDEN_RESOLUTION_CANDIDATES:
+    for resolution in sorted(resolution_counts):
         marker = "  <-- selected" if resolution == selected_resolution else ""
         print(
             f"  resolution={resolution:g}: "
@@ -1584,6 +1733,22 @@ def main():
             flush=True,
         )
     print("=" * 72, flush=True)
+
+    if not within_tolerance:
+        raise RuntimeError(
+            f"adaptive resolution search failed to produce "
+            f"{tolerance_min:,}..{tolerance_max:,} communities; "
+            f"closest={selected_sample_communities:,} at "
+            f"resolution={selected_resolution:g}. No representative output written."
+        )
+
+    for model in sample_models:
+        selected_labels = model["labels_by_resolution"][selected_resolution]
+        model["labels_by_resolution"] = {
+            selected_resolution: selected_labels
+        }
+        del model["adjacency"]
+    gc.collect()
 
     topology_labels = np.full(len(rows), -1, dtype=np.int32)
     summaries, diagnostics, representatives = [], [], []
@@ -1709,9 +1874,14 @@ def main():
         "community_tolerance_max": tolerance_max,
         "selected_resolution": float(selected_resolution),
         "selected_resolution_inside_tolerance": bool(within_tolerance),
+        "sample_resolution_scale": float(sample_resolution_scale),
+        "resolution_search_rounds": int(resolution_search_rounds),
+        "scaled_initial_resolution_candidates": [
+            float(value) for value in resolution_candidates
+        ],
         "resolution_community_counts": {
             f"{resolution:g}": int(resolution_counts[resolution])
-            for resolution in LEIDEN_RESOLUTION_CANDIDATES
+            for resolution in sorted(resolution_counts)
         },
         "final_communities": int(len(summaries)),
         "representative_patterns": int(len(representatives)),

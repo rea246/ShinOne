@@ -34,6 +34,24 @@ class TopologyClusteringTest(unittest.TestCase):
         self.assertEqual(resolution, 0.7)
         self.assertTrue(in_tolerance)
 
+    def test_resolution_search_expands_and_interpolates(self):
+        expanded = topology.next_resolution_candidate(
+            {0.5: 60, 1.0: 130},
+            target=1_000,
+            minimum_resolution=1.0e-4,
+            maximum_resolution=4_096.0,
+        )
+        self.assertEqual(expanded, 2.0)
+
+        interpolated = topology.next_resolution_candidate(
+            {8.0: 800, 16.0: 1_200},
+            target=1_000,
+            minimum_resolution=1.0e-4,
+            maximum_resolution=4_096.0,
+        )
+        self.assertGreater(interpolated, 8.0)
+        self.assertLess(interpolated, 16.0)
+
     def test_majority_vote_is_deterministic_on_ties(self):
         labels = np.array([
             [2, 1, 2, 1, 3],
@@ -326,7 +344,9 @@ class TopologyClusteringTest(unittest.TestCase):
             n = adjacency.shape[0]
             results = {}
             for resolution in resolutions:
-                if float(resolution) == 1.0 and n >= 3:
+                if float(resolution) >= 3.0 and n >= 3:
+                    results[float(resolution)] = np.arange(n, dtype=np.int32)
+                elif float(resolution) == 1.0 and n >= 3:
                     results[float(resolution)] = np.array(
                         [0, 0, 1], dtype=np.int32
                     )
@@ -339,7 +359,7 @@ class TopologyClusteringTest(unittest.TestCase):
             OUT_DIR=out_dir,
             SAMPLE_BUDGET=4,
             ASSIGN_NEIGHBORS=3,
-            COMMUNITY_TARGET=3,
+            COMMUNITY_TARGET=4,
             COMMUNITY_TOLERANCE=0.05,
             LEIDEN_RESOLUTION_CANDIDATES=(0.5, 1.0),
             load_inputs=mock.Mock(
@@ -361,9 +381,10 @@ class TopologyClusteringTest(unittest.TestCase):
                     encoding="utf-8"
                 )
             )
-            self.assertEqual(metadata["selected_resolution"], 1.0)
-            self.assertEqual(metadata["final_communities"], 3)
-            self.assertEqual(metadata["representative_patterns"], 3)
+            self.assertEqual(metadata["selected_resolution"], 3.0)
+            self.assertEqual(metadata["resolution_search_rounds"], 1)
+            self.assertEqual(metadata["final_communities"], 4)
+            self.assertEqual(metadata["representative_patterns"], 4)
             with np.load(Path(out_dir, "topology_labels.npz")) as saved:
                 self.assertTrue((saved["topology_labels"] >= 0).all())
                 self.assertEqual(len(saved["sample_rows"]), 4)

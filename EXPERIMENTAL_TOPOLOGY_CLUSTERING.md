@@ -111,7 +111,13 @@ multi-CPU 순서다.
 
 ### 6.3 Resolution selection with 5% tolerance
 
-동일한 sample graph에서 다음 Leiden resolution 후보를 평가한다.
+전체 graph를 100,000개 sample graph로 축소하면 같은 `k`와 resolution에서도 작은
+community 경계가 합쳐질 수 있다. 따라서 먼저 `전체 pattern 수 / 실제 sample 수`를
+resolution scale로 사용한다. 약 2,063,000개를 100,000개로 줄인 경우 초기 scale은
+약 20.63이다.
+
+아래 base Leiden resolution 후보에 이 scale을 곱하고, 비교 기준을 위해 resolution
+1.0도 포함하여 동일한 sample graph에서 평가한다.
 
 ```text
 0.25, 0.35, 0.50, 0.70, 0.85, 1.00, 1.20, 1.50, 2.00
@@ -119,8 +125,11 @@ multi-CPU 순서다.
 
 모든 H0 group의 community 수를 resolution별로 합산한다. 전체 community 수가
 950~1,050 범위인 후보 중 target 1,000에 가장 가까운 resolution을 선택한다.
-동률이면 더 높은 resolution을 선택한다. 범위에 들어오는 후보가 없으면 전체 후보
-중 1,000에 가장 가까운 결과를 선택하고 warning과 실제 개수를 기록한다.
+동률이면 더 높은 resolution을 선택한다. 초기 후보가 범위를 만들지 못하면 resolution을
+2배씩 자동 확장한다. target의 위·아래 community count가 확보되면 log-resolution
+공간에서 보간하여 최대 12회 세부 탐색한다. 그래도 범위에 들어오지 못할 때만 평가한
+전체 후보와 가장 가까운 결과를 출력한 뒤, 잘못된 개수의 representative 파일을 쓰지
+않고 명시적으로 중단한다.
 
 Resolution 선택에는 비교 대상인 REF 결과를 사용하지 않는다.
 
@@ -170,7 +179,8 @@ rare : RARE_T<topology_label>
 | `ASSIGN_NEIGHBORS` | 5 | full-population label vote |
 | `COMMUNITY_TARGET` | 1,000 | approximate representative count |
 | `COMMUNITY_TOLERANCE` | 0.05 | accepted range 950~1,050 |
-| Resolution candidates | 0.25~2.0 | sampled partition granularity search |
+| Base resolution candidates | 0.25~2.0 | multiplied by full/sample ratio |
+| Adaptive resolution rounds | 12 | expansion and interpolated refinement |
 | `LEIDEN_BACKEND` | `cugraph` | A100 weighted Leiden |
 | `CUGRAPH_MAX_ITERATIONS` | 100 | bounded Leiden iterations |
 | `EDGE_WEIGHT_MODE` | `local_gaussian` | distance-to-similarity mapping |
