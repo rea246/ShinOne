@@ -1,0 +1,23 @@
+Incoming Wafer Mechanical Condition에 따른 W2W Bonding Overlay Residual
+Technical Note · Draft for Internal Review · 2026-09-06
+Introduction
+Wafer-to-Wafer(W2W) direct/hybrid bonding에서 post-bond overlay는 단순한 alignment accuracy가 아니라 wafer 전면의 pad overlap margin과 electrical yield를 좌우하는 핵심 공정지표이다. 두 wafer를 bonding 직전에 정렬하더라도, center contact 이후 bond wave가 진행되는 동안 wafer grid가 변형되면 최종 overlay residual은 pre-bond alignment 결과와 달라질 수 있다. 실제 permanent wafer bonding 연구에서도 incoming wafer distortion과 bonder-induced distortion이 post-bond overlay에 함께 반영되는 것으로 보고되었다.[1] 따라서 bonding overlay는 장비의 정렬 오차만이 아니라, wafer가 chucking·contact·bond-wave propagation 과정에서 경험한 기계적 변형의 누적 결과로 해석해야 한다.
+이 관점에서 fixed recipe 최적화는 모든 incoming wafer가 동일한 constrained state로 변환된다는 암묵적 전제를 갖는다. 그러나 free-state wafer geometry는 vacuum chucking 중 flattening strain과 in-plane distortion으로 전환될 수 있고,[2] W2W bonding 문헌에서도 bow가 큰 wafer 및 saddle-shaped wafer에서 scaling, asymmetric scaling과 nonlinear bonding error가 변화하는 결과가 보고되었다.[3] [4] 또한 single-crystal Si는 elastic anisotropy를 가지므로, crystal plane·in-plane azimuth와 holding boundary가 결합될 때 bending 및 strain 분포가 달라질 수 있다.[5] [6] 다만 이 일반 사실만으로 특정 bonder에서 <100> wafer가 <110> wafer보다 항상 불리하다고 단정할 수는 없으며, orientation 효과는 incoming shape·film stress·notch/chuck azimuth를 통제한 뒤 검증해야 한다.
+본 평가 장비에서는 Bottom wafer가 강하게 고정되는 반면, Top wafer는 flip 후 edge/diagonal 방향으로 holding되고 center pin으로 초기 접촉을 형성한다. 이에 따라 Top wafer의 free-state curvature와 비축대칭 shape는 flip, vacuum capture/flattening, 국부 center loading 및 center-to-edge bond wave라는 연속적인 경계조건을 거친다. 본 실험에서 동일 recipe임에도 Top <100> 조건의 overlay residual이 증가했고, tensile/compressive warpage class별로 vacuum과 pin force의 최적점이 달랐으며, tensile-type Top wafer에서는 Upper-chuck runout 증가 경향이 관찰되었다. 본 보고서는 이 관찰을 Bonding Overlay Residual = f(Incoming Wafer State, Bonding Process Condition)이라는 상호작용 문제로 정식화한다. 여기서 관찰 결과는 사실로, crystal anisotropy 및 warpage–runout–bond-wave 연결은 검증이 필요한 working hypothesis로 구분한다.
+ 
+Experimental Method, Results and Discussion
+1. Experimental Method
+Bottom wafer는 <110>으로 고정하고 강하게 chucking하였다. Top wafer는 flip 후 edge/diagonal holding하고 center pin으로 bonding을 개시하였다. 실험은 (i) 동일 recipe에서 Top <110> 대 <100> crystal split, (ii) Top <100>에서 tensile-type 대 compressive-type incoming warpage split, (iii) 각 warpage condition에서 Upper-chuck vacuum과 center-pin force split 순으로 수행하였다. Response는 post-bond overlay residual과 Upper-chuck runout이며, 해석 시 wafer 수·lot·film stack·thickness/TTV·free-state 3D shape·notch azimuth·overlay removal model을 함께 관리해야 한다.
+2. Experimental Results
+1. Crystal split [관찰]: 동일 recipe에서 Top <100> 조건의 overlay residual이 Top <110> 조건보다 증가하였다.
+2. Warpage split [관찰]: Tensile-type과 compressive-type Top wafer는 서로 다른 overlay residual 특성을 보였다.
+3. Recipe interaction [관찰]: Upper vacuum 및 center-pin force 변화에 대한 최적점이 warpage condition별로 달랐다. 이는 Incoming condition × Recipe interaction 가능성을 직접 지지한다.
+4. Runout [관찰]: Tensile-type Top wafer에서 Bottom chuck 대비 Upper-chuck runout이 증가하는 경향이 확인되었다.
+3. Discussion
+문헌으로 지지되는 해석: Si의 elastic anisotropy와 wafer-shape-dependent chucking deformation은 존재하며, bow/saddle shape는 W2W bonding distortion에 영향을 줄 수 있다. 가능한 메커니즘: Incoming warpage → flip 후 curvature/azimuth 변화 → edge capture와 vacuum flattening → frictional slip 또는 centering/IPD 변화 → Upper runout·initial gap 변화 → bond-wave 비대칭 → overlay residual 변화. 이 연쇄는 물리적으로 타당하지만, 현재 데이터만으로 각 화살표의 인과성을 확정할 수는 없다. 특히 runout은 overlay의 직접 원인이라기보다 동일한 chucking deformation을 반영하는 mediator 또는 state proxy일 수 있다.
+Crystal split 역시 orientation 단독 효과로 단정하지 않는다. 동일 wafer를 chuck 기준 0°/45°/90°로 회전하여 free shape–chucked shape/runout–overlay fingerprint의 회전성을 비교하면 wafer-fixed 원인과 tool-fixed 원인을 분리할 수 있다. Warpage 효과는 Warpage × Vacuum × Pin Force factorial DOE로 검증하고, free-state shape → vacuum-ramp runout → pin contact → bond-wave map → overlay를 동일 wafer에서 시간순으로 연결해야 한다.
+4. Conclusion and Process Direction
+
+이번 결과의 핵심은 <100>과 <110>의 단순 우열이 아니라, 동일 recipe의 bonding response가 incoming wafer mechanical condition에 따라 달라졌다는 점이다. 따라서 one-recipe-fits-all 방식 대신 bow/warp scalar와 함께 Zernike saddle/astigmatism, principal curvature/axis, edge height·slope 및 pre-bond grid를 feature화하고, wafer class별 vacuum·pin-force process window를 선택하는 incoming-wafer-aware bonding recipe optimization으로 전환하는 것이 타당하다.
+
+Selected references: [1] Ip et al., Proc. SPIE 12496 (2023); [2] Turner et al., J. Micro/Nanolith. MEMS MOEMS 12, 023007 (2013); [3] Iacovo et al., IEEE ECTC (2023); [4] Kang et al., IEEE ECTC (2025); [5] Hopcroft et al., JMEMS 19, 229–238 (2010); [6] Thomsen et al., Sens. Actuators A 220, 347–364 (2014).
