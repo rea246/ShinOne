@@ -314,6 +314,12 @@ resolution, 실제 representative 수, backend, 전체 parameter 및 해당 run 
 
 ## 11. Comparison with REF representatives
 
+`7.analysis.py`는 6번의 대표군과 REF 20,000개 표본을 learned 40D 기반의 고정
+kPCA 공간에서 비교한다. 기존 handcrafted 21D 분석은 이번 7번의 입력이 아니다.
+별도 방법의 대표군을 추가하는 A/B/REF 비교는 후속 8번에서 수행한다.
+현재 설정, 입력 연결과 8번 재사용 규칙은
+[EXPERIMENTAL_KPCA_ANALYSIS.md](EXPERIMENTAL_KPCA_ANALYSIS.md)에 정의한다.
+
 ShinOne 결과 수는 950~1,050개를 허용한다. Coverage distance는 실제 representative
 수의 영향을 받으므로 비교 보고서에는 각 방법의 representative 수를 반드시 함께
 표시한다.
@@ -325,7 +331,12 @@ Representative set `R`에 대해 population pattern `i`의 coverage distance는 
 d_i(R)=\min_{r\in R}\lVert\tilde z_i-\tilde z_r\rVert_2.
 \]
 
-주요 지표는 다음과 같다.
+7번은 REF 표본에 대해 고정 kPCA 반경의 coverage/gap, H0별 coverage와
+정규화된 40D 최근접 거리 통계를 산출한다. 위 40D 거리 정의와 kPCA 거리/반경은
+서로 다른 지표이며, REF 표본 통계를 전체 population 전수 검사로 해석하지 않는다.
+
+향후 A/B 비교 및 추가 검증의 목표 지표는 다음과 같다. 이 목록 전체를 현재 7번이
+이미 계산한다는 뜻은 아니다.
 
 - 전체 population의 mean/P95/P99 coverage distance
 - rare population의 mean/P95/P99 coverage distance
@@ -344,14 +355,15 @@ Python 3.12 / CUDA 12 환경은 repository installer를 사용한다.
 ./install-py312-cu12.sh /path/to/wheels
 ```
 
-실행은 한 번이다.
+Clustering과 대표 추출은 6번 하나로 끝난다. 이후 7번에서 REF coverage를 분석한다.
 
 ```bash
 python 6.topology_clustering.py
+python 7.analysis.py
 ```
 
-`7.select_representatives.py`는 과거 exact-budget Stage-2 결과를 재처리하기 위한
-legacy utility이며 integrated baseline 실행에는 사용하지 않는다.
+이미 6번 결과가 있으면 7번만 실행한다. 이전 exact-budget 대표 추출 스크립트는 제거했으며
+6번의 대표를 재선정하거나 개수를 1,000개로 맞추지 않는다.
 
 Default Leiden backend에는 CUDA와 호환되는 RAPIDS `cugraph`, `cudf`, `cupy`가
 필요하다. FAISS GPU가 있으면 exact sample graph 및 assignment에 우선 사용하고,
@@ -365,5 +377,6 @@ Default Leiden backend에는 CUDA와 호환되는 RAPIDS `cugraph`, `cudf`, `cup
 - full-population community assignment
 - 약 1,000개의 actual centroid-nearest representative
 
-아직 full-population exact graph와의 assignment stability, sample seed stability 및
-REF representative와의 최종 coverage 결과를 주장하지 않는다.
+7번은 REF 표본에 대한 kPCA coverage/gap 및 40D 최근접 거리 진단을 추가한다.
+아직 full-population exact graph와의 assignment stability, sample seed stability,
+다른 방법 대비 우위 또는 실제 공정 성능 개선을 주장하지 않는다.

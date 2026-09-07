@@ -57,6 +57,7 @@ module_names = (
     "scipy",
     "pandas",
     "sklearn",
+    "threadpoolctl",
     "matplotlib",
     "seaborn",
     "klayout.db",
