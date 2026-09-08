@@ -365,6 +365,10 @@ python 7.analysis.py
 이미 6번 결과가 있으면 7번만 실행한다. 이전 exact-budget 대표 추출 스크립트는 제거했으며
 6번의 대표를 재선정하거나 개수를 1,000개로 맞추지 않는다.
 
+7번 결과는 run 폴더의 `analysis_report.html`을 브라우저로 열어 확인한다. 이미 7번을
+실행했다면 `python 7.analysis.py --replot latest`로 저장된 결과에서 heatmap과 보고서를
+생성할 수 있다. 이 옵션은 kPCA나 coverage 계산을 다시 수행하지 않는다.
+
 Default Leiden backend에는 CUDA와 호환되는 RAPIDS `cugraph`, `cudf`, `cupy`가
 필요하다. FAISS GPU가 있으면 exact sample graph 및 assignment에 우선 사용하고,
 없으면 PyTorch CUDA exact backend가 A100을 사용한다.

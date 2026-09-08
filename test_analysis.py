@@ -4,6 +4,7 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -202,6 +203,40 @@ class AnalysisTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "different"):
                 analysis.load_projection_bundle(path, {"frame_id": np.asarray("frame-B")})
 
+    def test_heatmaps_preserve_counts_full_dimension_labels_and_empty_cells(self):
+        # Same 2D position, different third coordinates and original 3D decisions.
+        points = np.array([[0, 0, 0], [0, 0, 4], [0, 0, 2], [1, 1, 1], [2, 2, 2]])
+        coverage = {"covered": np.array([True, False, True, False, True]),
+                    "distances": np.array([.1, 2.0, .2, 1.0, .3])}
+        grids = analysis.coverage_heatmap_grids(points, coverage, bins=2)
+        self.assertEqual([grid["pair"] for grid in grids], [(0, 1), (0, 2), (1, 2)])
+        for grid in grids:
+            self.assertEqual(grid["ref_counts"].sum(), 5)
+            self.assertEqual(grid["gap_counts"].sum(), 2)
+            self.assertAlmostEqual(np.nansum(grid["mean_distance"]*grid["ref_counts"]), 3.6)
+        first = grids[0]
+        self.assertEqual(first["ref_counts"][0, 0], 3)
+        self.assertAlmostEqual(first["gap_fraction"][0, 0], 1/3)
+        self.assertEqual(first["ref_counts"][1, 1], 2)  # Includes the maximum-edge point.
+        self.assertEqual(first["gap_fraction"][1, 1], .5)
+        self.assertTrue(np.isnan(first["gap_fraction"][0, 1]))
+        self.assertTrue(np.isnan(first["mean_distance"][0, 1]))
+        changed_labels = {**coverage, "covered": ~coverage["covered"]}
+        changed = analysis.coverage_heatmap_grids(points, changed_labels, bins=2)
+        for before, after in zip(grids, changed):
+            np.testing.assert_array_equal(before["x_edges"], after["x_edges"])
+            np.testing.assert_allclose(before["mean_distance"], after["mean_distance"], equal_nan=True)
+
+    def test_heatmap_plots_handle_constant_axes_and_all_covered_or_all_gap(self):
+        reference = {"kpca_coordinates": np.zeros((4, 2))}
+        with tempfile.TemporaryDirectory() as temp, mock.patch.object(analysis, "HEATMAP_BINS", 4):
+            for covered in (True, False):
+                coverage = {"covered": np.full(4, covered, dtype=bool),
+                            "distances": np.full(4, 0.0 if covered else 1.0)}
+                analysis.plot_coverage_heatmaps(Path(temp), reference, coverage, .5)
+                for name in ("kpca_coverage_2d_heatmap.png", "kpca_nearest_distance_2d_heatmap.png"):
+                    self.assertGreater((Path(temp) / name).stat().st_size, 1000)
+
     def test_integration_outputs_and_stage8_contract(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -229,8 +264,28 @@ class AnalysisTest(unittest.TestCase):
                     gap_rows = list(csv.DictReader(fp))
                 self.assertEqual(len(gap_rows), summary["uncovered_ref_count"])
                 self.assertTrue(all(row["cover_status"] == "gap" for row in gap_rows))
-                for name in ("kpca_coverage_2d.png", "kpca_coverage_3d.png", "kpca_coverage_distance_cdf.png"):
+                for name in ("kpca_coverage_2d.png", "kpca_coverage_3d.png", "kpca_coverage_distance_cdf.png",
+                             "kpca_coverage_2d_heatmap.png", "kpca_nearest_distance_2d_heatmap.png"):
                     self.assertGreater((root / "analysis" / name).stat().st_size, 1000)
+                report = (root / "analysis" / "analysis_report.html").read_text(encoding="utf-8")
+                self.assertIn('src="data:image/png;base64,', report)
+                self.assertIn(f'{summary["coverage_fraction"]:.2%}', report)
+                self.assertIn(summary["frame_id"], report)
+                self.assertEqual(report.count('src="data:image/png;base64,'), 5)
+                # An existing run can be viewed again without changing its analysis.
+                data_paths = list((root / "analysis").glob("*.npz"))
+                data_paths.append(root / "analysis" / "coverage_summary.json")
+                original_bytes = {path: path.read_bytes() for path in data_paths}
+                analysis.write_json(root / "latest_run.json",
+                                     {"run_directory": "analysis", "frame_id": summary["frame_id"]})
+                with mock.patch.multiple(analysis, OUT_DIR=root,
+                                         fit_reference_frame=mock.Mock(side_effect=AssertionError("replot must not fit")),
+                                         nearest_distances=mock.Mock(side_effect=AssertionError("replot must not query NN"))):
+                    with mock.patch.object(sys, "argv", ["7.analysis.py", "--replot", "latest"]):
+                        self.assertEqual(analysis.cli(), 0)
+                for path, original in original_bytes.items():
+                    self.assertEqual(path.read_bytes(), original)
+                self.assertIn("[Replot] DONE", (root / "analysis" / "replot.log").read_text())
                 # Change B representatives: REF sample/frame/radius stay unchanged.
                 write_representatives(stage6, cache["keys"], offset=4)
                 with mock.patch.object(analysis, "MAKE_PLOTS", False):

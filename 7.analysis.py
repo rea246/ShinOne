@@ -51,6 +51,7 @@ KERNEL_BACKEND = "auto"        # auto | torch_gpu | numpy_cpu
 GPU_DEVICE = 0
 CPU_THREADS = 8
 MAKE_PLOTS = True
+HEATMAP_BINS = 50             # Per axis; REF-only extent, no smoothing/filtering.
 
 FEATURE_BLOCKS = ("h0", "h1", "h2", "h3", "edge")
 SCHEMA_VERSION = 1
@@ -68,6 +69,7 @@ def validate_config():
         ("GAMMA_PAIR_CAP", GAMMA_PAIR_CAP, 2),
         ("TRANSFORM_BLOCK", TRANSFORM_BLOCK, 1),
         ("DISTANCE_BLOCK", DISTANCE_BLOCK, 1), ("CPU_THREADS", CPU_THREADS, 1),
+        ("HEATMAP_BINS", HEATMAP_BINS, 2),
     ):
         if not isinstance(value, int) or value < minimum:
             raise ValueError(f"{name} must be an integer >= {minimum}")
@@ -531,6 +533,114 @@ def write_scatter_csv(path, bundle, extras=None, selection=None):
     log(f"[Output] {Path(path).name}: {len(indices):,} rows")
 
 
+def kpca_plot_pairs(dimensions):
+    return [(0, 1), (0, 2), (1, 2)] if dimensions >= 3 else [(0, min(1, dimensions-1))]
+
+
+def coverage_heatmap_grids(coordinates, coverage, bins):
+    """Aggregate existing full-KPC decisions onto REF-only 2D grids.
+
+    Empty cells are unknown (NaN), not zero-gap cells. Repeated REF rows count
+    individually, just as in the original coverage calculation. Each pair has
+    its own REF extent; no representative coordinates, KDE, or clipping enter.
+    """
+    coordinates = np.asarray(coordinates, dtype=np.float64)
+    covered = np.asarray(coverage["covered"])
+    distances = np.asarray(coverage["distances"], dtype=np.float64)
+    if (coordinates.ndim != 2 or len(coordinates) == 0 or coordinates.shape[1] < 1
+            or not np.isfinite(coordinates).all()
+            or covered.shape != (len(coordinates),) or covered.dtype != np.dtype(bool)
+            or distances.shape != covered.shape or not np.isfinite(distances).all()
+            or (distances < 0).any() or not isinstance(bins, int) or bins < 2):
+        raise ValueError("invalid heatmap coordinates/coverage/bins")
+    grids = []
+    for a, b in kpca_plot_pairs(coordinates.shape[1]):
+        counts, x_edges, y_edges = np.histogram2d(
+            coordinates[:, a], coordinates[:, b], bins=bins
+        )
+        gap_counts, _, _ = np.histogram2d(
+            coordinates[~covered, a], coordinates[~covered, b], bins=(x_edges, y_edges)
+        )
+        distance_sums, _, _ = np.histogram2d(
+            coordinates[:, a], coordinates[:, b], bins=(x_edges, y_edges), weights=distances
+        )
+        grids.append({
+            "pair": (a, b), "x_edges": x_edges, "y_edges": y_edges,
+            "ref_counts": counts, "gap_counts": gap_counts,
+            "gap_fraction": np.divide(gap_counts, counts,
+                                      out=np.full_like(counts, np.nan), where=counts > 0),
+            "mean_distance": np.divide(distance_sums, counts,
+                                       out=np.full_like(counts, np.nan), where=counts > 0),
+        })
+    return grids
+
+
+def plot_coverage_heatmaps(run_dir, reference, coverage, radius):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import LogNorm, Normalize
+    from matplotlib.ticker import PercentFormatter
+
+    started = time.perf_counter()
+    run_dir = Path(run_dir)
+    coordinates = reference["kpca_coordinates"]
+    grids = coverage_heatmap_grids(coordinates, coverage, HEATMAP_BINS)
+    log(f"[Heatmap] START grid={HEATMAP_BINS}x{HEATMAP_BINS}, "
+        f"REF={len(coordinates):,}; empty cells masked, original coverage labels retained")
+    empty_color = "#e6e9ec"
+    density_cmap = plt.get_cmap("Blues").copy()
+    gap_cmap = plt.get_cmap("YlOrRd").copy()
+    density_cmap.set_bad(empty_color)
+    gap_cmap.set_bad(empty_color)
+    count_norm = LogNorm(vmin=1, vmax=max(2, max(g["ref_counts"].max() for g in grids)))
+    gap_norm = Normalize(vmin=0, vmax=1)
+    note = (f"Gray: no sampled REF | {HEATMAP_BINS}x{HEATMAP_BINS} bins per panel | "
+            f"distances use all {coordinates.shape[1]} scaled KPCs")
+    fig, axes = plt.subplots(2, len(grids), figsize=(5*len(grids)+1, 8.4),
+                             squeeze=False, constrained_layout=True)
+    for column, grid in enumerate(grids):
+        a, b = grid["pair"]
+        for row in range(2):
+            axes[row, column].set(xlabel=f"KP{a+1}", ylabel=f"KP{b+1}",
+                                  xlim=grid["x_edges"][[0, -1]], ylim=grid["y_edges"][[0, -1]])
+        count_image = axes[0, column].pcolormesh(
+            grid["x_edges"], grid["y_edges"], np.ma.masked_equal(grid["ref_counts"].T, 0),
+            cmap=density_cmap, norm=count_norm, shading="flat", rasterized=True,
+        )
+        gap_image = axes[1, column].pcolormesh(
+            grid["x_edges"], grid["y_edges"], np.ma.masked_invalid(grid["gap_fraction"].T),
+            cmap=gap_cmap, norm=gap_norm, shading="flat", rasterized=True,
+        )
+        axes[0, column].set_title(f"KP{a+1} / KP{b+1}: REF count")
+        axes[1, column].set_title(f"KP{a+1} / KP{b+1}: uncovered fraction")
+    fig.colorbar(count_image, ax=axes[0, :].tolist(), label="REF patterns per bin (log scale)", shrink=.9)
+    fig.colorbar(gap_image, ax=axes[1, :].tolist(), label="Uncovered / REF in bin",
+                 ticks=[0, .25, .5, .75, 1], format=PercentFormatter(xmax=1), shrink=.9)
+    fig.suptitle(f"REF density and coverage gaps | Fixed R = {radius:.4g}\n{note}", fontsize=12)
+    fig.savefig(run_dir / "kpca_coverage_2d_heatmap.png", dpi=160)
+    plt.close(fig)
+
+    # This map uses the saved nearest distances directly and is independent of R.
+    max_distance = max(float(np.nanmax(g["mean_distance"])) for g in grids)
+    distance_norm = Normalize(vmin=0, vmax=max_distance if max_distance > 0 else 1)
+    fig, axes = plt.subplots(1, len(grids), figsize=(5*len(grids)+1, 4.5),
+                             squeeze=False, constrained_layout=True)
+    for ax, grid in zip(axes[0], grids):
+        a, b = grid["pair"]
+        distance_image = ax.pcolormesh(
+            grid["x_edges"], grid["y_edges"], np.ma.masked_invalid(grid["mean_distance"].T),
+            cmap=gap_cmap, norm=distance_norm, shading="flat", rasterized=True,
+        )
+        ax.set(xlabel=f"KP{a+1}", ylabel=f"KP{b+1}", title=f"KP{a+1} / KP{b+1}",
+               xlim=grid["x_edges"][[0, -1]], ylim=grid["y_edges"][[0, -1]])
+    fig.colorbar(distance_image, ax=axes[0].tolist(), label="Mean nearest B distance (scaled KPC)", shrink=.9)
+    fig.suptitle(f"Nearest-representative distance by region (no coverage threshold)\n{note}", fontsize=12)
+    fig.savefig(run_dir / "kpca_nearest_distance_2d_heatmap.png", dpi=160)
+    plt.close(fig)
+    log(f"[Heatmap] DONE density/gap and nearest-distance maps, elapsed={time.perf_counter()-started:.1f}s")
+
+
 def plot_coverage(run_dir, reference, sample, coverage, radius):
     import matplotlib
     matplotlib.use("Agg")
@@ -539,7 +649,7 @@ def plot_coverage(run_dir, reference, sample, coverage, radius):
     yr, ys = reference["kpca_coordinates"], sample["kpca_coordinates"]
     covered = coverage["covered"]
     colors = {"covered": "#9caaaf", "gap": "#ce5f3d", "sample": "#156b91"}
-    pairs = [(0, 1), (0, 2), (1, 2)] if yr.shape[1] >= 3 else [(0, min(1, yr.shape[1]-1))]
+    pairs = kpca_plot_pairs(yr.shape[1])
     fig, axes = plt.subplots(1, len(pairs), figsize=(5*len(pairs), 4.5), squeeze=False)
     for ax, (a, b) in zip(axes[0], pairs):
         ax.scatter(yr[covered, a], yr[covered, b], s=3, alpha=.3,
@@ -578,6 +688,150 @@ def plot_coverage(run_dir, reference, sample, coverage, radius):
     fig.savefig(run_dir / "kpca_coverage_distance_cdf.png", dpi=160)
     plt.close(fig)
     log("[Plot] DONE coverage projections and distance CDF")
+    plot_coverage_heatmaps(run_dir, reference, coverage, radius)
+
+
+def write_html_report(run_dir, summary):
+    """Human-readable, offline report. All plot images are embedded in the HTML."""
+    import base64
+    from html import escape
+
+    run_dir = Path(run_dir)
+
+    def number(value, style="distance"):
+        if value is None:
+            return "—"
+        if style == "count":
+            return f"{int(value):,}"
+        if style == "percent":
+            return f"{float(value):.2%}"
+        return f"{float(value):.6g}"
+
+    def table(headers, rows):
+        head = "".join(f"<th>{escape(str(value))}</th>" for value in headers)
+        body = "".join("<tr>" + "".join(f"<td>{escape(str(value))}</td>" for value in row)
+                       + "</tr>" for row in rows)
+        return f'<div class="table-wrap"><table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>'
+
+    card_values = [
+        ("REF 표본", number(summary.get("ref_sample_count"), "count")),
+        ("대표 패턴 B", number(summary.get("topology_representative_count"), "count")),
+        ("Coverage", number(summary.get("coverage_fraction"), "percent")),
+        ("미커버 REF", number(summary.get("uncovered_ref_count"), "count")),
+        ("고정 반경 R", number(summary.get("radius"))),
+        ("학습 landmark", number(summary.get("landmark_count"), "count")),
+    ]
+    cards = "".join(f'<div class="card"><span>{escape(label)}</span><strong>{escape(value)}</strong></div>'
+                    for label, value in card_values)
+    distance_rows = []
+    for label, key in (("표준화 kPCA", "nearest_distance_kpca"),
+                       ("정규화 원본 embedding", "nearest_distance_40d")):
+        values = summary.get(key) or {}
+        distance_rows.append([label] + [number(values.get(stat)) for stat in ("mean", "median", "p95", "p99", "max")])
+    distance_table = table(["거리 공간", "평균", "중앙값 (R50)", "P95 (R95)", "P99 (R99)", "최댓값"], distance_rows)
+    group_rows = [["rare (-1)" if row["h0_label"] == -1 else f'H0_{row["h0_label"]}',
+                   number(row["sampled_ref_count"], "count"),
+                   number(row["coverage_fraction"], "percent"),
+                   number((row.get("nearest_distance") or {}).get("p95"))]
+                  for row in summary.get("h0_breakdown", [])]
+    group_table = table(["H0 그룹", "REF 표본 수", "Coverage", "kPCA 거리 P95"], group_rows)
+    setting_rows = [
+        ("REF 모집단 수", number(summary.get("ref_population_count"), "count")),
+        ("원본 embedding 차원", number(summary.get("feature_dimension"), "count")),
+        ("kPCA 차원", number(summary.get("kpc_components"), "count")),
+        ("반경 산정용 REF 이웃 순위", number(summary.get("radius_k"), "count")),
+        ("고정 비교 예산", number(summary.get("radius_budget"), "count")),
+        ("REF 표본과 대표 목록의 중복 수", number(summary.get("ref_sample_representative_overlap"), "count")),
+        ("대표 자체와의 중복을 제외한 보조 coverage", number(summary.get("coverage_fraction_excluding_representative_self_hits"), "percent")),
+        ("RBF gamma", number(summary.get("gamma"))),
+        ("유지한 landmark kernel variance mass", number(summary.get("retained_landmark_kernel_mass_fraction"), "percent")),
+        ("Sampling seed", number(summary.get("random_seed"), "count")),
+    ]
+    settings = table(["분석 조건", "값"], setting_rows)
+    figures = []
+    for filename, title, caption in (
+        ("kpca_coverage_2d_heatmap.png", "어디에 REF가 있고, 어디를 놓쳤는가",
+         "위: 칸별 REF 수(로그 색상). 아래: 그 칸 REF 중 미커버 비율. 빨갈수록 미커버 비율이 높습니다. "
+         "회색은 REF 표본이 없는 칸입니다. REF 수가 적은 칸의 비율은 위쪽 밀도와 함께 확인하세요."),
+        ("kpca_nearest_distance_2d_heatmap.png", "반경을 정하지 않고 보는 대표와의 거리",
+         "칸별 REF의 최근접 대표 거리 평균입니다. 빨갈수록 대표에서 멀리 떨어진 영역입니다. "
+         "거리 계산은 전체 kPCA 축을 사용하고, 표시만 두 축으로 모았습니다."),
+        ("kpca_coverage_distance_cdf.png", "R에 따른 coverage 변화",
+         "가로축 거리까지 허용할 때, 세로축만큼의 REF가 커버됩니다. 세로 점선은 이번 실행의 고정 R입니다."),
+        ("kpca_coverage_2d.png", "개별 패턴의 위치", "기존 2차원 scatter입니다. Heatmap에서 발견한 영역의 개별 점 분포를 확인합니다."),
+        ("kpca_coverage_3d.png", "3차원에서 본 분포", "첫 세 kPCA 축으로 REF와 대표 패턴의 위치를 표시합니다."),
+    ):
+        path = run_dir / filename
+        if path.is_file():
+            encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+            figures.append(f'<section><h2>{escape(title)}</h2><p>{escape(caption)}</p>'
+                           f'<img alt="{escape(title)}" src="data:image/png;base64,{encoded}"></section>')
+    if not figures:
+        figures.append("<p>이번 실행에서는 그래프를 생성하지 않았습니다.</p>")
+    css = """
+    *{box-sizing:border-box} body{margin:0;background:#f2f5f7;color:#213744;font:16px/1.6 system-ui,sans-serif}
+    main{max-width:1440px;margin:auto;padding:28px} h1{margin:0 0 8px;font-size:28px} h2{font-size:21px;margin:0 0 12px}
+    p{margin:8px 0 16px} .muted{color:#526b79;font-size:14px} .cards{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin:24px 0}
+    .card,section{background:white;border:1px solid #d9e2e8;border-radius:12px;padding:22px}
+    .card span{display:block;color:#526b79} .card strong{display:block;font-size:28px;color:#156b91}
+    section{margin:20px 0} img{display:block;width:100%;height:auto} .table-wrap{overflow-x:auto}
+    table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums} th,td{text-align:right;padding:10px 14px;border-bottom:1px solid #e6edf1;white-space:nowrap}
+    th{background:#edf3f6} th:first-child,td:first-child{text-align:left} footer{color:#526b79;font-size:13px;overflow-wrap:anywhere}
+    @media(max-width:700px){main{padding:14px}.cards{grid-template-columns:repeat(2,1fr);gap:10px}.card,section{padding:14px}h1{font-size:24px}.card strong{font-size:24px}}
+    """
+    html = f'''<!doctype html>
+<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Topology coverage 분석</title><style>{css}</style></head><body><main>
+<h1>Topology 대표 패턴 coverage 분석</h1><p class="muted">실행: {escape(run_dir.name)}</p>
+<p>Coverage는 가장 가까운 대표 패턴까지의 거리가 R 이내인 REF 표본의 비율입니다.
+거리 단위는 REF 축 표준편차로 조정한 kPCA 거리입니다. 전체 모집단의 전수 검사나 공정 길이 단위로 해석하지 않습니다.</p>
+<div class="cards">{cards}</div>
+{''.join(figures)}
+<section><h2>최근접 거리 요약</h2><p>kPCA 행의 R50·R95·R99는 해당 비율의 REF를 커버하는 데 필요한 거리의 표본 분위수입니다.
+원본 embedding 행은 별도의 거리 공간에서 계산한 보조 지표입니다.</p>{distance_table}</section>
+<section><h2>H0 그룹별 coverage</h2>{group_table}</section>
+<section><h2>분석 조건</h2>{settings}</section>
+<footer>그림을 포함한 이 보고서는 인터넷 연결 없이 열 수 있습니다.<br>Frame ID: {escape(str(summary.get('frame_id', '—')))}</footer>
+</main></body></html>'''
+    (run_dir / "analysis_report.html").write_text(html, encoding="utf-8")
+    log("[Report] SAVED analysis_report.html (offline, images embedded)")
+
+
+def replot_saved_run(run):
+    """Render from existing NPZ snapshots; do not refit, resample, or rerun NN."""
+    expected_frame_id = None
+    if str(run) == "latest":
+        with (Path(OUT_DIR) / "latest_run.json").open(encoding="utf-8") as fp:
+            pointer = json.load(fp)
+        run_dir = Path(OUT_DIR) / pointer["run_directory"]
+        expected_frame_id = pointer["frame_id"]
+    else:
+        run_dir = Path(run).expanduser().resolve()
+    with (run_dir / "replot.log").open("a", encoding="utf-8", buffering=1) as fp:
+        with contextlib.redirect_stdout(_Tee(sys.stdout, fp)), contextlib.redirect_stderr(_Tee(sys.stderr, fp)):
+            log(f"[Replot] START run={run_dir}")
+            try:
+                frame = load_reference_frame(run_dir / "reference_frame.npz")
+                if expected_frame_id is not None and str(frame["frame_id"].item()) != expected_frame_id:
+                    raise ValueError("latest run pointer has a different frame ID")
+                reference = load_projection_bundle(run_dir / "reference_sample.npz", frame)
+                sample = load_projection_bundle(run_dir / "topology_sample.npz", frame)
+                coverage = {"covered": reference["covered_by_topology"],
+                            "distances": reference["nearest_topology_distances"]}
+                radius = float(frame["radius"])
+                if not np.array_equal(coverage["covered"], coverage["distances"] <= radius):
+                    raise ValueError("saved coverage labels differ from saved distances/radius")
+                with (run_dir / "coverage_summary.json").open(encoding="utf-8") as summary_file:
+                    summary = json.load(summary_file)
+                if summary["frame_id"] != str(frame["frame_id"].item()):
+                    raise ValueError("saved summary belongs to a different kPCA frame")
+                plot_coverage(run_dir, reference, sample, coverage, radius)
+                write_html_report(run_dir, summary)
+            except Exception:
+                traceback.print_exc()
+                return 1
+            log(f"[Replot] DONE frame_id={str(frame['frame_id'].item())}, R={radius:.8g}")
+    return 0
 
 
 def main(run_dir):
@@ -698,6 +952,7 @@ def analyze(run_dir):
         "elapsed_seconds": time.perf_counter() - started,
     }
     write_json(run_dir / "coverage_summary.json", summary)
+    write_html_report(run_dir, summary)
     log(f"[Result] sampled REF covered={covered.sum():,}/{len(covered):,} ({covered.mean():.2%}), "
         f"gaps={(~covered).sum():,}, self_hits={overlap.sum():,}")
     log(f"[Result] DONE elapsed={time.perf_counter() - started:.1f}s; {run_dir}")
@@ -745,5 +1000,16 @@ def run_with_log():
     return 0
 
 
+def cli():
+    import argparse
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--replot", metavar="RUN_DIRECTORY_OR_latest",
+                        help="redraw plots from saved Stage-7 snapshots without rerunning analysis")
+    args = parser.parse_args()
+    if args.replot is not None:
+        return replot_saved_run(args.replot)
+    return run_with_log()
+
+
 if __name__ == "__main__":
-    raise SystemExit(run_with_log())
+    raise SystemExit(cli())

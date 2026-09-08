@@ -6,6 +6,23 @@
 python 7.analysis.py
 ```
 
+사람이 결과를 읽을 때는 결과 폴더의 `analysis_report.html`을 브라우저로 연다.
+요약 수치·표·그래프를 한 페이지에서 보며, 이미지를 HTML 안에 포함해 인터넷 연결이나
+추가 뷰어 설치가 필요 없다. JSON/NPZ는 자동 처리와 후속 8번 재사용용으로 유지한다.
+
+이미 성공한 7번 결과가 있으면 kPCA를 다시 실행하지 않고 새 heatmap과 보고서만 포함해
+그림을 재생성할 수 있다.
+
+```bash
+python 7.analysis.py --replot latest
+# 특정 run을 지정할 수도 있다.
+python 7.analysis.py --replot topology_analysis_out/run_<timestamp>
+```
+
+`--replot`은 기존 run의 PNG/HTML을 갱신하고 `replot.log`를 추가 기록한다. 저장된
+REF 표본·좌표계·반경·거리·coverage를 그대로 읽으며 NPZ/JSON/CSV와 latest pointer는
+수정하지 않는다. 원본 cache나 GPU 없이도 NumPy와 Matplotlib로 재시각화할 수 있다.
+
 6번에서 이미 선택한 약 1,000개의 실제 대표 패턴(B)을 REF와 비교한다.
 6번의 clustering/representative selection은 다시 수행하지 않는다.
 외부 방식 대표군(A)을 읽고 A/B/REF를 비교하는 작업은 **후속 8번의 범위**다.
@@ -134,6 +151,7 @@ REF k번째 이웃 계산에서는 self 한 개를 제외한다. 같은 위치�
 
 | Output | Contents |
 |---|---|
+| `analysis_report.html` | 사람이 읽는 요약 수치·거리 통계·H0별 표·그래프; 이미지를 내장한 오프라인 보고서 |
 | `analysis.log` | 입력·sampling·fit·block transform·coverage·저장 단계와 Python 예외 |
 | `reference_frame.npz` | scaler, block multiplier, landmarks, gamma, kernel centering, eigenpairs, KPC scale, REF rows, 고정 radius, frame hash |
 | `reference_sample.npz` | REF 20K key/row/label, 원본 40D와 normalized 40D, KPC 좌표, B 최근접 거리·coverage |
@@ -145,10 +163,25 @@ REF k번째 이웃 계산에서는 self 한 개를 제외한다. 같은 위치�
 | `kpca_coverage_2d.png` | KPC pair별 REF covered/gap과 B의 겹침 |
 | `kpca_coverage_3d.png` | 같은 점들의 KP1–3 view |
 | `kpca_coverage_distance_cdf.png` | 최근접 B 거리의 누적분포와 고정 반경 |
+| `kpca_coverage_2d_heatmap.png` | 위쪽: 칸별 REF 수(로그 색상), 아래쪽: 칸별 미커버 비율; KP1/2, KP1/3, KP2/3 |
+| `kpca_nearest_distance_2d_heatmap.png` | 칸별 최근접 B 거리의 평균; coverage 반경을 사용하지 않는 거리 지도 |
 
 도표는 2D/3D 투영이며 coverage label은 설정한 모든 KPC 차원을 사용해 계산한다.
 일부 고밀도 gap만 저장하는 것이 아니라 추출된 REF에서 발견한 gap 전부를 저장한다.
 원래 수백만 REF의 gap 전량을 검사했다는 뜻은 아니다.
+
+Heatmap은 `HEATMAP_BINS=50`의 50×50 격자로 각 KP pair를 표시한다. 경계는 각 pair의
+REF 최솟값/최댓값만으로 정하며, 모든 REF 점과 중복 좌표를 유지한다. 밀도 그림의 색은
+확률밀도 추정치가 아니라 해당 칸의 REF 개수다. 같은 종류의 세 패널은 같은 색상 범위를 쓴다.
+
+- 미커버 비율은 `해당 칸의 gap REF 수 / 해당 칸의 전체 REF 수`다.
+- 최근접 거리 지도는 해당 칸 REF의 저장된 전체-KPC 최근접 거리 평균이다.
+- **회색은 REF 표본이 없는 칸**이다. 이를 coverage 100% 또는 gap 0%로 처리하지 않는다.
+- 원래 전체-KPC coverage 판정을 2D 위치별로 집계한다. 2D에서 거리를 다시 계산하거나
+  KDE/smoothing으로 비어 있는 영역을 채우지 않는다. 숨겨진 축의 서로 다른 점들이 같은
+  칸으로 모일 수 있다.
+- REF가 적은 칸에서도 gap 비율 100%가 나올 수 있으므로 위쪽 REF 수와 함께 해석한다.
+- 격자 수는 시각화 해상도만 바꾸며, 기존 개별 패턴 coverage·반경·통계는 바꾸지 않는다.
 
 ## 7. Stage-8 contract (not implemented yet)
 
