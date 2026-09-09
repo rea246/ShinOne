@@ -22,7 +22,7 @@ python 7.analysis.py --replot topology_analysis_out/run_<timestamp>
 `--replot`은 기존 run의 PNG/HTML을 갱신하고 `replot.log`를 추가 기록한다. 저장된
 REF 표본·좌표계·반경·기존 대표까지의 거리·coverage를 그대로 읽으며 기존 분석의
 NPZ/JSON/CSV와 latest pointer는 수정하지 않는다. 미커버 진단 대표를 계산해 별도의
-`uncovered_gap_*` 결과를 생성/갱신한다. 원본 cache나 GPU 없이도 NumPy, SciPy,
+`uncovered_gap_*` 결과를 현재의 100% 미커버 bin 규칙으로 생성/갱신한다. 원본 cache나 GPU 없이도 NumPy, SciPy,
 Matplotlib로 후처리와 재시각화가 가능하다.
 
 6번에서 이미 선택한 약 1,000개의 실제 대표 패턴(B)을 REF와 비교한다.
@@ -147,37 +147,67 @@ REF k번째 이웃 계산에서는 self 한 개를 제외한다. 같은 위치�
 
 ### Uncovered REF의 진단 대표군
 
-고정 R에서 미커버로 판정된 REF만 모아 **현재 표준화 kPCA 공간의 모든 축**에서
-진단 대표를 추린다. 6번의 기존 대표군(B), H0/topology label, REF와 kPCA frame,
-coverage 통계는 유지한다. 진단 그룹 ID `G0001` 등은 6번의 community ID와 별개다.
+진단 대표의 후보는 **heatmap에서 해당 칸의 REF가 전부 미커버인 bin 내부의 REF**로 제한한다.
+설명할 때는 “이 칸에서 관측한 REF는 모두 놓쳤으며, 그 안에서 뽑은 실제 패턴이 이것이다”라고
+표현한다. 전체 coverage의 판정 기준은 계속 표준화 kPCA의 최근접 거리 `d_B(r) > R`이다.
+
+1. 기존 heatmap과 같은 REF 좌표·축 쌍·`HEATMAP_BINS=50` 경계를 사용한다.
+2. `REF count > 0`이고 `gap count == REF count`인 bin만 남긴다. 빈 칸이나 표시 반올림으로
+   100%처럼 보이는 칸은 포함하지 않는다. REF가 하나뿐인 칸도 포함하며 그 개수를 기록한다.
+3. KP1/KP2, KP1/KP3, KP2/KP3 중 **하나라도** 조건에 맞는 bin에 속하면 후보로 삼는다.
+   서로 다른 그림에서 같은 REF가 선정되어도 global row 기준 한 번만 센다.
+4. 모든 그림에서 혼합 bin에만 있는 미커버 REF는 진단 후보에서 제외한다. 이 REF도
+   전체 coverage 통계와 `uncovered_kpca_gap_patterns.csv`에는 그대로 남는다.
+
+이 후보 집합에만 기존 **모든 표준화 kPCA 축의 반경 기반 대표 추출**을 적용한다.
+6번의 기존 대표군(B), H0/topology label, REF와 kPCA frame, coverage 통계는 유지한다.
+진단 그룹 ID `G0001` 등은 6번의 community ID와 별개다. bin 하나당 반드시 대표 하나를
+고르는 방식은 아니며, 대표 추출 후보를 설명 가능한 영역으로 제한하는 변경이다.
 
 기본 묶음 반경은 `GAP_RADIUS_MULTIPLIER=1.0`으로 기존 coverage R과 같다.
 
-1. 기존 대표군에서 가장 멀리 떨어진 미커버 REF를 첫 진단 대표로 선택한다.
-2. 나머지 미커버 REF에서 지금까지 선택한 진단 대표 중 최근접 거리를 계산한다.
+1. 기존 대표군에서 가장 멀리 떨어진 후보 REF를 첫 진단 대표로 선택한다.
+2. 나머지 후보 REF에서 지금까지 선택한 진단 대표 중 최근접 거리를 계산한다.
 3. 그 거리가 가장 큰 REF를 다음 대표로 선택한다.
-4. 모든 미커버 REF가 진단 대표 중 하나의 묶음 반경 안에 들어오면 종료한다.
+4. 모든 후보 REF가 진단 대표 중 하나의 묶음 반경 안에 들어오면 종료한다.
 5. 최근접 진단 대표에 구성원을 배정하고, 구성원 수 내림차순으로 그룹 번호를 붙인다.
 
 모든 대표는 **실제 미커버 패턴**이다. 평균 벡터나 생성된 가상 패턴을 출력하지 않는다.
 동률은 global row/선택 순서로 결정해 입력 행 순서에 영향받지 않는다. 중복 좌표의
-서로 다른 REF는 구성원 수에 모두 반영하며, 고립된 패턴도 버리지 않는다. gap이 없으면
-대표 0개와 빈 CSV/NPZ를 정상 출력한다. R이 0이면 동일 좌표끼리만 묶는다.
+서로 다른 REF는 구성원 수에 모두 반영하며, 조건을 만족한 고립 패턴도 버리지 않는다.
+gap이 없거나 100% 미커버 bin이 하나도 없으면 대표 0개와 빈 CSV/NPZ를 정상 출력한다.
+후자의 경우에도 전체 gap 수를 0으로 바꾸지 않으며 보고서에 두 상황을 구분한다.
+R이 0이면 동일 좌표끼리만 묶는다.
 
 이는 반경 내의 누락 영역을 설명하는 farthest-first 대표이며 centroid-nearest/medoid
-추출과는 다르다. 대표 수는 미커버 분포와 반경으로 결정하고 1,000개 등의 목표 수로
+추출과는 다르다. 대표 수는 후보 분포와 반경으로 결정하고 1,000개 등의 목표 수로
 자르지 않는다. 최소 개수의 대표라는 보장도 하지 않는다. 후보 간 N×N 행렬 없이 선택된
-대표 하나와 전체 gap의 거리를 차례로 계산한다.
+대표 하나와 전체 후보의 거리를 차례로 계산한다.
 
-각 그룹은 미커버 REF 구성원 수, gap 중 비중, 전체 REF 표본 중 비중, 실제 대표 ID/row,
+각 그룹은 후보 REF 구성원 수, 전체 gap/고유 후보/전체 REF 표본 중 비중, 실제 대표 ID/row,
 기존 대표까지의 거리, 그룹의 거리 통계와 H0 구성을 기록한다. 구성원과 진단 대표의
 최대 거리도 기록해 반경 조건을 확인한다. 이 묶음이 실제 형상/공정 특성의 동일성을
 보장하는 것은 아니며, 원본 40D와 ID로 실제 패턴을 후속 확인한다.
 
 HTML과 위치 그림은 구성원 수 상위 `GAP_PREVIEW_GROUPS=20`개를 먼저 표시한다.
+**각 대표는 자기 bin이 100% 미커버인 축 쌍에만** 마름모로 그린다. 따라서 KP1/KP3에서
+선정되었지만 KP1/KP2에서는 혼합 bin에 놓인 대표를 KP1/KP2에도 표시하는 혼동을 피한다.
+번호는 실제 위치에서 가독성을 위해 이동시키며 연결선 끝의 마름모가 실제 패턴 위치다.
+표에 해당 bin과 REF 수를 함께 제시한다. 후보 합집합은 한 번만 세지만, 축 쌍별 bin의
+REF 수를 단순 합산하면 같은 REF가 중복되므로 전체 후보 수와는 다를 수 있다.
 나머지 그룹도 HTML의 펼침 표 및 CSV/NPZ/JSON에 전부 보존한다. 표시 제한은 추출 수에
 영향을 주지 않는다. 진단 대표를 기존 대표군에 자동 추가하거나, 이 REF에서 골랐다는
 이유만으로 독립적인 coverage 개선을 주장하지 않는다.
+
+대표와 각 구성원에 100% 미커버 bin ID를 기록한다. bin ID는 축 쌍과 1부터 시작하는
+x/y bin 번호를 포함하며, `uncovered_gap_bins.csv`에 원래 KP 좌표의 경계와 REF 수를 저장한다.
+bin은 왼쪽/아래 경계를 포함하고 오른쪽/위 경계는 제외하되, 각 축의 마지막 bin은
+최댓값도 포함한다. 이는 NumPy histogram과 같은 규칙이다.
+
+이후 `HEATMAP_BINS`를 바꾸면 **진단 후보와 대표도 바뀐다**. 기존 전체 coverage와
+R은 바뀌지 않는다. 대표를 뽑은 조건은 진단 JSON/NPZ에 저장한다. 진단 JSON은 schema 2이며,
+`uncovered_ref_count`는 전체 gap, `eligible_ref_count`는 중복 제거한 100% bin 후보,
+`assigned_uncovered_ref_count`는 그룹에 배정된 후보 수다. 기존 Stage-8 frame schema는 유지한다.
 
 ## 6. Outputs
 
@@ -201,13 +231,15 @@ HTML과 위치 그림은 구성원 수 상위 `GAP_PREVIEW_GROUPS=20`개를 먼�
 | `kpca_coverage_distance_cdf.png` | 최근접 B 거리의 누적분포와 고정 반경 |
 | `kpca_coverage_2d_heatmap.png` | 위쪽: 칸별 REF 수(로그 색상), 아래쪽: 칸별 미커버 비율; KP1/2, KP1/3, KP2/3 |
 | `kpca_nearest_distance_2d_heatmap.png` | 칸별 최근접 B 거리의 평균; coverage 반경을 사용하지 않는 거리 지도 |
-| `uncovered_gap_representatives.csv` / `.npz` | 그룹별 실제 미커버 대표의 ID/row, 원본 40D·좌표, 구성원 수와 기존 대표까지의 거리 |
-| `uncovered_gap_members.csv` | 미커버 REF 전량의 그룹·진단 대표 연결, 진단 대표/기존 대표까지의 거리 |
-| `uncovered_gap_summary.json` | 묶음 반경·방법·입력 fingerprint, 모든 진단 그룹의 크기·거리 통계·H0 구성 |
-| `kpca_uncovered_representatives_2d.png` | 미커버 비율 heatmap 위에 상위 그룹 대표의 위치/번호 표시; HTML 표와 연결 |
+| `uncovered_gap_representatives.csv` / `.npz` | 100% 미커버 bin에서 추린 실제 대표의 ID/row, 원본 40D·좌표, 구성원 수·거리·해당 bin ID |
+| `uncovered_gap_members.csv` | 100% bin 후보 REF의 그룹·진단 대표 연결, 거리와 해당 bin ID; 혼합 bin gap은 제외 |
+| `uncovered_gap_bins.csv` | 조건을 충족한 모든 bin의 축 쌍·번호·KP 좌표 경계·REF 수·gap 수 |
+| `uncovered_gap_summary.json` | 전체 gap/후보/제외 수, bin 설정·경계, 반경·방법·입력 fingerprint, 진단 그룹 통계 |
+| `kpca_uncovered_representatives_2d.png` | 상위 그룹 대표를 각 대표의 bin이 100% 미커버인 축 쌍에만 표시; HTML 표와 연결 |
 
 도표는 2D/3D 투영이며 coverage label은 설정한 모든 KPC 차원을 사용해 계산한다.
-일부 고밀도 gap만 저장하는 것이 아니라 추출된 REF에서 발견한 gap 전부를 저장한다.
+`uncovered_kpca_gap_patterns.csv`는 추출된 REF에서 발견한 gap 전부를 저장한다.
+별도 `uncovered_gap_*` 진단 대표 출력은 100% 미커버 bin의 후보만 다룬다.
 원래 수백만 REF의 gap 전량을 검사했다는 뜻은 아니다.
 
 Heatmap은 `HEATMAP_BINS=50`의 50×50 격자로 각 KP pair를 표시한다. 경계는 각 pair의
@@ -221,7 +253,8 @@ REF 최솟값/최댓값만으로 정하며, 모든 REF 점과 중복 좌표를 �
   KDE/smoothing으로 비어 있는 영역을 채우지 않는다. 숨겨진 축의 서로 다른 점들이 같은
   칸으로 모일 수 있다.
 - REF가 적은 칸에서도 gap 비율 100%가 나올 수 있으므로 위쪽 REF 수와 함께 해석한다.
-- 격자 수는 시각화 해상도만 바꾸며, 기존 개별 패턴 coverage·반경·통계는 바꾸지 않는다.
+- 격자 수는 시각화 해상도와 100% 미커버 bin 진단 후보를 바꾸며, 기존 개별 패턴
+  coverage·반경·통계는 바꾸지 않는다.
 
 ## 7. Stage-8 contract (not implemented yet)
 

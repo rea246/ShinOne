@@ -54,6 +54,26 @@ def write_representatives(directory, keys, offset):
             writer.writerow([row, keys[row], 0 if row < 40 else -1, (row % 40)//10])
 
 
+def make_gap_fixture(points, radius):
+    points = np.asarray(points, dtype=float)
+    rows = np.arange(10, 10+len(points))
+    raw = np.pad(points, ((0, 0), (0, 40-points.shape[1])))
+    distances = np.linalg.norm(points-points[0], axis=1)
+    reference = {
+        "frame_id": np.asarray("test-frame"), "global_rows": rows,
+        "pattern_keys": np.asarray([f"p-{i}" for i in rows]),
+        "h0_labels": np.zeros(len(rows), dtype=int), "topology_labels": np.zeros(len(rows), dtype=int),
+        "raw_embeddings": raw, "normalized_embeddings": raw,
+        "kpca_coordinates": points, "distance_coordinates": points,
+        "feature_names": np.asarray([f"feature-{i}" for i in range(40)]),
+        "nearest_topology_distances": distances, "covered_by_topology": distances <= radius,
+        "nearest_topology_global_rows": np.full(len(rows), rows[0]),
+    }
+    sample = {"frame_id": reference["frame_id"], "global_rows": rows[:1],
+              "pattern_keys": reference["pattern_keys"][:1]}
+    return reference, sample
+
+
 class AnalysisTest(unittest.TestCase):
     def setUp(self):
         self.stdout = contextlib.redirect_stdout(io.StringIO())
@@ -214,6 +234,9 @@ class AnalysisTest(unittest.TestCase):
             self.assertEqual(grid["ref_counts"].sum(), 5)
             self.assertEqual(grid["gap_counts"].sum(), 2)
             self.assertAlmostEqual(np.nansum(grid["mean_distance"]*grid["ref_counts"]), 3.6)
+            reconstructed = np.zeros((2, 2), dtype=int)
+            np.add.at(reconstructed, tuple(grid["ref_bin_indices"].T), 1)
+            np.testing.assert_array_equal(reconstructed, grid["ref_counts"])
         first = grids[0]
         self.assertEqual(first["ref_counts"][0, 0], 3)
         self.assertAlmostEqual(first["gap_fraction"][0, 0], 1/3)
@@ -236,6 +259,104 @@ class AnalysisTest(unittest.TestCase):
                 analysis.plot_coverage_heatmaps(Path(temp), reference, coverage, .5)
                 for name in ("kpca_coverage_2d_heatmap.png", "kpca_nearest_distance_2d_heatmap.png"):
                     self.assertGreater((Path(temp) / name).stat().st_size, 1000)
+
+    def test_full_gap_candidates_use_any_pair_union_with_exact_bin_edges(self):
+        points = np.array([[0., 0, 0], [.1, .1, .1], [0., 0, 1],
+                           [1., 1, 0], [.5, .5, 0], [1., 1, 0]])
+        distances = np.linalg.norm(points, axis=1)
+        coverage = {"covered": distances <= .05, "distances": distances}
+        result = analysis.fully_uncovered_bin_candidates(points, coverage, 2)
+        np.testing.assert_array_equal(result["eligible_mask"], [False, False, True, True, True, True])
+        # The hidden-axis gap is mixed in KP1/KP2 but eligible in the other pairs.
+        self.assertEqual(result["bin_ids_by_ref"][2, 0], "")
+        self.assertTrue((result["bin_ids_by_ref"][2, 1:] != "").all())
+        first_pair = {b["bin_id"]: b for b in result["bins"] if b["pair"] == "KP1/KP2"}
+        self.assertEqual(len(first_pair), 1)
+        bin_id = result["bin_ids_by_ref"][3, 0]
+        self.assertEqual(result["bin_ids_by_ref"][4, 0], bin_id)  # Internal edge goes right.
+        self.assertEqual(first_pair[bin_id]["ref_count"], 3)  # Duplicate/max-edge points retained.
+        self.assertTrue(first_pair[bin_id]["x_upper_inclusive"])
+        self.assertTrue(all(b["ref_count"] == b["gap_count"] > 0 for b in result["bins"]))
+        perm = np.array([5, 2, 0, 4, 1, 3])
+        shuffled = analysis.fully_uncovered_bin_candidates(
+            points[perm], {name: value[perm] for name, value in coverage.items()}, 2)
+        np.testing.assert_array_equal(shuffled["bin_ids_by_ref"], result["bin_ids_by_ref"][perm])
+        self.assertEqual(shuffled["bins"], result["bins"])
+        # The candidate filter must also reach the exported real representatives
+        # and member list, while the original five gap decisions remain intact.
+        ref, sample = make_gap_fixture(points, .05)
+        before = analysis.arrays_fingerprint(ref)
+        with tempfile.TemporaryDirectory() as temp, mock.patch.object(analysis, "HEATMAP_BINS", 2):
+            diagnostics = analysis.summarize_uncovered_reference(ref, sample, .05)
+            summary = diagnostics["summary"]
+            self.assertEqual(summary["uncovered_ref_count"], 5)
+            self.assertEqual(summary["eligible_ref_count"], 4)
+            self.assertEqual(summary["excluded_mixed_bin_uncovered_ref_count"], 1)
+            self.assertAlmostEqual(sum(g["fraction_of_uncovered_ref"] for g in summary["groups"]), .8)
+            self.assertAlmostEqual(sum(g["fraction_of_eligible_ref"] for g in summary["groups"]), 1.)
+            analysis.write_gap_diagnostics(temp, ref, diagnostics)
+            with (Path(temp)/"uncovered_gap_members.csv").open() as fp:
+                members = list(csv.DictReader(fp))
+            self.assertEqual(sorted(int(row["global_row"]) for row in members), [12, 13, 14, 15])
+            self.assertTrue(all(row["fully_uncovered_bin_ids"] for row in members))
+            with (Path(temp)/"uncovered_gap_bins.csv").open() as fp:
+                exported_bins = {row["bin_id"]: row for row in csv.DictReader(fp)}
+            for row in members:
+                for bin_id in row["fully_uncovered_bin_ids"].split(";"):
+                    self.assertEqual(exported_bins[bin_id]["ref_count"], exported_bins[bin_id]["gap_count"])
+            self.assertEqual(analysis.arrays_fingerprint(ref), before)
+
+    def test_full_gap_bins_reject_rounded_100_percent_and_keep_singletons(self):
+        points = np.full((10_001, 3), .01)
+        points[0], points[-1] = 0., 1.
+        distances = np.linalg.norm(points, axis=1)
+        result = analysis.fully_uncovered_bin_candidates(
+            points, {"covered": distances <= .001, "distances": distances}, 2)
+        self.assertEqual(result["eligible_mask"].sum(), 1)
+        self.assertTrue(result["eligible_mask"][-1])
+        self.assertEqual(len(result["bins"]), 3)
+        self.assertTrue(all(b["ref_count"] == 1 for b in result["bins"]))
+
+    def test_gap_candidates_empty_with_only_mixed_bins_and_when_all_covered(self):
+        ref, sample = make_gap_fixture([[0., 0, 0], [.01, .01, .01], [1., 1, 1]], .001)
+        # Add a covered point in every occupied bin, leaving one real gap.
+        sample = {"frame_id": ref["frame_id"], "global_rows": ref["global_rows"][[0, -1]],
+                  "pattern_keys": ref["pattern_keys"][[0, -1]]}
+        ref["covered_by_topology"][-1] = True
+        ref["nearest_topology_distances"][-1] = 0.
+        ref["nearest_topology_global_rows"][-1] = ref["global_rows"][-1]
+        with tempfile.TemporaryDirectory() as temp, mock.patch.object(analysis, "HEATMAP_BINS", 2):
+            result = analysis.summarize_uncovered_reference(ref, sample, .001)
+            self.assertEqual(result["summary"]["uncovered_ref_count"], 1)
+            self.assertEqual(result["summary"]["eligible_ref_count"], 0)
+            self.assertEqual(result["summary"]["diagnostic_representative_count"], 0)
+            analysis.write_gap_diagnostics(temp, ref, result)
+            analysis.plot_gap_diagnostics(temp, ref, result)
+            analysis.write_html_report(temp, {"frame_id": "test-frame"}, result["summary"])
+            report = (Path(temp)/"analysis_report.html").read_text()
+            self.assertIn("미커버 REF는 있지만 100% 미커버 bin이 없어", report)
+            with (Path(temp)/"uncovered_gap_bins.csv").open() as fp:
+                self.assertEqual(list(csv.DictReader(fp)), [])
+            with np.load(Path(temp)/"uncovered_gap_representatives.npz", allow_pickle=False) as bundle:
+                self.assertEqual(bundle["fully_uncovered_bin_ids"].shape, (0, 3))
+            ref["covered_by_topology"][:] = True
+            ref["nearest_topology_distances"][:] = 0.
+            empty = analysis.summarize_uncovered_reference(ref, sample, 0.)
+            self.assertEqual(empty["summary"]["uncovered_ref_count"], 0)
+            self.assertEqual(empty["summary"]["fully_uncovered_bin_count"], 0)
+
+    def test_gap_plot_marks_only_the_100_percent_pairs_of_each_representative(self):
+        import matplotlib.pyplot as plt
+        ref, sample = make_gap_fixture([[0., 0, 0], [0., 0, 1]], .1)
+        with tempfile.TemporaryDirectory() as temp, mock.patch.object(analysis, "HEATMAP_BINS", 2):
+            result = analysis.summarize_uncovered_reference(ref, sample, .1)
+            with mock.patch.object(plt, "close"):
+                analysis.plot_gap_diagnostics(temp, ref, result)
+                fig = plt.gcf()
+                self.assertEqual(len(fig.axes[0].collections[1].get_offsets()), 0)
+                for ax in fig.axes[1:3]:
+                    np.testing.assert_array_equal(ax.collections[1].get_offsets(), [[0., 1.]])
+            plt.close(fig)
 
     def test_gap_radius_cover_is_bounded_order_independent_and_keeps_duplicates(self):
         from scipy.spatial.distance import cdist
@@ -305,6 +426,7 @@ class AnalysisTest(unittest.TestCase):
             self.assertNotIn(10, reps["global_rows"])
             self.assertFalse(reps["covered_by_topology"].any())
             self.assertTrue((reps["nearest_topology_distances"] > 1).all())
+            self.assertTrue((reps["fully_uncovered_bin_ids"] != "").any(axis=1).all())
             with (Path(temp)/"uncovered_gap_members.csv").open() as fp:
                 members = list(csv.DictReader(fp))
             self.assertEqual(len(members), 4)
@@ -360,12 +482,17 @@ class AnalysisTest(unittest.TestCase):
                 with (root / "analysis" / "uncovered_gap_summary.json").open() as fp:
                     gaps = json.load(fp)
                 self.assertEqual(gaps["uncovered_ref_count"], summary["uncovered_ref_count"])
-                self.assertEqual(gaps["assigned_uncovered_ref_count"], summary["uncovered_ref_count"])
-                self.assertEqual(sum(g["gap_ref_count"] for g in gaps["groups"]), summary["uncovered_ref_count"])
+                self.assertEqual(gaps["assigned_uncovered_ref_count"], gaps["eligible_ref_count"])
+                self.assertEqual(sum(g["gap_ref_count"] for g in gaps["groups"]), gaps["eligible_ref_count"])
+                self.assertEqual(gaps["eligible_ref_count"]+gaps["excluded_mixed_bin_uncovered_ref_count"],
+                                 summary["uncovered_ref_count"])
                 for group in gaps["groups"]:
                     self.assertIn(group["representative_pattern_key"], report)
                     self.assertGreater(group["representative_distance_to_existing"], summary["radius"])
                     self.assertLessEqual(group["max_member_distance_to_gap_representative"], summary["radius"])
+                    self.assertTrue(group["representative_100pct_bins"])
+                    self.assertTrue(all(b["gap_count"] == b["ref_count"] > 0
+                                        for b in group["representative_100pct_bins"]))
                 # An existing run can be viewed again without changing its analysis.
                 data_paths = [root / "analysis" / name for name in
                               ("reference_frame.npz", "reference_sample.npz", "topology_sample.npz")]

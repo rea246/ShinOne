@@ -368,8 +368,10 @@ python 7.analysis.py
 7번 결과는 run 폴더의 `analysis_report.html`을 브라우저로 열어 확인한다. 이미 7번을
 실행했다면 `python 7.analysis.py --replot latest`로 저장된 결과에서 heatmap과 보고서를
 생성할 수 있다. 이 옵션은 kPCA나 coverage 계산을 다시 수행하지 않는다.
-미커버 REF에서는 별도의 실제 진단 대표군을 추려 HTML의 그룹 표·위치 그림과 연결한다.
-이 후처리는 6번 대표 목록을 바꾸지 않는다.
+미커버 REF 중 heatmap의 **100% 미커버 bin**에 속한 REF만 후보로 삼아 별도의 실제
+진단 대표군을 추린다. 세 KP 축 쌍의 후보를 중복 없이 합치며, 대표는 조건을 만족한
+축 쌍에만 표시하고 HTML 표에 해당 bin과 REF 수를 연결한다. 이 후처리는 6번 대표 목록이나
+전체 coverage를 바꾸지 않는다. 혼합 bin의 gap도 전체 미커버 CSV에는 유지한다.
 
 Default Leiden backend에는 CUDA와 호환되는 RAPIDS `cugraph`, `cudf`, `cupy`가
 필요하다. FAISS GPU가 있으면 exact sample graph 및 assignment에 우선 사용하고,
