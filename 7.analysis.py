@@ -3,7 +3,8 @@
 Stage 7 compares REF with the topology representative set (B), not yet with an
 external method (A). Stage 8 must reuse the saved frame, REF rows and radius.
 The 40 inputs are the cached learned h0/h1/h2/h3/edge embeddings, not 21 raw
-handcrafted features. No clustering or representative selection is rerun.
+handcrafted features. Stage-6 selection stays fixed; uncovered REF is summarized
+by a separate set of real diagnostic representatives.
 
 Dependencies: numpy, scipy, matplotlib, threadpoolctl and torch (Stage-4 cache).
 RBF kernels use PyTorch CUDA when available, otherwise vectorized SciPy.
@@ -52,6 +53,8 @@ GPU_DEVICE = 0
 CPU_THREADS = 8
 MAKE_PLOTS = True
 HEATMAP_BINS = 50             # Per axis; REF-only extent, no smoothing/filtering.
+GAP_RADIUS_MULTIPLIER = 1.0   # Diagnostic grouping radius = saved coverage R * this.
+GAP_PREVIEW_GROUPS = 20       # Labels/table preview only; all groups are exported.
 
 FEATURE_BLOCKS = ("h0", "h1", "h2", "h3", "edge")
 SCHEMA_VERSION = 1
@@ -70,6 +73,7 @@ def validate_config():
         ("TRANSFORM_BLOCK", TRANSFORM_BLOCK, 1),
         ("DISTANCE_BLOCK", DISTANCE_BLOCK, 1), ("CPU_THREADS", CPU_THREADS, 1),
         ("HEATMAP_BINS", HEATMAP_BINS, 2),
+        ("GAP_PREVIEW_GROUPS", GAP_PREVIEW_GROUPS, 1),
     ):
         if not isinstance(value, int) or value < minimum:
             raise ValueError(f"{name} must be an integer >= {minimum}")
@@ -79,6 +83,8 @@ def validate_config():
         raise ValueError("R_MULT must be finite and > 0")
     if GAMMA is not None and (not np.isfinite(GAMMA) or GAMMA <= 0):
         raise ValueError("GAMMA must be None or finite and > 0")
+    if not np.isfinite(GAP_RADIUS_MULTIPLIER) or GAP_RADIUS_MULTIPLIER <= 0:
+        raise ValueError("GAP_RADIUS_MULTIPLIER must be finite and > 0")
     if KERNEL_BACKEND not in {"auto", "torch_gpu", "numpy_cpu"}:
         raise ValueError("invalid KERNEL_BACKEND")
     if GPU_DEVICE < 0:
@@ -453,6 +459,178 @@ def distance_summary(distances):
             "p99": float(np.percentile(distances, 99)), "max": float(distances.max())}
 
 
+def radius_cover_representatives(coordinates, global_rows, existing_distances, radius):
+    """Deterministic farthest-first cover using real input rows, without an NxN matrix.
+
+    Start at the point farthest from the existing sample. Then select the point
+    farthest from the selected diagnostic set until every input is within radius.
+    A global-row sort breaks ties independently of the input order. The number
+    of representatives is unconstrained; this is not a minimum-cardinality claim.
+    """
+    from scipy.spatial.distance import cdist
+
+    x = np.asarray(coordinates, dtype=np.float64)
+    rows = integer_vector(global_rows, "gap global rows")
+    existing = np.asarray(existing_distances, dtype=np.float64)
+    if (x.ndim != 2 or x.shape[1] < 1 or len(x) != len(rows)
+            or existing.shape != rows.shape or not np.isfinite(x).all()
+            or not np.isfinite(existing).all() or (existing < 0).any()
+            or len(np.unique(rows)) != len(rows) or not np.isfinite(radius) or radius < 0):
+        raise ValueError("invalid gap radius-cover inputs")
+    if not len(x):
+        return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64), np.empty(0)
+    order = np.argsort(rows, kind="stable")
+    x, existing = x[order], existing[order]
+    selected, nearest = [], np.full(len(x), np.inf)
+    membership = np.full(len(x), -1, dtype=np.int64)
+    next_index = int(np.argmax(existing))
+    started = time.perf_counter()
+    while True:
+        distances = cdist(x, x[next_index:next_index+1], "euclidean")[:, 0]
+        closer = distances < nearest
+        membership[closer] = len(selected)
+        nearest[closer] = distances[closer]
+        selected.append(next_index)
+        remaining = int(np.count_nonzero(nearest > radius))
+        if len(selected) == 1 or len(selected) % 100 == 0 or remaining == 0:
+            log(f"[Gap groups] representatives={len(selected):,}, "
+                f"within_radius={len(x)-remaining:,}/{len(x):,}, "
+                f"elapsed={time.perf_counter()-started:.1f}s")
+        if remaining == 0:
+            break
+        next_index = int(np.argmax(nearest))
+    original_membership = np.empty_like(membership)
+    original_distances = np.empty_like(nearest)
+    original_membership[order] = membership
+    original_distances[order] = nearest
+    return order[np.asarray(selected)], original_membership, original_distances
+
+
+def summarize_uncovered_reference(reference, sample, radius):
+    """Summarize saved uncovered points; never mutate the baseline REF/B arrays."""
+    if not np.isfinite(GAP_RADIUS_MULTIPLIER) or GAP_RADIUS_MULTIPLIER <= 0:
+        raise ValueError("GAP_RADIUS_MULTIPLIER must be finite and > 0")
+    coordinates = np.asarray(reference["distance_coordinates"], dtype=np.float64)
+    covered = np.asarray(reference["covered_by_topology"])
+    existing = np.asarray(reference["nearest_topology_distances"], dtype=np.float64)
+    rows = integer_vector(reference["global_rows"], "REF global rows")
+    if (coordinates.ndim != 2 or len(coordinates) != len(rows)
+            or covered.dtype != np.dtype(bool) or covered.shape != rows.shape
+            or existing.shape != rows.shape or not np.isfinite(existing).all()
+            or not np.isfinite(radius) or radius < 0
+            or not np.array_equal(covered, existing <= radius)):
+        raise ValueError("inconsistent saved REF coverage for gap diagnostics")
+    if str(reference["frame_id"].item()) != str(sample["frame_id"].item()):
+        raise ValueError("gap diagnostics require REF and sample in the same frame")
+    gap_indices = np.flatnonzero(~covered)
+    gap_indices = gap_indices[np.argsort(rows[gap_indices], kind="stable")]
+    grouping_radius = radius * GAP_RADIUS_MULTIPLIER
+    log(f"[Gap groups] START uncovered={len(gap_indices):,}, radius={grouping_radius:.8g}, "
+        f"dimensions={coordinates.shape[1]}; diagnostic representatives only")
+    selected, membership, member_distances = radius_cover_representatives(
+        coordinates[gap_indices], rows[gap_indices], existing[gap_indices], grouping_radius
+    )
+    representative_indices = gap_indices[selected]
+    counts = np.bincount(membership, minlength=len(selected))
+    # Report populous missing regions first, then more distant groups, then row ID.
+    ranking = sorted(range(len(selected)), key=lambda i: (
+        -int(counts[i]), -float(existing[representative_indices[i]]),
+        int(rows[representative_indices[i]])))
+    old_to_new = np.empty(len(selected), dtype=np.int64)
+    old_to_new[ranking] = np.arange(len(selected))
+    membership = old_to_new[membership]
+    representative_indices = representative_indices[ranking]
+    sample_keys = {int(row): str(key) for row, key in zip(sample["global_rows"], sample["pattern_keys"])}
+    groups = []
+    for label, ref_index in enumerate(representative_indices):
+        mask = membership == label
+        members = gap_indices[mask]
+        nearest_row = int(reference["nearest_topology_global_rows"][ref_index])
+        h0_labels, h0_counts = np.unique(reference["h0_labels"][members], return_counts=True)
+        groups.append({
+            "gap_group": f"G{label+1:04d}", "gap_ref_count": int(len(members)),
+            "fraction_of_uncovered_ref": len(members)/len(gap_indices),
+            "fraction_of_sampled_ref": len(members)/len(rows),
+            "representative_global_row": int(rows[ref_index]),
+            "representative_pattern_key": str(reference["pattern_keys"][ref_index]),
+            "representative_h0_label": int(reference["h0_labels"][ref_index]),
+            "representative_topology_cluster": int(reference["topology_labels"][ref_index]),
+            "nearest_existing_global_row": nearest_row,
+            "nearest_existing_pattern_key": sample_keys[nearest_row],
+            "representative_distance_to_existing": float(existing[ref_index]),
+            "existing_distance_summary": distance_summary(existing[members]),
+            "max_member_distance_to_gap_representative": float(member_distances[mask].max()),
+            "h0_composition": {str(int(h0)): int(count) for h0, count in zip(h0_labels, h0_counts)},
+        })
+    summary = {
+        "schema_version": 1, "frame_id": str(reference["frame_id"].item()),
+        "method": "deterministic_farthest_first_radius_cover",
+        "grouping_space": "all REF-standardized kPCA components",
+        "coverage_radius": float(radius), "grouping_radius": float(grouping_radius),
+        "grouping_radius_multiplier": GAP_RADIUS_MULTIPLIER,
+        "ref_sample_count": len(rows), "uncovered_ref_count": len(gap_indices),
+        "diagnostic_representative_count": len(groups),
+        "assigned_uncovered_ref_count": len(membership),
+        "max_member_distance_to_gap_representative": (
+            float(member_distances.max()) if len(member_distances) else None),
+        "input_fingerprint": arrays_fingerprint({
+            "ref_rows": rows, "ref_coordinates": coordinates,
+            "covered": covered, "existing_distances": existing,
+            "sample_rows": sample["global_rows"], "sample_keys": sample["pattern_keys"],
+        }),
+        "scope": "Diagnostic exemplars of sampled uncovered REF; baseline representatives and coverage unchanged.",
+        "groups": groups,
+    }
+    return {"summary": summary, "gap_indices": gap_indices,
+            "representative_indices": representative_indices,
+            "membership": membership, "member_distances": member_distances}
+
+
+def write_gap_diagnostics(run_dir, reference, diagnostics):
+    run_dir = Path(run_dir)
+    summary, groups = diagnostics["summary"], diagnostics["summary"]["groups"]
+    indices = diagnostics["representative_indices"]
+    bundle = {"frame_id": reference["frame_id"], "feature_names": reference["feature_names"]}
+    for name in ("global_rows", "pattern_keys", "h0_labels", "topology_labels", "raw_embeddings",
+                 "normalized_embeddings", "kpca_coordinates", "distance_coordinates"):
+        bundle[name] = reference[name][indices]
+    bundle["gap_group_ids"] = np.asarray([g["gap_group"] for g in groups], dtype=str)
+    bundle["gap_ref_counts"] = np.asarray([g["gap_ref_count"] for g in groups], dtype=np.int64)
+    bundle["diagnostic_kind"] = np.asarray("uncovered_REF")
+    bundle["covered_by_topology"] = reference["covered_by_topology"][indices]
+    bundle["nearest_topology_global_rows"] = reference["nearest_topology_global_rows"][indices]
+    bundle["nearest_topology_distances"] = reference["nearest_topology_distances"][indices]
+    bundle["nearest_topology_pattern_keys"] = np.asarray([g["nearest_existing_pattern_key"] for g in groups], dtype=str)
+    bundle["coverage_radius"] = np.asarray(summary["coverage_radius"])
+    bundle["grouping_radius"] = np.asarray(summary["grouping_radius"])
+    save_npz(run_dir / "uncovered_gap_representatives.npz", bundle)
+    extras = {
+        "gap_group": bundle["gap_group_ids"], "gap_ref_count": bundle["gap_ref_counts"],
+        "fraction_of_uncovered_ref": [g["fraction_of_uncovered_ref"] for g in groups],
+        "fraction_of_sampled_ref": [g["fraction_of_sampled_ref"] for g in groups],
+        "nearest_existing_key": [g["nearest_existing_pattern_key"] for g in groups],
+        "distance_to_existing": [g["representative_distance_to_existing"] for g in groups],
+        "group_existing_distance_p95": [g["existing_distance_summary"]["p95"] for g in groups],
+        "max_member_distance_to_gap_representative": [g["max_member_distance_to_gap_representative"] for g in groups],
+    }
+    write_scatter_csv(run_dir / "uncovered_gap_representatives.csv", bundle, extras)
+    with (run_dir / "uncovered_gap_members.csv").open("w", newline="", encoding="utf-8") as fp:
+        writer = csv.writer(fp)
+        writer.writerow(["gap_group", "pattern_key", "global_row", "h0_label", "topology_cluster",
+                         "gap_representative_key", "gap_representative_global_row",
+                         "distance_to_gap_representative", "distance_to_existing"])
+        for ref_index, label, distance in zip(diagnostics["gap_indices"], diagnostics["membership"],
+                                               diagnostics["member_distances"]):
+            group = groups[label]
+            writer.writerow([group["gap_group"], reference["pattern_keys"][ref_index],
+                             int(reference["global_rows"][ref_index]), int(reference["h0_labels"][ref_index]),
+                             int(reference["topology_labels"][ref_index]), group["representative_pattern_key"],
+                             group["representative_global_row"], float(distance),
+                             float(reference["nearest_topology_distances"][ref_index])])
+    write_json(run_dir / "uncovered_gap_summary.json", summary)
+    log(f"[Gap groups] SAVED representatives={len(groups):,}, members={len(diagnostics['gap_indices']):,}")
+
+
 def arrays_fingerprint(arrays):
     digest = hashlib.sha256()
     for name, value in sorted(arrays.items()):
@@ -691,7 +869,68 @@ def plot_coverage(run_dir, reference, sample, coverage, radius):
     plot_coverage_heatmaps(run_dir, reference, coverage, radius)
 
 
-def write_html_report(run_dir, summary):
+def plot_gap_diagnostics(run_dir, reference, diagnostics):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import Normalize
+    from matplotlib.ticker import PercentFormatter
+
+    if not isinstance(GAP_PREVIEW_GROUPS, int) or GAP_PREVIEW_GROUPS < 1:
+        raise ValueError("GAP_PREVIEW_GROUPS must be an integer >= 1")
+    summary = diagnostics["summary"]
+    shown = min(GAP_PREVIEW_GROUPS, summary["diagnostic_representative_count"])
+    coordinates = reference["kpca_coordinates"]
+    coverage = {"covered": reference["covered_by_topology"],
+                "distances": reference["nearest_topology_distances"]}
+    grids = coverage_heatmap_grids(coordinates, coverage, HEATMAP_BINS)
+    cmap = plt.get_cmap("YlOrRd").copy()
+    cmap.set_bad("#e6e9ec")
+    fig, axes = plt.subplots(1, len(grids), figsize=(5*len(grids)+1, 4.8),
+                             squeeze=False, constrained_layout=True)
+    for ax, grid in zip(axes[0], grids):
+        a, b = grid["pair"]
+        mesh = ax.pcolormesh(grid["x_edges"], grid["y_edges"],
+                             np.ma.masked_invalid(grid["gap_fraction"].T),
+                             cmap=cmap, norm=Normalize(0, 1), shading="flat", rasterized=True)
+        indices = diagnostics["representative_indices"][:shown]
+        ax.scatter(coordinates[indices, a], coordinates[indices, b], marker="D", s=25,
+                   color="#182e3a", edgecolors="white", linewidths=.6, zorder=3)
+        # Distinct label slots prevent dense-region representatives obscuring IDs.
+        ticks = np.linspace(.05, .95, max(17, math.ceil(math.sqrt(shown))+2))
+        slots = np.stack(np.meshgrid(ticks, ticks), axis=-1).reshape(-1, 2)
+        available = np.ones(len(slots), dtype=bool)
+        for number, index in enumerate(indices, 1):
+            position = np.array([
+                (coordinates[index, a]-grid["x_edges"][0])/np.ptp(grid["x_edges"]),
+                (coordinates[index, b]-grid["y_edges"][0])/np.ptp(grid["y_edges"]),
+            ])
+            costs = np.sum((slots-position)**2, axis=1)
+            costs[~available] = np.inf
+            slot = int(np.argmin(costs))
+            available[slot] = False
+            ax.annotate(str(number), (coordinates[index, a], coordinates[index, b]),
+                        xytext=slots[slot], textcoords="axes fraction", fontsize=8,
+                        ha="center", va="center", color="#182e3a",
+                        arrowprops={"arrowstyle":"-", "color":"#526b79", "lw":.6},
+                        bbox={"facecolor":"white", "edgecolor":"none", "alpha":.9, "pad":.7})
+        if shown == 0:
+            ax.text(.5, .5, "No uncovered REF", transform=ax.transAxes,
+                    ha="center", va="center", bbox={"facecolor":"white", "alpha":.9})
+        ax.set(xlabel=f"KP{a+1}", ylabel=f"KP{b+1}", title=f"KP{a+1} / KP{b+1}",
+               xlim=grid["x_edges"][[0, -1]], ylim=grid["y_edges"][[0, -1]])
+    fig.colorbar(mesh, ax=axes[0].tolist(), label="Uncovered / REF in bin",
+                 ticks=[0, .25, .5, .75, 1], format=PercentFormatter(xmax=1), shrink=.9)
+    label_note = f"Labels 1-{shown}: G0001 onward, ranked by gap REF count" if shown else "No gap representatives required"
+    fig.suptitle(f"Uncovered REF exemplars | {summary['diagnostic_representative_count']:,} diagnostic groups\n"
+                 f"{label_note} | "
+                 f"group radius={summary['grouping_radius']:.4g} in all scaled KPCs", fontsize=12)
+    fig.savefig(Path(run_dir) / "kpca_uncovered_representatives_2d.png", dpi=160)
+    plt.close(fig)
+    log(f"[Gap plot] SAVED top {shown} of {summary['diagnostic_representative_count']:,} groups")
+
+
+def write_html_report(run_dir, summary, gap_summary=None):
     """Human-readable, offline report. All plot images are embedded in the HTML."""
     import base64
     from html import escape
@@ -721,6 +960,8 @@ def write_html_report(run_dir, summary):
         ("고정 반경 R", number(summary.get("radius"))),
         ("학습 landmark", number(summary.get("landmark_count"), "count")),
     ]
+    if gap_summary is not None:
+        card_values[-1] = ("미커버 진단 대표", number(gap_summary["diagnostic_representative_count"], "count"))
     cards = "".join(f'<div class="card"><span>{escape(label)}</span><strong>{escape(value)}</strong></div>'
                     for label, value in card_values)
     distance_rows = []
@@ -737,6 +978,7 @@ def write_html_report(run_dir, summary):
     group_table = table(["H0 그룹", "REF 표본 수", "Coverage", "kPCA 거리 P95"], group_rows)
     setting_rows = [
         ("REF 모집단 수", number(summary.get("ref_population_count"), "count")),
+        ("학습 landmark 수", number(summary.get("landmark_count"), "count")),
         ("원본 embedding 차원", number(summary.get("feature_dimension"), "count")),
         ("kPCA 차원", number(summary.get("kpc_components"), "count")),
         ("반경 산정용 REF 이웃 순위", number(summary.get("radius_k"), "count")),
@@ -748,11 +990,36 @@ def write_html_report(run_dir, summary):
         ("Sampling seed", number(summary.get("random_seed"), "count")),
     ]
     settings = table(["분석 조건", "값"], setting_rows)
+    gap_section = ""
+    if gap_summary is not None:
+        rows = [[g["gap_group"], g["representative_pattern_key"], g["representative_global_row"],
+                 number(g["gap_ref_count"], "count"), number(g["fraction_of_uncovered_ref"], "percent"),
+                 number(g["fraction_of_sampled_ref"], "percent"),
+                 number(g["representative_distance_to_existing"])] for g in gap_summary["groups"]]
+        headers = ["그룹", "실제 대표 패턴 ID", "원본 row", "미커버 REF 수", "전체 gap 중 비중",
+                   "전체 REF 표본 중 비중", "대표의 기존군 최근접 거리"]
+        shown = min(GAP_PREVIEW_GROUPS, len(rows))
+        preview = table(headers, rows[:shown]) if rows else "<p>현재 R에서 미커버 REF가 없습니다.</p>"
+        remainder = (f'<details><summary>나머지 {len(rows)-shown:,}개 그룹 보기</summary>'
+                     f'{table(headers, rows[shown:])}</details>') if len(rows) > shown else ""
+        gap_section = f'''<section><h2>어떤 실제 패턴을 놓쳤는가</h2>
+<p>미커버 REF {number(gap_summary['uncovered_ref_count'], 'count')}개를 설명하는 진단 대표
+{number(len(rows), 'count')}개입니다. 모든 구성원은 자기 진단 대표에서
+{number(gap_summary['grouping_radius'])} 이내에 있습니다. 이 거리는 전체 표준화 kPCA 공간 기준입니다.</p>
+<p>구성원 수가 많은 그룹부터 표시합니다. 그림의 숫자 1은 G0001에 해당합니다.
+각 대표는 미커버 REF에서 선택한 실제 패턴이며, 원본 row와 ID로 추적할 수 있습니다.
+기존 대표군과 coverage 값은 유지합니다. 같은 그룹이라는 것만으로 실제 형상이 동일하다는 뜻은 아닙니다.</p>
+{preview}{remainder}<p class="muted">전체 대표: uncovered_gap_representatives.csv ·
+구성원 연결: uncovered_gap_members.csv · 원본 40D는 대표 CSV/NPZ에 함께 저장됩니다.</p></section>'''
     figures = []
+    gap_section_inserted = False
     for filename, title, caption in (
         ("kpca_coverage_2d_heatmap.png", "어디에 REF가 있고, 어디를 놓쳤는가",
          "위: 칸별 REF 수(로그 색상). 아래: 그 칸 REF 중 미커버 비율. 빨갈수록 미커버 비율이 높습니다. "
          "회색은 REF 표본이 없는 칸입니다. REF 수가 적은 칸의 비율은 위쪽 밀도와 함께 확인하세요."),
+        ("kpca_uncovered_representatives_2d.png", "미커버 영역과 진단 대표 패턴",
+         "미커버 비율 heatmap에 구성원 수 상위 그룹의 실제 대표 위치를 마름모로 표시하고 번호를 연결선으로 붙였습니다. "
+         "표시 개수는 그림 가독성을 위한 것이며, 나머지 그룹도 아래 표와 파일에 모두 보존합니다."),
         ("kpca_nearest_distance_2d_heatmap.png", "반경을 정하지 않고 보는 대표와의 거리",
          "칸별 REF의 최근접 대표 거리 평균입니다. 빨갈수록 대표에서 멀리 떨어진 영역입니다. "
          "거리 계산은 전체 kPCA 축을 사용하고, 표시만 두 축으로 모았습니다."),
@@ -766,6 +1033,11 @@ def write_html_report(run_dir, summary):
             encoded = base64.b64encode(path.read_bytes()).decode("ascii")
             figures.append(f'<section><h2>{escape(title)}</h2><p>{escape(caption)}</p>'
                            f'<img alt="{escape(title)}" src="data:image/png;base64,{encoded}"></section>')
+            if filename == "kpca_uncovered_representatives_2d.png" and gap_section:
+                figures.append(gap_section)
+                gap_section_inserted = True
+    if gap_section and not gap_section_inserted:
+        figures.insert(0, gap_section)
     if not figures:
         figures.append("<p>이번 실행에서는 그래프를 생성하지 않았습니다.</p>")
     css = """
@@ -798,7 +1070,7 @@ def write_html_report(run_dir, summary):
 
 
 def replot_saved_run(run):
-    """Render from existing NPZ snapshots; do not refit, resample, or rerun NN."""
+    """Use saved coverage, add gap diagnostics, and render; do not refit/resample."""
     expected_frame_id = None
     if str(run) == "latest":
         with (Path(OUT_DIR) / "latest_run.json").open(encoding="utf-8") as fp:
@@ -825,8 +1097,11 @@ def replot_saved_run(run):
                     summary = json.load(summary_file)
                 if summary["frame_id"] != str(frame["frame_id"].item()):
                     raise ValueError("saved summary belongs to a different kPCA frame")
+                diagnostics = summarize_uncovered_reference(reference, sample, radius)
+                write_gap_diagnostics(run_dir, reference, diagnostics)
                 plot_coverage(run_dir, reference, sample, coverage, radius)
-                write_html_report(run_dir, summary)
+                plot_gap_diagnostics(run_dir, reference, diagnostics)
+                write_html_report(run_dir, summary, diagnostics["summary"])
             except Exception:
                 traceback.print_exc()
                 return 1
@@ -914,6 +1189,10 @@ def analyze(run_dir):
     write_scatter_csv(run_dir / "kpca_topology_scatter.csv", sample)
     if MAKE_PLOTS:
         plot_coverage(run_dir, reference, sample, coverage, radius)
+    diagnostics = summarize_uncovered_reference(reference, sample, radius)
+    write_gap_diagnostics(run_dir, reference, diagnostics)
+    if MAKE_PLOTS:
+        plot_gap_diagnostics(run_dir, reference, diagnostics)
 
     covered = coverage["covered"]
     h0_summary = []
@@ -952,7 +1231,7 @@ def analyze(run_dir):
         "elapsed_seconds": time.perf_counter() - started,
     }
     write_json(run_dir / "coverage_summary.json", summary)
-    write_html_report(run_dir, summary)
+    write_html_report(run_dir, summary, diagnostics["summary"])
     log(f"[Result] sampled REF covered={covered.sum():,}/{len(covered):,} ({covered.mean():.2%}), "
         f"gaps={(~covered).sum():,}, self_hits={overlap.sum():,}")
     log(f"[Result] DONE elapsed={time.perf_counter() - started:.1f}s; {run_dir}")

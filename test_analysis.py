@@ -237,6 +237,90 @@ class AnalysisTest(unittest.TestCase):
                 for name in ("kpca_coverage_2d_heatmap.png", "kpca_nearest_distance_2d_heatmap.png"):
                     self.assertGreater((Path(temp) / name).stat().st_size, 1000)
 
+    def test_gap_radius_cover_is_bounded_order_independent_and_keeps_duplicates(self):
+        from scipy.spatial.distance import cdist
+        points = np.array([[0.0], [1.0], [1.0], [4.0], [5.0]])
+        rows = np.array([7, 2, 13, 6, 10])
+        existing = np.array([2.0, 3.0, 3.0, 6.0, 7.0])
+        selected, labels, distances = analysis.radius_cover_representatives(points, rows, existing, 1.0)
+        self.assertEqual(len(selected), 2)
+        self.assertEqual(len(labels), 5)
+        self.assertLessEqual(distances.max(), 1.0)
+        actual = cdist(points, points[selected])[np.arange(len(points)), labels]
+        np.testing.assert_allclose(distances, actual)
+        self.assertEqual(labels[1], labels[2])
+        perm = np.array([4, 2, 0, 3, 1])
+        other, other_labels, other_distances = analysis.radius_cover_representatives(
+            points[perm], rows[perm], existing[perm], 1.0)
+        np.testing.assert_array_equal(rows[selected], rows[perm][other])
+        np.testing.assert_array_equal(labels[perm], other_labels)
+        np.testing.assert_allclose(distances[perm], other_distances)
+
+    def test_gap_groups_use_hidden_kpca_axes_without_unbounded_chaining(self):
+        points = np.zeros((6, 3))
+        points[:, 2] = np.arange(6) * .9
+        selected, labels, distances = analysis.radius_cover_representatives(
+            points, np.arange(6), np.arange(6)+2.0, 1.0)
+        self.assertGreaterEqual(len(selected), 3)
+        self.assertLessEqual(distances.max(), 1.0)
+        self.assertEqual(len(np.unique(labels)), len(selected))
+
+    def test_gap_radius_cover_handles_empty_zero_radius_and_ties(self):
+        selected, labels, distances = analysis.radius_cover_representatives(
+            np.empty((0, 3)), np.empty(0, dtype=int), np.empty(0), 0)
+        self.assertEqual(len(selected)+len(labels)+len(distances), 0)
+        points = np.array([[0.0, 0], [0.0, 0], [2.0, 0]])
+        selected, labels, distances = analysis.radius_cover_representatives(
+            points, np.array([10, 2, 5]), np.ones(3), 0)
+        self.assertEqual(selected[0], 1)  # Equal existing distance: smallest global row.
+        self.assertEqual(len(selected), 2)
+        np.testing.assert_array_equal(distances, np.zeros(3))
+        self.assertEqual(labels[0], labels[1])
+
+    def test_gap_outputs_include_only_uncovered_real_patterns_and_handle_no_gaps(self):
+        points = np.array([[0., 0, 0], [2., 0, 0], [2.2, 0, 0], [6., 0, 0], [6.2, 0, 0]])
+        distances = points[:, 0]
+        reference = {
+            "frame_id": np.asarray("test-frame"), "global_rows": np.arange(10, 15),
+            "pattern_keys": np.asarray([f"p-{i}" for i in range(10, 15)]),
+            "h0_labels": np.array([0, 0, 0, -1, -1]), "topology_labels": np.zeros(5, dtype=int),
+            "raw_embeddings": np.pad(points, ((0, 0), (0, 37))),
+            "normalized_embeddings": np.pad(points, ((0, 0), (0, 37))),
+            "kpca_coordinates": points, "distance_coordinates": points,
+            "feature_names": np.asarray([f"feature-{i}" for i in range(40)]),
+            "nearest_topology_distances": distances, "covered_by_topology": distances <= 1,
+            "nearest_topology_global_rows": np.full(5, 10),
+        }
+        sample = {"frame_id":reference["frame_id"], "global_rows":np.array([10]),
+                  "pattern_keys":np.asarray(["p-10"])}
+        with tempfile.TemporaryDirectory() as temp:
+            before = analysis.arrays_fingerprint(reference)
+            diagnostics = analysis.summarize_uncovered_reference(reference, sample, 1.0)
+            self.assertEqual(len(diagnostics["summary"]["groups"]), 2)
+            self.assertEqual(sum(g["gap_ref_count"] for g in diagnostics["summary"]["groups"]), 4)
+            self.assertTrue((distances[diagnostics["representative_indices"]] > 1).all())
+            analysis.write_gap_diagnostics(Path(temp), reference, diagnostics)
+            reps = analysis.load_projection_bundle(Path(temp)/"uncovered_gap_representatives.npz", sample)
+            self.assertEqual(reps["raw_embeddings"].shape, (2, 40))
+            self.assertNotIn(10, reps["global_rows"])
+            self.assertFalse(reps["covered_by_topology"].any())
+            self.assertTrue((reps["nearest_topology_distances"] > 1).all())
+            with (Path(temp)/"uncovered_gap_members.csv").open() as fp:
+                members = list(csv.DictReader(fp))
+            self.assertEqual(len(members), 4)
+            self.assertTrue(all(float(row["distance_to_gap_representative"]) <= 1 for row in members))
+            self.assertEqual(analysis.arrays_fingerprint(reference), before)
+            # A run with no uncovered REF still exports valid empty files/report.
+            covered_reference = {**reference, "covered_by_topology":np.ones(5, dtype=bool)}
+            empty = analysis.summarize_uncovered_reference(covered_reference, sample, 10.0)
+            analysis.write_gap_diagnostics(Path(temp), covered_reference, empty)
+            self.assertEqual(empty["summary"]["diagnostic_representative_count"], 0)
+            with (Path(temp)/"uncovered_gap_representatives.csv").open() as fp:
+                self.assertEqual(len(list(csv.DictReader(fp))), 0)
+            analysis.plot_gap_diagnostics(Path(temp), covered_reference, empty)
+            analysis.write_html_report(Path(temp), {"frame_id":"test-frame"}, empty["summary"])
+            self.assertIn("현재 R에서 미커버 REF가 없습니다", (Path(temp)/"analysis_report.html").read_text())
+
     def test_integration_outputs_and_stage8_contract(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -265,16 +349,28 @@ class AnalysisTest(unittest.TestCase):
                 self.assertEqual(len(gap_rows), summary["uncovered_ref_count"])
                 self.assertTrue(all(row["cover_status"] == "gap" for row in gap_rows))
                 for name in ("kpca_coverage_2d.png", "kpca_coverage_3d.png", "kpca_coverage_distance_cdf.png",
-                             "kpca_coverage_2d_heatmap.png", "kpca_nearest_distance_2d_heatmap.png"):
+                             "kpca_coverage_2d_heatmap.png", "kpca_nearest_distance_2d_heatmap.png",
+                             "kpca_uncovered_representatives_2d.png"):
                     self.assertGreater((root / "analysis" / name).stat().st_size, 1000)
                 report = (root / "analysis" / "analysis_report.html").read_text(encoding="utf-8")
                 self.assertIn('src="data:image/png;base64,', report)
                 self.assertIn(f'{summary["coverage_fraction"]:.2%}', report)
                 self.assertIn(summary["frame_id"], report)
-                self.assertEqual(report.count('src="data:image/png;base64,'), 5)
+                self.assertEqual(report.count('src="data:image/png;base64,'), 6)
+                with (root / "analysis" / "uncovered_gap_summary.json").open() as fp:
+                    gaps = json.load(fp)
+                self.assertEqual(gaps["uncovered_ref_count"], summary["uncovered_ref_count"])
+                self.assertEqual(gaps["assigned_uncovered_ref_count"], summary["uncovered_ref_count"])
+                self.assertEqual(sum(g["gap_ref_count"] for g in gaps["groups"]), summary["uncovered_ref_count"])
+                for group in gaps["groups"]:
+                    self.assertIn(group["representative_pattern_key"], report)
+                    self.assertGreater(group["representative_distance_to_existing"], summary["radius"])
+                    self.assertLessEqual(group["max_member_distance_to_gap_representative"], summary["radius"])
                 # An existing run can be viewed again without changing its analysis.
-                data_paths = list((root / "analysis").glob("*.npz"))
+                data_paths = [root / "analysis" / name for name in
+                              ("reference_frame.npz", "reference_sample.npz", "topology_sample.npz")]
                 data_paths.append(root / "analysis" / "coverage_summary.json")
+                data_paths.extend((root / "analysis").glob("kpca_*scatter.csv"))
                 original_bytes = {path: path.read_bytes() for path in data_paths}
                 analysis.write_json(root / "latest_run.json",
                                      {"run_directory": "analysis", "frame_id": summary["frame_id"]})

@@ -20,8 +20,10 @@ python 7.analysis.py --replot topology_analysis_out/run_<timestamp>
 ```
 
 `--replot`은 기존 run의 PNG/HTML을 갱신하고 `replot.log`를 추가 기록한다. 저장된
-REF 표본·좌표계·반경·거리·coverage를 그대로 읽으며 NPZ/JSON/CSV와 latest pointer는
-수정하지 않는다. 원본 cache나 GPU 없이도 NumPy와 Matplotlib로 재시각화할 수 있다.
+REF 표본·좌표계·반경·기존 대표까지의 거리·coverage를 그대로 읽으며 기존 분석의
+NPZ/JSON/CSV와 latest pointer는 수정하지 않는다. 미커버 진단 대표를 계산해 별도의
+`uncovered_gap_*` 결과를 생성/갱신한다. 원본 cache나 GPU 없이도 NumPy, SciPy,
+Matplotlib로 후처리와 재시각화가 가능하다.
 
 6번에서 이미 선택한 약 1,000개의 실제 대표 패턴(B)을 REF와 비교한다.
 6번의 clustering/representative selection은 다시 수행하지 않는다.
@@ -143,6 +145,40 @@ REF k번째 이웃 계산에서는 self 한 개를 제외한다. 같은 위치�
 40D용 coverage 임계값을 추가로 만들지는 않는다. 최인접 representative는 40D와 KPC에서
 다를 수 있으므로 두 이웃 key도 따로 남긴다.
 
+### Uncovered REF의 진단 대표군
+
+고정 R에서 미커버로 판정된 REF만 모아 **현재 표준화 kPCA 공간의 모든 축**에서
+진단 대표를 추린다. 6번의 기존 대표군(B), H0/topology label, REF와 kPCA frame,
+coverage 통계는 유지한다. 진단 그룹 ID `G0001` 등은 6번의 community ID와 별개다.
+
+기본 묶음 반경은 `GAP_RADIUS_MULTIPLIER=1.0`으로 기존 coverage R과 같다.
+
+1. 기존 대표군에서 가장 멀리 떨어진 미커버 REF를 첫 진단 대표로 선택한다.
+2. 나머지 미커버 REF에서 지금까지 선택한 진단 대표 중 최근접 거리를 계산한다.
+3. 그 거리가 가장 큰 REF를 다음 대표로 선택한다.
+4. 모든 미커버 REF가 진단 대표 중 하나의 묶음 반경 안에 들어오면 종료한다.
+5. 최근접 진단 대표에 구성원을 배정하고, 구성원 수 내림차순으로 그룹 번호를 붙인다.
+
+모든 대표는 **실제 미커버 패턴**이다. 평균 벡터나 생성된 가상 패턴을 출력하지 않는다.
+동률은 global row/선택 순서로 결정해 입력 행 순서에 영향받지 않는다. 중복 좌표의
+서로 다른 REF는 구성원 수에 모두 반영하며, 고립된 패턴도 버리지 않는다. gap이 없으면
+대표 0개와 빈 CSV/NPZ를 정상 출력한다. R이 0이면 동일 좌표끼리만 묶는다.
+
+이는 반경 내의 누락 영역을 설명하는 farthest-first 대표이며 centroid-nearest/medoid
+추출과는 다르다. 대표 수는 미커버 분포와 반경으로 결정하고 1,000개 등의 목표 수로
+자르지 않는다. 최소 개수의 대표라는 보장도 하지 않는다. 후보 간 N×N 행렬 없이 선택된
+대표 하나와 전체 gap의 거리를 차례로 계산한다.
+
+각 그룹은 미커버 REF 구성원 수, gap 중 비중, 전체 REF 표본 중 비중, 실제 대표 ID/row,
+기존 대표까지의 거리, 그룹의 거리 통계와 H0 구성을 기록한다. 구성원과 진단 대표의
+최대 거리도 기록해 반경 조건을 확인한다. 이 묶음이 실제 형상/공정 특성의 동일성을
+보장하는 것은 아니며, 원본 40D와 ID로 실제 패턴을 후속 확인한다.
+
+HTML과 위치 그림은 구성원 수 상위 `GAP_PREVIEW_GROUPS=20`개를 먼저 표시한다.
+나머지 그룹도 HTML의 펼침 표 및 CSV/NPZ/JSON에 전부 보존한다. 표시 제한은 추출 수에
+영향을 주지 않는다. 진단 대표를 기존 대표군에 자동 추가하거나, 이 REF에서 골랐다는
+이유만으로 독립적인 coverage 개선을 주장하지 않는다.
+
 ## 6. Outputs
 
 결과는 `topology_analysis_out/run_<UTC timestamp>/`에 실행별로 저장한다. 이전 실행의
@@ -165,6 +201,10 @@ REF k번째 이웃 계산에서는 self 한 개를 제외한다. 같은 위치�
 | `kpca_coverage_distance_cdf.png` | 최근접 B 거리의 누적분포와 고정 반경 |
 | `kpca_coverage_2d_heatmap.png` | 위쪽: 칸별 REF 수(로그 색상), 아래쪽: 칸별 미커버 비율; KP1/2, KP1/3, KP2/3 |
 | `kpca_nearest_distance_2d_heatmap.png` | 칸별 최근접 B 거리의 평균; coverage 반경을 사용하지 않는 거리 지도 |
+| `uncovered_gap_representatives.csv` / `.npz` | 그룹별 실제 미커버 대표의 ID/row, 원본 40D·좌표, 구성원 수와 기존 대표까지의 거리 |
+| `uncovered_gap_members.csv` | 미커버 REF 전량의 그룹·진단 대표 연결, 진단 대표/기존 대표까지의 거리 |
+| `uncovered_gap_summary.json` | 묶음 반경·방법·입력 fingerprint, 모든 진단 그룹의 크기·거리 통계·H0 구성 |
+| `kpca_uncovered_representatives_2d.png` | 미커버 비율 heatmap 위에 상위 그룹 대표의 위치/번호 표시; HTML 표와 연결 |
 
 도표는 2D/3D 투영이며 coverage label은 설정한 모든 KPC 차원을 사용해 계산한다.
 일부 고밀도 gap만 저장하는 것이 아니라 추출된 REF에서 발견한 gap 전부를 저장한다.
