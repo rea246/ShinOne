@@ -1,5 +1,8 @@
 # Experimental strategy — Reference-centered kPCA group weighting
 
+이 전략을 서론·필요성·데이터 활용·실험 설계·결과 작성안·기대효과·기존 기술 비교로
+전개한 [기술 보고서 초안](TECHNICAL_REPORT_REFERENCE_WEIGHTED_MASK_MODEL.md)을 함께 참고한다.
+
 ## 핵심 주장
 
 이 연구는 kPCA coverage가 물리적 성능을 직접 나타낸다고 가정하지 않는다. kPCA는
