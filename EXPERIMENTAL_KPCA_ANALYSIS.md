@@ -27,7 +27,9 @@ Matplotlib로 후처리와 재시각화가 가능하다.
 
 6번에서 이미 선택한 약 1,000개의 실제 대표 패턴(B)을 REF와 비교한다.
 6번의 clustering/representative selection은 다시 수행하지 않는다.
-외부 방식 대표군(A)을 읽고 A/B/REF를 비교하는 작업은 **후속 8번의 범위**다.
+외부 방식 대표군을 읽고 A/B/REF를 비교하는 작업은 **8.compare_coverage.py의 범위**다.
+8번에서는 사용자의 명칭에 맞춰 기존 topology=A, 외부 `B.txt`=B로 부른다.
+이 문서의 7번 기존 B 명칭과 snapshot 필드는 유지한다.
 이번 7번에는 A 입력이나 A/B 우위 판정을 넣지 않는다.
 
 참고한 흐름은 `claude/kpca-gap-patterns-validation-e9uk0s` 브랜치의
@@ -256,17 +258,19 @@ REF 최솟값/최댓값만으로 정하며, 모든 REF 점과 중복 좌표를 �
 - 격자 수는 시각화 해상도와 100% 미커버 bin 진단 후보를 바꾸며, 기존 개별 패턴
   coverage·반경·통계는 바꾸지 않는다.
 
-## 7. Stage-8 contract (not implemented yet)
+## 7. Stage-8 comparison
 
-8번은 같은 성공 run에서 다음 순서로 이어간다.
+`8.compare_coverage.py`가 같은 성공 run에서 다음 순서로 이어간다.
+상세 규칙과 출력은 `EXPERIMENTAL_COVERAGE_COMPARISON.md`를 따른다.
 
 1. `load_reference_frame(path)`로 frame을 읽고 fingerprint를 검증한다.
-2. `load_projection_bundle(path, frame)`로 REF와 B snapshot을 읽는다.
-3. 외부 대표군 A의 key를 같은 cache row에 연결하고 같은 순서의 learned 40D를 읽는다.
-4. `transform_raw_embeddings(raw_A, frame)`으로 **재학습 없이** projection한다.
+2. `load_projection_bundle(path, frame)`로 REF와 topology snapshot을 읽는다. 8번에서는 topology를 A라고 부른다.
+3. 외부 대표군 B.txt의 key를 같은 cache row에 연결하고 같은 순서의 learned 40D를 읽는다.
+4. 같은 row의 저장된 좌표는 재사용하고 나머지 B를 `transform_raw_embeddings`로 **재학습 없이** projection한다.
 5. projection을 저장된 `frame['kpc_scale']`로 나눈 뒤 저장된 `frame['radius']`로 평가한다.
 6. 고유 key/global row로 REF를 매칭하고 `both_covered`, `A_only`, `B_only`, `both_gap`을
-   구분한다. 좌표로 조인하거나 대표 개수에 맞춰 반경을 다시 계산하지 않는다.
+   구분한다(8번의 `both_gap` 필드명은 `both_uncovered`). 각 bin의 전체 REF를 분모로 A-only 비율을 구하고
+   100% A-only bin의 실제 진단 대표를 추린다. 좌표로 조인하거나 대표 개수에 맞춰 반경을 다시 계산하지 않는다.
 
 현재 7번의 B snapshot이 기존 6번 CSV보다 우선적인 비교 입력이다. 6번을 나중에 재실행해
 representatives.csv가 바뀌어도 이전 7번의 REF/B/frame은 같은 run 안에 보존된다.

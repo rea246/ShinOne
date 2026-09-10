@@ -1,7 +1,8 @@
 """REF-fixed landmark kPCA coverage of the real representatives from Stage 6.
 
 Stage 7 compares REF with the topology representative set (B), not yet with an
-external method (A). Stage 8 must reuse the saved frame, REF rows and radius.
+external method (A). Stage 8 reuses the saved frame, REF rows and radius,
+and calls the topology set A and the external B.txt set B (legacy fields stay).
 The 40 inputs are the cached learned h0/h1/h2/h3/edge embeddings, not 21 raw
 handcrafted features. Stage-6 selection stays fixed; real diagnostic representatives
 come only from nonempty heatmap bins whose sampled REF are all uncovered.

@@ -373,6 +373,11 @@ python 7.analysis.py
 축 쌍에만 표시하고 HTML 표에 해당 bin과 REF 수를 연결한다. 이 후처리는 6번 대표 목록이나
 전체 coverage를 바꾸지 않는다. 혼합 bin의 gap도 전체 미커버 CSV에는 유지한다.
 
+외부 대표 목록과 비교하려면 같은 폴더의 `B.txt`에 pattern key를 한 줄씩 넣고
+`python 8.compare_coverage.py`를 실행한다. 8번은 기존 topology 대표를 A, 외부 목록을 B로
+명명하며 같은 7번 REF·frame·R을 재사용한다. B 미커버와 A-only bin 비율, 100% A-only bin의
+실제 대표를 `comparison_report.html`에 출력한다. 상세 논리는 `EXPERIMENTAL_COVERAGE_COMPARISON.md`에 있다.
+
 Default Leiden backend에는 CUDA와 호환되는 RAPIDS `cugraph`, `cudf`, `cupy`가
 필요하다. FAISS GPU가 있으면 exact sample graph 및 assignment에 우선 사용하고,
 없으면 PyTorch CUDA exact backend가 A100을 사용한다.

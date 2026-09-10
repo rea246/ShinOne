@@ -21,6 +21,10 @@ viz/
 PREPROCESSED_*.pt
 dummy_dataset/
 
+# External comparison input and generated Stage-8 run snapshots/reports
+/B.txt
+/coverage_comparison_out/
+
 # Claude Code 로컬 설정 (개인 권한 허용목록 — 공유 대상 아님)
 .claude/settings.local.json
 
