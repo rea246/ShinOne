@@ -62,17 +62,33 @@ def _read_table(path):
     return df
 
 
-def group_labels(gauge_series):
+def group_labels(gauge_series, words=None, delimiter="_"):
     """각 Sample1 점에 단일 그룹 라벨을 매긴다(파티션)."""
-    if SAMPLE1_GROUP_WORDS is not None:
+    if words is not None:
         low = gauge_series.astype(str).str.lower()
         lab = np.full(len(gauge_series), "other", dtype=object)
         # 리스트 앞 단어가 우선하도록 역순으로 덮어씀
-        for w in reversed([str(x) for x in SAMPLE1_GROUP_WORDS]):
+        for w in reversed([str(x) for x in words]):
             m = low.str.contains(w.lower(), regex=False, na=False).to_numpy()
             lab[m] = str(w)
         return lab
-    return gauge_series.astype(str).apply(lambda x: x.split(GROUP_DELIM)[0]).to_numpy()
+    return gauge_series.astype(str).apply(lambda x: x.split(delimiter)[0]).to_numpy()
+
+
+def nearest_votes(target, sample, topk=3, eps=1e-12):
+    """Shared R-free top-K votes; each target distributes exactly one point."""
+    target, sample = np.asarray(target, float), np.asarray(sample, float)
+    if (target.ndim != 2 or sample.ndim != 2 or not len(target) or not len(sample)
+            or target.shape[1] != sample.shape[1] or not target.shape[1]
+            or not np.isfinite(target).all() or not np.isfinite(sample).all()
+            or not isinstance(topk, int) or topk < 1 or not np.isfinite(eps) or eps <= 0):
+        raise ValueError("Invalid coordinates, TOPK or EPS for nearest-neighbor votes")
+    k = min(topk, len(sample))
+    dist, idx = cKDTree(sample).query(target, k=k)
+    dist, idx = dist.reshape(len(target), k), idx.reshape(len(target), k)
+    weights = 1.0 / (dist + eps)
+    weights /= weights.sum(axis=1, keepdims=True)
+    return dist, idx, weights
 
 
 def run():
@@ -111,7 +127,7 @@ def run():
     # Sample1 유효 점 + 그룹 라벨 + gauge/원본인덱스
     S1k = S1[KP_COLS].to_numpy(float); S1f = np.isfinite(S1k).all(axis=1)
     Sn = S1k[S1f] / ystd
-    s1_lab   = group_labels(S1[GAUGE_COL])[S1f]
+    s1_lab   = group_labels(S1[GAUGE_COL], SAMPLE1_GROUP_WORDS, GROUP_DELIM)[S1f]
     s1_gauge = S1[GAUGE_COL].astype(str).to_numpy()[S1f]
     s1_oidx  = np.where(S1f)[0]                        # Sample1 원본 행번호(추적용)
     if len(Sn) == 0:
@@ -128,14 +144,7 @@ def run():
     print(f"[Match] target {len(Tn):,}개 → Sample1 {len(Sn):,}점 중 최근접 top-{k} (거리 역수 가중)")
 
     # 최근접 top-k 거리/인덱스
-    dist, idx = cKDTree(Sn).query(Tn, k=k)
-    if k == 1:                                          # k=1 이면 1D → 2D로
-        dist = dist[:, None]; idx = idx[:, None]
-    dist = np.atleast_2d(dist); idx = np.atleast_2d(idx)
-
-    # 거리 역수 정규화 (행 합 = 1). 0거리는 EPS로 그 항이 지배.
-    w = 1.0 / (dist + EPS)
-    w = w / w.sum(axis=1, keepdims=True)
+    dist, idx, w = nearest_votes(Tn, Sn, TOPK, EPS)
 
     # ---- target 별 top-k 매칭 원본행 출력 ----
     out = T_use.copy()

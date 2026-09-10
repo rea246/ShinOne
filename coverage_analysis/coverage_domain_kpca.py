@@ -95,6 +95,12 @@ OUTPUT_DIR    = "coverage_plots"
 RESERVOIR_SEED = 0
 USE_CACHE     = True
 CACHE_DIR     = ".refcache"
+# kNN vote / fixed-R coverage heatmaps and a self-contained HTML report.
+WRITE_INFLUENCE_REPORT = True
+INFLUENCE_TOPK = 3
+HEATMAP_BINS = 24
+INFLUENCE_GROUP_WORDS = None   # ordered substring groups; first match wins
+INFLUENCE_GROUP_DELIM = "_"   # otherwise gauge_name prefix defines a group
 
 sns.set_theme(style="white", context="talk")
 C_REF = "#8C8C8C"; C_SAMPLE = "#2CA02C"; C_GAP = "#F4511E"; C_HL = "#8E24AA"
@@ -447,6 +453,12 @@ def run():
 
     names = resolve_feature_names(SAMPLE_PATH, REF_PATH, FMT)
     R = build_reference(REF_PATH, names, FMT)
+    # Same fitted frame gets the same ID across sample runs; sample and R are excluded.
+    frame_hash = hashlib.sha256(_cache_key(REF_PATH, names, FMT).encode())
+    for array in (R["center"], R["scale"], R["Yr"], R["kpca"].X_fit_,
+                  R["kpca"].eigenvectors_, R["kpca"].eigenvalues_):
+        frame_hash.update(np.ascontiguousarray(array, dtype=np.float64).tobytes())
+    frame_id = frame_hash.hexdigest()
 
     # Sample 전체 읽기(원본 열 포함) → feature/유한행/gauge 강조 마스크
     if FMT == "csv":
@@ -460,6 +472,7 @@ def run():
     sample_raw = Xfull[fin]
     Xs_s = (sample_raw - R["center"]) / R["scale"]
     Ys = R["kpca"].transform(Xs_s)                 # 비선형 잠재
+    kp_cols = [f"KP{i+1}" for i in range(Ys.shape[1])]
     Ys_lin = R["pca"].transform(Xs_s)              # 선형 잠재
 
     # gauge_name 에 특정 단어 포함 → 강조 마스크(Ys=유한행 정렬)
@@ -516,9 +529,11 @@ def run():
         parts.append(pd.DataFrame(R["ref_keep"][imp_mask], columns=R["keep_cols"]).reset_index(drop=True))
     parts.append(pd.DataFrame(R["ref_raw"][imp_mask], columns=names).reset_index(drop=True))
     gap_df = pd.concat(parts, axis=1)
-    gap_df["KP1"], gap_df["KP2"], gap_df["KP3"] = Yi[:, 0], Yi[:, 1], Yi[:, 2]
+    for axis, name in enumerate(kp_cols):
+        gap_df[name] = Yi[:, axis]
     gap_df["ref_density"] = dens[imp_mask]
     gap_df["gap_group"] = groups
+    gap_df["kpca_frame_id"] = frame_id
     gap_df = gap_df.sort_values("ref_density", ascending=False)
     gap_df.to_csv(j("uncovered_kpca_gap_patterns.csv"), index=False)
 
@@ -530,15 +545,18 @@ def run():
         parts.append(pd.DataFrame(R["ref_keep"], columns=R["keep_cols"]).reset_index(drop=True))
     parts.append(pd.DataFrame(R["ref_raw"], columns=names).reset_index(drop=True))
     ref_sc = pd.concat(parts, axis=1)
-    ref_sc["KP1"], ref_sc["KP2"], ref_sc["KP3"] = R["Yr"][:, 0], R["Yr"][:, 1], R["Yr"][:, 2]
+    for axis, name in enumerate(kp_cols):
+        ref_sc[name] = R["Yr"][:, axis]
     ref_sc["ref_density"], ref_sc["cover_status"] = dens, ref_status
+    ref_sc["kpca_frame_id"] = frame_id
     ref_sc.to_csv(j("kpca_reference_scatter.csv"), index=False)
 
     # scatter 에 쓰인 Sample 전량 저장 (원본 전체 열 + KP + 강조여부)
     hl_full = np.zeros(len(sdf), dtype=bool); hl_full[np.where(fin)[0][hl]] = True
-    for a, nm in enumerate(["KP1", "KP2", "KP3"]):
+    for a, nm in enumerate(kp_cols):
         col = np.full(len(sdf), np.nan); col[fin] = Ys[:, a]; sdf[nm] = col
     sdf["gauge_highlight"] = hl_full
+    sdf["kpca_frame_id"] = frame_id
     sdf.to_csv(j("kpca_sample_scatter.csv"), index=False)
     print(f"[Save] kpca_reference_scatter.csv ({len(ref_sc):,}), kpca_sample_scatter.csv ({len(sdf):,})")
 
@@ -559,7 +577,8 @@ def run():
         "kpca_true_gap_pct": round(mk["true_gap"] * 100, 3),
         "linear_true_coverage_pct": round(ml["true_cov"] * 100, 3),
         "delta_illusion_pct": round(delta * 100, 3),
-        "R_mult": R_MULT, "repr_radius_kpca": round(R_k, 5), "k_neighbors": k_k,
+        "R_mult": R_MULT, "repr_radius_kpca": R_k, "k_neighbors": k_k,
+        "kpca_frame_id": frame_id, "kp_cols": kp_cols, "ystd_kpca": R["ystd_k"].tolist(),
         "n_ref_hdr_kpca": mk["n_ref_hdr"],
         "n_covered_kpca": mk["n_covered"], "n_gap_ref_points": int(gap_mask.sum()),
         "gap_important_q": GAP_IMPORTANT_Q, "n_important_gap": int(imp_mask.sum()),
@@ -574,6 +593,20 @@ def run():
             mh["true_cov"] / mk["true_cov"] * 100, 3) if mk["true_cov"] else 0.0
     with open(j("kpca_summary_metrics.json"), "w") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
+
+    if WRITE_INFLUENCE_REPORT:
+        try:
+            from .coverage_influence_report import generate_report
+        except ImportError:
+            from coverage_influence_report import generate_report
+        report_sample = sdf
+        if GAUGE_COL not in sdf:
+            report_sample = sdf.assign(**{GAUGE_COL: "Sample"})
+        generate_report(ref_sc, report_sample, R_k, j("influence"), bins=HEATMAP_BINS,
+                        topk=INFLUENCE_TOPK, gauge_col=GAUGE_COL, kp_cols=kp_cols,
+                        group_words=INFLUENCE_GROUP_WORDS, group_delim=INFLUENCE_GROUP_DELIM,
+                        provenance={"source": "coverage_domain_kpca.run", "reference": os.path.abspath(REF_PATH),
+                                    "sample": os.path.abspath(SAMPLE_PATH), "radius_source": "full sample budget"})
 
     print("\n" + "=" * 66)
     print("  [Kernel PCA Nonlinear Coverage]")
