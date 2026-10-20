@@ -1,0 +1,212 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1920" height="1080" viewBox="0 0 1920 1080">
+<rect width="1920" height="1080" fill="white"/>
+<text x="55" y="42" dominant-baseline="text-before-edge" text-anchor="start" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="47" font-weight="700" fill="#1F2937">Topology data에서 패턴 벡터까지</text>
+<text x="57" y="110" dominant-baseline="text-before-edge" text-anchor="start" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="26" font-weight="400" fill="#64748B">가변 크기의 도형·관계 그래프를 학습된 40차원 표현으로 요약</text>
+<rect x="50" y="181" width="430" height="655" rx="16" fill="#F7F9FC" stroke="#D7DEE8" stroke-width="2"/>
+<text x="74" y="207" dominant-baseline="text-before-edge" text-anchor="start" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="29" font-weight="700" fill="#1F2937">① 그래프 입력</text>
+<text x="74" y="253" dominant-baseline="text-before-edge" text-anchor="start" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="23" font-weight="400" fill="#64748B">Polygon 배치 + 관계 정보</text>
+<rect x="510" y="181" width="430" height="655" rx="16" fill="#F7F9FC" stroke="#D7DEE8" stroke-width="2"/>
+<text x="534" y="207" dominant-baseline="text-before-edge" text-anchor="start" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="29" font-weight="700" fill="#1F2937">② 특징 추출</text>
+<text x="534" y="253" dominant-baseline="text-before-edge" text-anchor="start" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="23" font-weight="400" fill="#64748B">학습된 GAT 인코더</text>
+<rect x="970" y="181" width="430" height="655" rx="16" fill="#F7F9FC" stroke="#D7DEE8" stroke-width="2"/>
+<text x="994" y="207" dominant-baseline="text-before-edge" text-anchor="start" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="29" font-weight="700" fill="#1F2937">③ 영역별 집계</text>
+<text x="994" y="253" dominant-baseline="text-before-edge" text-anchor="start" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="23" font-weight="400" fill="#64748B">노드·연결 특징의 평균</text>
+<rect x="1430" y="181" width="430" height="655" rx="16" fill="#F7F9FC" stroke="#D7DEE8" stroke-width="2"/>
+<text x="1454" y="207" dominant-baseline="text-before-edge" text-anchor="start" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="29" font-weight="700" fill="#1F2937">④ 패턴 벡터</text>
+<text x="1454" y="253" dominant-baseline="text-before-edge" text-anchor="start" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="23" font-weight="400" fill="#64748B">다섯 블록을 연결</text>
+<line x1="487" y1="500" x2="502" y2="500" stroke="#1F2937" stroke-width="4" stroke-linecap="round"/>
+<line x1="502" y1="500" x2="492.45398902354583" y2="505.4656815162811" stroke="#1F2937" stroke-width="4" stroke-linecap="round"/>
+<line x1="502" y1="500" x2="492.45398902354583" y2="494.5343184837189" stroke="#1F2937" stroke-width="4" stroke-linecap="round"/>
+<line x1="947" y1="500" x2="962" y2="500" stroke="#1F2937" stroke-width="4" stroke-linecap="round"/>
+<line x1="962" y1="500" x2="952.4539890235459" y2="505.4656815162811" stroke="#1F2937" stroke-width="4" stroke-linecap="round"/>
+<line x1="962" y1="500" x2="952.4539890235459" y2="494.5343184837189" stroke="#1F2937" stroke-width="4" stroke-linecap="round"/>
+<line x1="1407" y1="500" x2="1422" y2="500" stroke="#1F2937" stroke-width="4" stroke-linecap="round"/>
+<line x1="1422" y1="500" x2="1412.4539890235458" y2="505.4656815162811" stroke="#1F2937" stroke-width="4" stroke-linecap="round"/>
+<line x1="1422" y1="500" x2="1412.4539890235458" y2="494.5343184837189" stroke="#1F2937" stroke-width="4" stroke-linecap="round"/>
+<line x1="265" y1="464" x2="133" y2="464" stroke="#4285BA" stroke-width="4" stroke-linecap="round"/>
+<line x1="265" y1="464" x2="397" y2="464" stroke="#4285BA" stroke-width="4" stroke-linecap="round"/>
+<line x1="265" y1="464" x2="265" y2="332" stroke="#4285BA" stroke-width="4" stroke-linecap="round"/>
+<line x1="133" y1="464" x2="133" y2="332" stroke="#4285BA" stroke-width="4" stroke-linecap="round"/>
+<line x1="397" y1="464" x2="397" y2="332" stroke="#4285BA" stroke-width="4" stroke-linecap="round"/>
+<line x1="265" y1="332" x2="133" y2="332" stroke="#4285BA" stroke-width="4" stroke-linecap="round"/>
+<line x1="265" y1="332" x2="397" y2="332" stroke="#4285BA" stroke-width="4" stroke-linecap="round"/>
+<rect x="236.0" y="423.0" width="58" height="82" rx="3" fill="white" stroke="#DC5B57" stroke-width="4"/>
+<circle cx="265" cy="464" r="7" fill="#DC5B57" stroke="#DC5B57" stroke-width="2"/>
+<rect x="106.0" y="433.0" width="54" height="62" rx="3" fill="white" stroke="#E9A23B" stroke-width="4"/>
+<circle cx="133" cy="464" r="7" fill="#E9A23B" stroke="#E9A23B" stroke-width="2"/>
+<rect x="362.0" y="443.0" width="70" height="42" rx="3" fill="white" stroke="#E9A23B" stroke-width="4"/>
+<circle cx="397" cy="464" r="7" fill="#E9A23B" stroke="#E9A23B" stroke-width="2"/>
+<rect x="238.0" y="301.0" width="54" height="62" rx="3" fill="white" stroke="#E9A23B" stroke-width="4"/>
+<circle cx="265" cy="332" r="7" fill="#E9A23B" stroke="#E9A23B" stroke-width="2"/>
+<rect x="98.0" y="311.0" width="70" height="42" rx="3" fill="white" stroke="#52A778" stroke-width="4"/>
+<circle cx="133" cy="332" r="7" fill="#52A778" stroke="#52A778" stroke-width="2"/>
+<rect x="370.0" y="301.0" width="54" height="62" rx="3" fill="white" stroke="#52A778" stroke-width="4"/>
+<circle cx="397" cy="332" r="7" fill="#52A778" stroke="#52A778" stroke-width="2"/>
+<rect x="98.0" y="613.0" width="70" height="42" rx="3" fill="white" stroke="#939EAA" stroke-width="4"/>
+<circle cx="133" cy="634" r="7" fill="#939EAA" stroke="#939EAA" stroke-width="2"/>
+<text x="306" y="514" dominant-baseline="text-before-edge" text-anchor="start" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="21" font-weight="700" fill="#DC5B57">h0 / POI</text>
+<text x="265" y="702" dominant-baseline="text-before-edge" text-anchor="middle" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="22" font-weight="400" fill="#1F2937">노드: 상대 x·y, 폭·높이</text>
+<text x="265" y="743" dominant-baseline="text-before-edge" text-anchor="middle" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="22" font-weight="400" fill="#1F2937">연결: 거리·방향 + 이웃 ID</text>
+<text x="265" y="789" dominant-baseline="text-before-edge" text-anchor="middle" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="20" font-weight="400" fill="#64748B">노드·연결의 개수는 패턴마다 다름</text>
+<rect x="576" y="316" width="298" height="152" rx="12" fill="white" stroke="#4285BA" stroke-width="3"/>
+<text x="725" y="335" dominant-baseline="text-before-edge" text-anchor="middle" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="28" font-weight="700" fill="#1F2937">Graph encoder</text>
+<line x1="633" y1="395" x2="725" y2="395" stroke="#C9D7E4" stroke-width="2" stroke-linecap="round"/>
+<line x1="633" y1="395" x2="725" y2="432" stroke="#C9D7E4" stroke-width="2" stroke-linecap="round"/>
+<line x1="633" y1="432" x2="725" y2="395" stroke="#C9D7E4" stroke-width="2" stroke-linecap="round"/>
+<line x1="633" y1="432" x2="725" y2="432" stroke="#C9D7E4" stroke-width="2" stroke-linecap="round"/>
+<line x1="725" y1="395" x2="817" y2="395" stroke="#C9D7E4" stroke-width="2" stroke-linecap="round"/>
+<line x1="725" y1="395" x2="817" y2="432" stroke="#C9D7E4" stroke-width="2" stroke-linecap="round"/>
+<line x1="725" y1="432" x2="817" y2="395" stroke="#C9D7E4" stroke-width="2" stroke-linecap="round"/>
+<line x1="725" y1="432" x2="817" y2="432" stroke="#C9D7E4" stroke-width="2" stroke-linecap="round"/>
+<circle cx="633" cy="395" r="9" fill="#4285BA" stroke="#4285BA" stroke-width="2"/>
+<circle cx="633" cy="432" r="9" fill="#4285BA" stroke="#4285BA" stroke-width="2"/>
+<circle cx="725" cy="395" r="9" fill="#4285BA" stroke="#4285BA" stroke-width="2"/>
+<circle cx="725" cy="432" r="9" fill="#4285BA" stroke="#4285BA" stroke-width="2"/>
+<circle cx="817" cy="395" r="9" fill="#4285BA" stroke="#4285BA" stroke-width="2"/>
+<circle cx="817" cy="432" r="9" fill="#4285BA" stroke="#4285BA" stroke-width="2"/>
+<line x1="725" y1="483" x2="725" y2="520" stroke="#1F2937" stroke-width="3" stroke-linecap="round"/>
+<line x1="725" y1="520" x2="720.0311986215627" y2="511.3218082032235" stroke="#1F2937" stroke-width="3" stroke-linecap="round"/>
+<line x1="725" y1="520" x2="729.9688013784373" y2="511.3218082032235" stroke="#1F2937" stroke-width="3" stroke-linecap="round"/>
+<text x="546" y="548" dominant-baseline="text-before-edge" text-anchor="start" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="23" font-weight="700" fill="#1F2937">노드별</text>
+<rect x="638" y="546" width="20" height="29" rx="3" fill="#DC5B57" stroke="white" stroke-width="1"/>
+<rect x="661" y="546" width="20" height="29" rx="3" fill="#DC5B57" stroke="white" stroke-width="1"/>
+<rect x="684" y="546" width="20" height="29" rx="3" fill="#DC5B57" stroke="white" stroke-width="1"/>
+<rect x="707" y="546" width="20" height="29" rx="3" fill="#DC5B57" stroke="white" stroke-width="1"/>
+<rect x="730" y="546" width="20" height="29" rx="3" fill="#DC5B57" stroke="white" stroke-width="1"/>
+<rect x="753" y="546" width="20" height="29" rx="3" fill="#DC5B57" stroke="white" stroke-width="1"/>
+<rect x="776" y="546" width="20" height="29" rx="3" fill="#DC5B57" stroke="white" stroke-width="1"/>
+<rect x="799" y="546" width="20" height="29" rx="3" fill="#DC5B57" stroke="white" stroke-width="1"/>
+<text x="839" y="548" dominant-baseline="text-before-edge" text-anchor="start" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="23" font-weight="700" fill="#DC5B57">8D</text>
+<text x="546" y="608" dominant-baseline="text-before-edge" text-anchor="start" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="23" font-weight="700" fill="#1F2937">연결별</text>
+<rect x="638" y="606" width="20" height="29" rx="3" fill="#4285BA" stroke="white" stroke-width="1"/>
+<rect x="661" y="606" width="20" height="29" rx="3" fill="#4285BA" stroke="white" stroke-width="1"/>
+<rect x="684" y="606" width="20" height="29" rx="3" fill="#4285BA" stroke="white" stroke-width="1"/>
+<rect x="707" y="606" width="20" height="29" rx="3" fill="#4285BA" stroke="white" stroke-width="1"/>
+<rect x="730" y="606" width="20" height="29" rx="3" fill="#4285BA" stroke="white" stroke-width="1"/>
+<rect x="753" y="606" width="20" height="29" rx="3" fill="#4285BA" stroke="white" stroke-width="1"/>
+<rect x="776" y="606" width="20" height="29" rx="3" fill="#4285BA" stroke="white" stroke-width="1"/>
+<rect x="799" y="606" width="20" height="29" rx="3" fill="#4285BA" stroke="white" stroke-width="1"/>
+<text x="839" y="608" dominant-baseline="text-before-edge" text-anchor="start" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="23" font-weight="700" fill="#4285BA">8D</text>
+<text x="725" y="704" dominant-baseline="text-before-edge" text-anchor="middle" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="22" font-weight="400" fill="#1F2937">자기 속성과 이웃 정보를 반영</text>
+<text x="725" y="746" dominant-baseline="text-before-edge" text-anchor="middle" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="22" font-weight="400" fill="#1F2937">각 노드·연결 → 특징값 8개</text>
+<text x="725" y="789" dominant-baseline="text-before-edge" text-anchor="middle" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="20" font-weight="400" fill="#64748B">색 막대는 학습된 특징값의 개념도</text>
+<text x="991" y="328" dominant-baseline="text-before-edge" text-anchor="start" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="22" font-weight="700" fill="#1F2937">h0 중심</text>
+<rect x="1115" y="324" width="23" height="31" rx="3" fill="#DC5B57" stroke="white" stroke-width="1"/>
+<rect x="1141" y="324" width="23" height="31" rx="3" fill="#DC5B57" stroke="white" stroke-width="1"/>
+<rect x="1167" y="324" width="23" height="31" rx="3" fill="#DC5B57" stroke="white" stroke-width="1"/>
+<rect x="1193" y="324" width="23" height="31" rx="3" fill="#DC5B57" stroke="white" stroke-width="1"/>
+<rect x="1219" y="324" width="23" height="31" rx="3" fill="#DC5B57" stroke="white" stroke-width="1"/>
+<rect x="1245" y="324" width="23" height="31" rx="3" fill="#DC5B57" stroke="white" stroke-width="1"/>
+<rect x="1271" y="324" width="23" height="31" rx="3" fill="#DC5B57" stroke="white" stroke-width="1"/>
+<rect x="1297" y="324" width="23" height="31" rx="3" fill="#DC5B57" stroke="white" stroke-width="1"/>
+<text x="1341" y="327" dominant-baseline="text-before-edge" text-anchor="start" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="22" font-weight="700" fill="#DC5B57">8D</text>
+<text x="991" y="397" dominant-baseline="text-before-edge" text-anchor="start" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="22" font-weight="700" fill="#1F2937">h1 이웃</text>
+<rect x="1115" y="393" width="23" height="31" rx="3" fill="#E9A23B" stroke="white" stroke-width="1"/>
+<rect x="1141" y="393" width="23" height="31" rx="3" fill="#E9A23B" stroke="white" stroke-width="1"/>
+<rect x="1167" y="393" width="23" height="31" rx="3" fill="#E9A23B" stroke="white" stroke-width="1"/>
+<rect x="1193" y="393" width="23" height="31" rx="3" fill="#E9A23B" stroke="white" stroke-width="1"/>
+<rect x="1219" y="393" width="23" height="31" rx="3" fill="#E9A23B" stroke="white" stroke-width="1"/>
+<rect x="1245" y="393" width="23" height="31" rx="3" fill="#E9A23B" stroke="white" stroke-width="1"/>
+<rect x="1271" y="393" width="23" height="31" rx="3" fill="#E9A23B" stroke="white" stroke-width="1"/>
+<rect x="1297" y="393" width="23" height="31" rx="3" fill="#E9A23B" stroke="white" stroke-width="1"/>
+<text x="1341" y="396" dominant-baseline="text-before-edge" text-anchor="start" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="22" font-weight="700" fill="#E9A23B">8D</text>
+<text x="991" y="466" dominant-baseline="text-before-edge" text-anchor="start" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="22" font-weight="700" fill="#1F2937">h2 이웃</text>
+<rect x="1115" y="462" width="23" height="31" rx="3" fill="#52A778" stroke="white" stroke-width="1"/>
+<rect x="1141" y="462" width="23" height="31" rx="3" fill="#52A778" stroke="white" stroke-width="1"/>
+<rect x="1167" y="462" width="23" height="31" rx="3" fill="#52A778" stroke="white" stroke-width="1"/>
+<rect x="1193" y="462" width="23" height="31" rx="3" fill="#52A778" stroke="white" stroke-width="1"/>
+<rect x="1219" y="462" width="23" height="31" rx="3" fill="#52A778" stroke="white" stroke-width="1"/>
+<rect x="1245" y="462" width="23" height="31" rx="3" fill="#52A778" stroke="white" stroke-width="1"/>
+<rect x="1271" y="462" width="23" height="31" rx="3" fill="#52A778" stroke="white" stroke-width="1"/>
+<rect x="1297" y="462" width="23" height="31" rx="3" fill="#52A778" stroke="white" stroke-width="1"/>
+<text x="1341" y="465" dominant-baseline="text-before-edge" text-anchor="start" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="22" font-weight="700" fill="#52A778">8D</text>
+<text x="991" y="535" dominant-baseline="text-before-edge" text-anchor="start" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="22" font-weight="700" fill="#1F2937">h3 나머지</text>
+<rect x="1115" y="531" width="23" height="31" rx="3" fill="#939EAA" stroke="white" stroke-width="1"/>
+<rect x="1141" y="531" width="23" height="31" rx="3" fill="#939EAA" stroke="white" stroke-width="1"/>
+<rect x="1167" y="531" width="23" height="31" rx="3" fill="#939EAA" stroke="white" stroke-width="1"/>
+<rect x="1193" y="531" width="23" height="31" rx="3" fill="#939EAA" stroke="white" stroke-width="1"/>
+<rect x="1219" y="531" width="23" height="31" rx="3" fill="#939EAA" stroke="white" stroke-width="1"/>
+<rect x="1245" y="531" width="23" height="31" rx="3" fill="#939EAA" stroke="white" stroke-width="1"/>
+<rect x="1271" y="531" width="23" height="31" rx="3" fill="#939EAA" stroke="white" stroke-width="1"/>
+<rect x="1297" y="531" width="23" height="31" rx="3" fill="#939EAA" stroke="white" stroke-width="1"/>
+<text x="1341" y="534" dominant-baseline="text-before-edge" text-anchor="start" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="22" font-weight="700" fill="#939EAA">8D</text>
+<text x="991" y="604" dominant-baseline="text-before-edge" text-anchor="start" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="22" font-weight="700" fill="#1F2937">edge 관계</text>
+<rect x="1115" y="600" width="23" height="31" rx="3" fill="#4285BA" stroke="white" stroke-width="1"/>
+<rect x="1141" y="600" width="23" height="31" rx="3" fill="#4285BA" stroke="white" stroke-width="1"/>
+<rect x="1167" y="600" width="23" height="31" rx="3" fill="#4285BA" stroke="white" stroke-width="1"/>
+<rect x="1193" y="600" width="23" height="31" rx="3" fill="#4285BA" stroke="white" stroke-width="1"/>
+<rect x="1219" y="600" width="23" height="31" rx="3" fill="#4285BA" stroke="white" stroke-width="1"/>
+<rect x="1245" y="600" width="23" height="31" rx="3" fill="#4285BA" stroke="white" stroke-width="1"/>
+<rect x="1271" y="600" width="23" height="31" rx="3" fill="#4285BA" stroke="white" stroke-width="1"/>
+<rect x="1297" y="600" width="23" height="31" rx="3" fill="#4285BA" stroke="white" stroke-width="1"/>
+<text x="1341" y="603" dominant-baseline="text-before-edge" text-anchor="start" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="22" font-weight="700" fill="#4285BA">8D</text>
+<text x="1185" y="705" dominant-baseline="text-before-edge" text-anchor="middle" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="22" font-weight="400" fill="#1F2937">같은 영역의 노드 특징을 평균</text>
+<text x="1185" y="747" dominant-baseline="text-before-edge" text-anchor="middle" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="22" font-weight="400" fill="#1F2937">연결 특징도 별도로 평균</text>
+<text x="1185" y="789" dominant-baseline="text-before-edge" text-anchor="middle" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="20" font-weight="400" fill="#64748B">h3: h0·h1·h2를 제외한 노드</text>
+<rect x="1510" y="316" width="270" height="31" rx="4" fill="#DC5B57" stroke="#DC5B57" stroke-width="1"/>
+<text x="1645" y="319" dominant-baseline="text-before-edge" text-anchor="middle" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="20" font-weight="700" fill="white">h0 : 8</text>
+<rect x="1510" y="357" width="270" height="31" rx="4" fill="#E9A23B" stroke="#E9A23B" stroke-width="1"/>
+<text x="1645" y="360" dominant-baseline="text-before-edge" text-anchor="middle" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="20" font-weight="700" fill="white">h1 : 8</text>
+<rect x="1510" y="398" width="270" height="31" rx="4" fill="#52A778" stroke="#52A778" stroke-width="1"/>
+<text x="1645" y="401" dominant-baseline="text-before-edge" text-anchor="middle" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="20" font-weight="700" fill="white">h2 : 8</text>
+<rect x="1510" y="439" width="270" height="31" rx="4" fill="#939EAA" stroke="#939EAA" stroke-width="1"/>
+<text x="1645" y="442" dominant-baseline="text-before-edge" text-anchor="middle" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="20" font-weight="700" fill="white">h3 : 8</text>
+<rect x="1510" y="480" width="270" height="31" rx="4" fill="#4285BA" stroke="#4285BA" stroke-width="1"/>
+<text x="1645" y="483" dominant-baseline="text-before-edge" text-anchor="middle" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="20" font-weight="700" fill="white">edge : 8</text>
+<line x1="1645" y1="532" x2="1645" y2="565" stroke="#1F2937" stroke-width="3" stroke-linecap="round"/>
+<line x1="1645" y1="565" x2="1640.0311986215627" y2="556.3218082032236" stroke="#1F2937" stroke-width="3" stroke-linecap="round"/>
+<line x1="1645" y1="565" x2="1649.9688013784373" y2="556.3218082032236" stroke="#1F2937" stroke-width="3" stroke-linecap="round"/>
+<rect x="1465" y="586" width="8" height="54" rx="1" fill="#DC5B57" stroke="#DC5B57" stroke-width="1"/>
+<rect x="1474" y="586" width="8" height="54" rx="1" fill="#DC5B57" stroke="#DC5B57" stroke-width="1"/>
+<rect x="1483" y="586" width="8" height="54" rx="1" fill="#DC5B57" stroke="#DC5B57" stroke-width="1"/>
+<rect x="1492" y="586" width="8" height="54" rx="1" fill="#DC5B57" stroke="#DC5B57" stroke-width="1"/>
+<rect x="1501" y="586" width="8" height="54" rx="1" fill="#DC5B57" stroke="#DC5B57" stroke-width="1"/>
+<rect x="1510" y="586" width="8" height="54" rx="1" fill="#DC5B57" stroke="#DC5B57" stroke-width="1"/>
+<rect x="1519" y="586" width="8" height="54" rx="1" fill="#DC5B57" stroke="#DC5B57" stroke-width="1"/>
+<rect x="1528" y="586" width="8" height="54" rx="1" fill="#DC5B57" stroke="#DC5B57" stroke-width="1"/>
+<text x="1500" y="653" dominant-baseline="text-before-edge" text-anchor="middle" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="19" font-weight="700" fill="#DC5B57">h0</text>
+<rect x="1537" y="586" width="8" height="54" rx="1" fill="#E9A23B" stroke="#E9A23B" stroke-width="1"/>
+<rect x="1546" y="586" width="8" height="54" rx="1" fill="#E9A23B" stroke="#E9A23B" stroke-width="1"/>
+<rect x="1555" y="586" width="8" height="54" rx="1" fill="#E9A23B" stroke="#E9A23B" stroke-width="1"/>
+<rect x="1564" y="586" width="8" height="54" rx="1" fill="#E9A23B" stroke="#E9A23B" stroke-width="1"/>
+<rect x="1573" y="586" width="8" height="54" rx="1" fill="#E9A23B" stroke="#E9A23B" stroke-width="1"/>
+<rect x="1582" y="586" width="8" height="54" rx="1" fill="#E9A23B" stroke="#E9A23B" stroke-width="1"/>
+<rect x="1591" y="586" width="8" height="54" rx="1" fill="#E9A23B" stroke="#E9A23B" stroke-width="1"/>
+<rect x="1600" y="586" width="8" height="54" rx="1" fill="#E9A23B" stroke="#E9A23B" stroke-width="1"/>
+<text x="1572" y="653" dominant-baseline="text-before-edge" text-anchor="middle" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="19" font-weight="700" fill="#E9A23B">h1</text>
+<rect x="1609" y="586" width="8" height="54" rx="1" fill="#52A778" stroke="#52A778" stroke-width="1"/>
+<rect x="1618" y="586" width="8" height="54" rx="1" fill="#52A778" stroke="#52A778" stroke-width="1"/>
+<rect x="1627" y="586" width="8" height="54" rx="1" fill="#52A778" stroke="#52A778" stroke-width="1"/>
+<rect x="1636" y="586" width="8" height="54" rx="1" fill="#52A778" stroke="#52A778" stroke-width="1"/>
+<rect x="1645" y="586" width="8" height="54" rx="1" fill="#52A778" stroke="#52A778" stroke-width="1"/>
+<rect x="1654" y="586" width="8" height="54" rx="1" fill="#52A778" stroke="#52A778" stroke-width="1"/>
+<rect x="1663" y="586" width="8" height="54" rx="1" fill="#52A778" stroke="#52A778" stroke-width="1"/>
+<rect x="1672" y="586" width="8" height="54" rx="1" fill="#52A778" stroke="#52A778" stroke-width="1"/>
+<text x="1644" y="653" dominant-baseline="text-before-edge" text-anchor="middle" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="19" font-weight="700" fill="#52A778">h2</text>
+<rect x="1681" y="586" width="8" height="54" rx="1" fill="#939EAA" stroke="#939EAA" stroke-width="1"/>
+<rect x="1690" y="586" width="8" height="54" rx="1" fill="#939EAA" stroke="#939EAA" stroke-width="1"/>
+<rect x="1699" y="586" width="8" height="54" rx="1" fill="#939EAA" stroke="#939EAA" stroke-width="1"/>
+<rect x="1708" y="586" width="8" height="54" rx="1" fill="#939EAA" stroke="#939EAA" stroke-width="1"/>
+<rect x="1717" y="586" width="8" height="54" rx="1" fill="#939EAA" stroke="#939EAA" stroke-width="1"/>
+<rect x="1726" y="586" width="8" height="54" rx="1" fill="#939EAA" stroke="#939EAA" stroke-width="1"/>
+<rect x="1735" y="586" width="8" height="54" rx="1" fill="#939EAA" stroke="#939EAA" stroke-width="1"/>
+<rect x="1744" y="586" width="8" height="54" rx="1" fill="#939EAA" stroke="#939EAA" stroke-width="1"/>
+<text x="1716" y="653" dominant-baseline="text-before-edge" text-anchor="middle" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="19" font-weight="700" fill="#939EAA">h3</text>
+<rect x="1753" y="586" width="8" height="54" rx="1" fill="#4285BA" stroke="#4285BA" stroke-width="1"/>
+<rect x="1762" y="586" width="8" height="54" rx="1" fill="#4285BA" stroke="#4285BA" stroke-width="1"/>
+<rect x="1771" y="586" width="8" height="54" rx="1" fill="#4285BA" stroke="#4285BA" stroke-width="1"/>
+<rect x="1780" y="586" width="8" height="54" rx="1" fill="#4285BA" stroke="#4285BA" stroke-width="1"/>
+<rect x="1789" y="586" width="8" height="54" rx="1" fill="#4285BA" stroke="#4285BA" stroke-width="1"/>
+<rect x="1798" y="586" width="8" height="54" rx="1" fill="#4285BA" stroke="#4285BA" stroke-width="1"/>
+<rect x="1807" y="586" width="8" height="54" rx="1" fill="#4285BA" stroke="#4285BA" stroke-width="1"/>
+<rect x="1816" y="586" width="8" height="54" rx="1" fill="#4285BA" stroke="#4285BA" stroke-width="1"/>
+<text x="1788" y="653" dominant-baseline="text-before-edge" text-anchor="middle" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="19" font-weight="700" fill="#4285BA">edge</text>
+<text x="1645" y="706" dominant-baseline="text-before-edge" text-anchor="middle" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="27" font-weight="700" fill="#1F2937">패턴 1개 → 숫자 40개</text>
+<text x="1645" y="753" dominant-baseline="text-before-edge" text-anchor="middle" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="21" font-weight="400" fill="#1F2937">실제 pattern_key와 연결하여 저장</text>
+<text x="1645" y="789" dominant-baseline="text-before-edge" text-anchor="middle" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="21" font-weight="400" fill="#64748B">40D = 8D × 5개 블록</text>
+<rect x="50" y="872" width="1810" height="151" rx="12" fill="#EFF5FA" stroke="#DFE8F0" stroke-width="2"/>
+<text x="77" y="893" dominant-baseline="text-before-edge" text-anchor="start" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="23" font-weight="700" fill="#4285BA">학습 원리</text>
+<text x="237" y="893" dominant-baseline="text-before-edge" text-anchor="start" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="25" font-weight="700" fill="#1F2937">도형·관계 속성 → 인코더 → 디코더 → 원본 속성 예측</text>
+<text x="237" y="939" dominant-baseline="text-before-edge" text-anchor="start" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="22" font-weight="400" fill="#64748B">속성 복원 오차와 VICReg 제약을 줄이도록 학습한 뒤, 위 흐름으로 패턴 벡터를 추출</text>
+<text x="237" y="978" dominant-baseline="text-before-edge" text-anchor="start" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="22" font-weight="400" fill="#64748B">8D는 노드·연결별 특징이고, 40D는 패턴 전체를 요약한 최종 벡터</text>
+</svg>
