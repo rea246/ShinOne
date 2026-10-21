@@ -1,0 +1,182 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1920" height="1080" viewBox="0 0 1920 1080">
+<rect width="1920" height="1080" fill="white"/>
+<text x="55" y="33" dominant-baseline="text-before-edge" text-anchor="start" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="39" font-weight="700" fill="#1F2937">학습할 때는 Decoder로 확인하고, 사용할 때는 Encoder로 특징을 추출</text>
+<text x="57" y="94" dominant-baseline="text-before-edge" text-anchor="start" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="25" font-weight="400" fill="#64748B">학습: 원본 속성을 다시 맞히며 모델을 훈련   /   사용: 학습된 특징을 모아 패턴별 40D 생성</text>
+<rect x="50" y="151" width="1810" height="393" rx="14" fill="#F7F9FC" stroke="#D7DEE8" stroke-width="2"/>
+<text x="73" y="168" dominant-baseline="text-before-edge" text-anchor="start" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="28" font-weight="700" fill="#1F2937">① 학습 단계 — 원본을 얼마나 잘 설명하는지 반복 확인</text>
+<rect x="75" y="254" width="290" height="169" rx="10" fill="white" stroke="#D7DEE8" stroke-width="2"/>
+<rect x="430" y="254" width="290" height="169" rx="10" fill="white" stroke="#4285BA" stroke-width="3"/>
+<rect x="785" y="254" width="290" height="169" rx="10" fill="white" stroke="#D7DEE8" stroke-width="2"/>
+<rect x="1140" y="254" width="290" height="169" rx="10" fill="white" stroke="#D7DEE8" stroke-width="2"/>
+<rect x="1495" y="254" width="340" height="169" rx="10" fill="white" stroke="#D7DEE8" stroke-width="2"/>
+<line x1="375" y1="337" x2="418" y2="337" stroke="#1F2937" stroke-width="3" stroke-linecap="round"/>
+<line x1="418" y1="337" x2="409.3218082032235" y2="341.9688013784374" stroke="#1F2937" stroke-width="3" stroke-linecap="round"/>
+<line x1="418" y1="337" x2="409.3218082032235" y2="332.0311986215626" stroke="#1F2937" stroke-width="3" stroke-linecap="round"/>
+<line x1="730" y1="337" x2="773" y2="337" stroke="#1F2937" stroke-width="3" stroke-linecap="round"/>
+<line x1="773" y1="337" x2="764.3218082032236" y2="341.9688013784374" stroke="#1F2937" stroke-width="3" stroke-linecap="round"/>
+<line x1="773" y1="337" x2="764.3218082032236" y2="332.0311986215626" stroke="#1F2937" stroke-width="3" stroke-linecap="round"/>
+<line x1="1085" y1="337" x2="1128" y2="337" stroke="#1F2937" stroke-width="3" stroke-linecap="round"/>
+<line x1="1128" y1="337" x2="1119.3218082032236" y2="341.9688013784374" stroke="#1F2937" stroke-width="3" stroke-linecap="round"/>
+<line x1="1128" y1="337" x2="1119.3218082032236" y2="332.0311986215626" stroke="#1F2937" stroke-width="3" stroke-linecap="round"/>
+<line x1="1440" y1="337" x2="1483" y2="337" stroke="#1F2937" stroke-width="3" stroke-linecap="round"/>
+<line x1="1483" y1="337" x2="1474.3218082032236" y2="341.9688013784374" stroke="#1F2937" stroke-width="3" stroke-linecap="round"/>
+<line x1="1483" y1="337" x2="1474.3218082032236" y2="332.0311986215626" stroke="#1F2937" stroke-width="3" stroke-linecap="round"/>
+<text x="220" y="269" dominant-baseline="text-before-edge" text-anchor="middle" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="23" font-weight="700" fill="#1F2937">원본 Topology data</text>
+<text x="220" y="309" dominant-baseline="text-before-edge" text-anchor="middle" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="22" font-weight="400" fill="#1F2937">도형: 위치·크기</text>
+<text x="220" y="346" dominant-baseline="text-before-edge" text-anchor="middle" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="22" font-weight="400" fill="#1F2937">관계: 거리·방향</text>
+<text x="220" y="389" dominant-baseline="text-before-edge" text-anchor="middle" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="18" font-weight="400" fill="#64748B">입력에는 작은 노이즈 추가</text>
+<text x="575" y="270" dominant-baseline="text-before-edge" text-anchor="middle" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="29" font-weight="700" fill="#4285BA">Encoder</text>
+<text x="575" y="313" dominant-baseline="text-before-edge" text-anchor="middle" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="22" font-weight="400" fill="#1F2937">이웃 관계를 반영해</text>
+<text x="575" y="349" dominant-baseline="text-before-edge" text-anchor="middle" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="22" font-weight="400" fill="#1F2937">특징을 만드는 도구</text>
+<text x="575" y="390" dominant-baseline="text-before-edge" text-anchor="middle" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="20" font-weight="700" fill="#4285BA">GAT · 학습 중</text>
+<text x="930" y="270" dominant-baseline="text-before-edge" text-anchor="middle" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="25" font-weight="700" fill="#1F2937">중간 특징</text>
+<text x="804" y="320" dominant-baseline="text-before-edge" text-anchor="start" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="21" font-weight="400" fill="#1F2937">도형별</text>
+<rect x="882" y="320" width="15" height="25" rx="3" fill="#DC5B57" stroke="white" stroke-width="1"/>
+<rect x="900" y="320" width="15" height="25" rx="3" fill="#DC5B57" stroke="white" stroke-width="1"/>
+<rect x="918" y="320" width="15" height="25" rx="3" fill="#DC5B57" stroke="white" stroke-width="1"/>
+<rect x="936" y="320" width="15" height="25" rx="3" fill="#DC5B57" stroke="white" stroke-width="1"/>
+<rect x="954" y="320" width="15" height="25" rx="3" fill="#DC5B57" stroke="white" stroke-width="1"/>
+<rect x="972" y="320" width="15" height="25" rx="3" fill="#DC5B57" stroke="white" stroke-width="1"/>
+<rect x="990" y="320" width="15" height="25" rx="3" fill="#DC5B57" stroke="white" stroke-width="1"/>
+<rect x="1008" y="320" width="15" height="25" rx="3" fill="#DC5B57" stroke="white" stroke-width="1"/>
+<text x="804" y="365" dominant-baseline="text-before-edge" text-anchor="start" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="21" font-weight="400" fill="#1F2937">관계별</text>
+<rect x="882" y="365" width="15" height="25" rx="3" fill="#4285BA" stroke="white" stroke-width="1"/>
+<rect x="900" y="365" width="15" height="25" rx="3" fill="#4285BA" stroke="white" stroke-width="1"/>
+<rect x="918" y="365" width="15" height="25" rx="3" fill="#4285BA" stroke="white" stroke-width="1"/>
+<rect x="936" y="365" width="15" height="25" rx="3" fill="#4285BA" stroke="white" stroke-width="1"/>
+<rect x="954" y="365" width="15" height="25" rx="3" fill="#4285BA" stroke="white" stroke-width="1"/>
+<rect x="972" y="365" width="15" height="25" rx="3" fill="#4285BA" stroke="white" stroke-width="1"/>
+<rect x="990" y="365" width="15" height="25" rx="3" fill="#4285BA" stroke="white" stroke-width="1"/>
+<rect x="1008" y="365" width="15" height="25" rx="3" fill="#4285BA" stroke="white" stroke-width="1"/>
+<text x="930" y="401" dominant-baseline="text-before-edge" text-anchor="middle" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="18" font-weight="400" fill="#64748B">각각 숫자 8개</text>
+<text x="1285" y="270" dominant-baseline="text-before-edge" text-anchor="middle" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="29" font-weight="700" fill="#1F2937">Decoder</text>
+<text x="1285" y="314" dominant-baseline="text-before-edge" text-anchor="middle" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="22" font-weight="400" fill="#1F2937">특징값에서 원래의</text>
+<text x="1285" y="350" dominant-baseline="text-before-edge" text-anchor="middle" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="21" font-weight="400" fill="#1F2937">도형·관계 속성을 예측</text>
+<text x="1285" y="391" dominant-baseline="text-before-edge" text-anchor="middle" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="19" font-weight="400" fill="#64748B">학습을 위한 예측 도구</text>
+<text x="1665" y="270" dominant-baseline="text-before-edge" text-anchor="middle" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="24" font-weight="700" fill="#1F2937">예측값 ↔ 원본값 비교</text>
+<text x="1665" y="317" dominant-baseline="text-before-edge" text-anchor="middle" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="22" font-weight="400" fill="#1F2937">위치·크기를 맞혔나?</text>
+<text x="1665" y="353" dominant-baseline="text-before-edge" text-anchor="middle" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="22" font-weight="400" fill="#1F2937">거리·방향을 맞혔나?</text>
+<text x="1665" y="391" dominant-baseline="text-before-edge" text-anchor="middle" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="20" font-weight="700" fill="#B87726">차이 = 복원 오차</text>
+<line x1="220" y1="245" x2="220" y2="217" stroke="#64748B" stroke-width="2" stroke-linecap="round"/>
+<line x1="220" y1="217" x2="1665" y2="217" stroke="#64748B" stroke-width="2" stroke-linecap="round"/>
+<line x1="1665" y1="217" x2="1665" y2="245" stroke="#64748B" stroke-width="2" stroke-linecap="round"/>
+<line x1="1665" y1="245" x2="1661.0249588972501" y2="238.0574465625788" stroke="#64748B" stroke-width="2" stroke-linecap="round"/>
+<line x1="1665" y1="245" x2="1668.9750411027499" y2="238.0574465625788" stroke="#64748B" stroke-width="2" stroke-linecap="round"/>
+<rect x="850" y="204" width="410" height="27" rx="0" fill="#F7F9FC" stroke="#F7F9FC" stroke-width="1"/>
+<text x="1055" y="205" dominant-baseline="text-before-edge" text-anchor="middle" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="19" font-weight="400" fill="#64748B">원본 속성을 비교 기준으로 보관</text>
+<line x1="1665" y1="435" x2="1665" y2="473" stroke="#B87726" stroke-width="3" stroke-linecap="round"/>
+<line x1="1665" y1="473" x2="575" y2="473" stroke="#B87726" stroke-width="3" stroke-linecap="round"/>
+<line x1="575" y1="473" x2="575" y2="435" stroke="#B87726" stroke-width="3" stroke-linecap="round"/>
+<line x1="575" y1="435" x2="579.9688013784373" y2="443.6781917967765" stroke="#B87726" stroke-width="3" stroke-linecap="round"/>
+<line x1="575" y1="435" x2="570.0311986215627" y2="443.6781917967765" stroke="#B87726" stroke-width="3" stroke-linecap="round"/>
+<line x1="1285" y1="473" x2="1285" y2="435" stroke="#B87726" stroke-width="3" stroke-linecap="round"/>
+<line x1="1285" y1="435" x2="1289.9688013784373" y2="443.6781917967765" stroke="#B87726" stroke-width="3" stroke-linecap="round"/>
+<line x1="1285" y1="435" x2="1280.0311986215627" y2="443.6781917967765" stroke="#B87726" stroke-width="3" stroke-linecap="round"/>
+<rect x="711" y="459" width="425" height="30" rx="0" fill="#F7F9FC" stroke="#F7F9FC" stroke-width="1"/>
+<text x="923" y="460" dominant-baseline="text-before-edge" text-anchor="middle" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="21" font-weight="700" fill="#B87726">오차가 줄어들도록 두 도구를 함께 수정</text>
+<text x="76" y="509" dominant-baseline="text-before-edge" text-anchor="start" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="21" font-weight="400" fill="#64748B">보조 학습: 원본·노이즈 입력의 표현을 가깝게 하고, 모든 패턴이 같은 값이 되는 것을 억제 (VICReg)</text>
+<line x1="575" y1="552" x2="575" y2="650" stroke="#4285BA" stroke-width="5" stroke-linecap="round"/>
+<line x1="575" y1="650" x2="568.0436780701876" y2="637.8505314845129" stroke="#4285BA" stroke-width="5" stroke-linecap="round"/>
+<line x1="575" y1="650" x2="581.9563219298124" y2="637.8505314845129" stroke="#4285BA" stroke-width="5" stroke-linecap="round"/>
+<text x="622" y="566" dominant-baseline="text-before-edge" text-anchor="start" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="28" font-weight="700" fill="#4285BA">학습 완료 → Encoder 저장·재사용</text>
+<text x="623" y="611" dominant-baseline="text-before-edge" text-anchor="start" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="22" font-weight="400" fill="#64748B">아래에서는 학습된 계산 방법을 그대로 적용</text>
+<rect x="50" y="661" width="1810" height="329" rx="14" fill="#EDF5FB" stroke="#CDDEED" stroke-width="2"/>
+<text x="73" y="679" dominant-baseline="text-before-edge" text-anchor="start" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="28" font-weight="700" fill="#1F2937">② 사용 단계 — 학습된 Encoder로 패턴별 40D 추출</text>
+<rect x="75" y="736" width="290" height="166" rx="10" fill="white" stroke="#D7DEE8" stroke-width="2"/>
+<rect x="430" y="736" width="290" height="166" rx="10" fill="white" stroke="#4285BA" stroke-width="3"/>
+<rect x="785" y="736" width="290" height="166" rx="10" fill="white" stroke="#D7DEE8" stroke-width="2"/>
+<rect x="1140" y="736" width="290" height="166" rx="10" fill="white" stroke="#D7DEE8" stroke-width="2"/>
+<rect x="1495" y="736" width="340" height="166" rx="10" fill="white" stroke="#D7DEE8" stroke-width="2"/>
+<line x1="375" y1="819" x2="418" y2="819" stroke="#1F2937" stroke-width="3" stroke-linecap="round"/>
+<line x1="418" y1="819" x2="409.3218082032235" y2="823.9688013784373" stroke="#1F2937" stroke-width="3" stroke-linecap="round"/>
+<line x1="418" y1="819" x2="409.3218082032235" y2="814.0311986215627" stroke="#1F2937" stroke-width="3" stroke-linecap="round"/>
+<line x1="730" y1="819" x2="773" y2="819" stroke="#1F2937" stroke-width="3" stroke-linecap="round"/>
+<line x1="773" y1="819" x2="764.3218082032236" y2="823.9688013784373" stroke="#1F2937" stroke-width="3" stroke-linecap="round"/>
+<line x1="773" y1="819" x2="764.3218082032236" y2="814.0311986215627" stroke="#1F2937" stroke-width="3" stroke-linecap="round"/>
+<line x1="1085" y1="819" x2="1128" y2="819" stroke="#1F2937" stroke-width="3" stroke-linecap="round"/>
+<line x1="1128" y1="819" x2="1119.3218082032236" y2="823.9688013784373" stroke="#1F2937" stroke-width="3" stroke-linecap="round"/>
+<line x1="1128" y1="819" x2="1119.3218082032236" y2="814.0311986215627" stroke="#1F2937" stroke-width="3" stroke-linecap="round"/>
+<line x1="1440" y1="819" x2="1483" y2="819" stroke="#1F2937" stroke-width="3" stroke-linecap="round"/>
+<line x1="1483" y1="819" x2="1474.3218082032236" y2="823.9688013784373" stroke="#1F2937" stroke-width="3" stroke-linecap="round"/>
+<line x1="1483" y1="819" x2="1474.3218082032236" y2="814.0311986215627" stroke="#1F2937" stroke-width="3" stroke-linecap="round"/>
+<text x="220" y="753" dominant-baseline="text-before-edge" text-anchor="middle" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="24" font-weight="700" fill="#1F2937">분석할 패턴의</text>
+<text x="220" y="792" dominant-baseline="text-before-edge" text-anchor="middle" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="25" font-weight="700" fill="#1F2937">Topology data</text>
+<text x="220" y="847" dominant-baseline="text-before-edge" text-anchor="middle" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="20" font-weight="400" fill="#64748B">원본 속성을 그대로 입력</text>
+<text x="575" y="752" dominant-baseline="text-before-edge" text-anchor="middle" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="25" font-weight="700" fill="#4285BA">학습 완료 Encoder</text>
+<text x="575" y="794" dominant-baseline="text-before-edge" text-anchor="middle" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="22" font-weight="400" fill="#1F2937">배운 계산 방법으로</text>
+<text x="575" y="830" dominant-baseline="text-before-edge" text-anchor="middle" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="24" font-weight="700" fill="#1F2937">특징만 추출</text>
+<text x="575" y="871" dominant-baseline="text-before-edge" text-anchor="middle" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="18" font-weight="400" fill="#64748B">추가 학습 없이 적용</text>
+<text x="930" y="751" dominant-baseline="text-before-edge" text-anchor="middle" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="23" font-weight="700" fill="#1F2937">도형·관계별 특징</text>
+<text x="804" y="794" dominant-baseline="text-before-edge" text-anchor="start" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="21" font-weight="400" fill="#1F2937">도형별</text>
+<rect x="882" y="793" width="15" height="24" rx="3" fill="#DC5B57" stroke="white" stroke-width="1"/>
+<rect x="900" y="793" width="15" height="24" rx="3" fill="#DC5B57" stroke="white" stroke-width="1"/>
+<rect x="918" y="793" width="15" height="24" rx="3" fill="#DC5B57" stroke="white" stroke-width="1"/>
+<rect x="936" y="793" width="15" height="24" rx="3" fill="#DC5B57" stroke="white" stroke-width="1"/>
+<rect x="954" y="793" width="15" height="24" rx="3" fill="#DC5B57" stroke="white" stroke-width="1"/>
+<rect x="972" y="793" width="15" height="24" rx="3" fill="#DC5B57" stroke="white" stroke-width="1"/>
+<rect x="990" y="793" width="15" height="24" rx="3" fill="#DC5B57" stroke="white" stroke-width="1"/>
+<rect x="1008" y="793" width="15" height="24" rx="3" fill="#DC5B57" stroke="white" stroke-width="1"/>
+<text x="804" y="840" dominant-baseline="text-before-edge" text-anchor="start" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="21" font-weight="400" fill="#1F2937">관계별</text>
+<rect x="882" y="839" width="15" height="24" rx="3" fill="#4285BA" stroke="white" stroke-width="1"/>
+<rect x="900" y="839" width="15" height="24" rx="3" fill="#4285BA" stroke="white" stroke-width="1"/>
+<rect x="918" y="839" width="15" height="24" rx="3" fill="#4285BA" stroke="white" stroke-width="1"/>
+<rect x="936" y="839" width="15" height="24" rx="3" fill="#4285BA" stroke="white" stroke-width="1"/>
+<rect x="954" y="839" width="15" height="24" rx="3" fill="#4285BA" stroke="white" stroke-width="1"/>
+<rect x="972" y="839" width="15" height="24" rx="3" fill="#4285BA" stroke="white" stroke-width="1"/>
+<rect x="990" y="839" width="15" height="24" rx="3" fill="#4285BA" stroke="white" stroke-width="1"/>
+<rect x="1008" y="839" width="15" height="24" rx="3" fill="#4285BA" stroke="white" stroke-width="1"/>
+<text x="930" y="877" dominant-baseline="text-before-edge" text-anchor="middle" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="17" font-weight="400" fill="#64748B">노드 수·연결 수만큼의 8D</text>
+<text x="1285" y="751" dominant-baseline="text-before-edge" text-anchor="middle" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="24" font-weight="700" fill="#1F2937">영역별 평균 집계</text>
+<text x="1285" y="794" dominant-baseline="text-before-edge" text-anchor="middle" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="19" font-weight="400" fill="#1F2937">중심 / 1차 / 2차 / 나머지</text>
+<text x="1285" y="831" dominant-baseline="text-before-edge" text-anchor="middle" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="21" font-weight="400" fill="#1F2937">+ 전체 관계</text>
+<text x="1285" y="872" dominant-baseline="text-before-edge" text-anchor="middle" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="20" font-weight="700" fill="#4285BA">다섯 묶음, 각각 8개</text>
+<text x="1665" y="751" dominant-baseline="text-before-edge" text-anchor="middle" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="27" font-weight="700" fill="#1F2937">패턴 전체의 40D</text>
+<rect x="1517.0" y="801" width="6.3" height="36" rx="1" fill="#DC5B57" stroke="#DC5B57" stroke-width="1"/>
+<rect x="1524.4" y="801" width="6.3" height="36" rx="1" fill="#DC5B57" stroke="#DC5B57" stroke-width="1"/>
+<rect x="1531.8" y="801" width="6.3" height="36" rx="1" fill="#DC5B57" stroke="#DC5B57" stroke-width="1"/>
+<rect x="1539.2" y="801" width="6.3" height="36" rx="1" fill="#DC5B57" stroke="#DC5B57" stroke-width="1"/>
+<rect x="1546.6" y="801" width="6.3" height="36" rx="1" fill="#DC5B57" stroke="#DC5B57" stroke-width="1"/>
+<rect x="1554.0" y="801" width="6.3" height="36" rx="1" fill="#DC5B57" stroke="#DC5B57" stroke-width="1"/>
+<rect x="1561.4" y="801" width="6.3" height="36" rx="1" fill="#DC5B57" stroke="#DC5B57" stroke-width="1"/>
+<rect x="1568.8" y="801" width="6.3" height="36" rx="1" fill="#DC5B57" stroke="#DC5B57" stroke-width="1"/>
+<rect x="1576.2" y="801" width="6.3" height="36" rx="1" fill="#E9A23B" stroke="#E9A23B" stroke-width="1"/>
+<rect x="1583.6" y="801" width="6.3" height="36" rx="1" fill="#E9A23B" stroke="#E9A23B" stroke-width="1"/>
+<rect x="1591.0" y="801" width="6.3" height="36" rx="1" fill="#E9A23B" stroke="#E9A23B" stroke-width="1"/>
+<rect x="1598.4" y="801" width="6.3" height="36" rx="1" fill="#E9A23B" stroke="#E9A23B" stroke-width="1"/>
+<rect x="1605.8" y="801" width="6.3" height="36" rx="1" fill="#E9A23B" stroke="#E9A23B" stroke-width="1"/>
+<rect x="1613.2" y="801" width="6.3" height="36" rx="1" fill="#E9A23B" stroke="#E9A23B" stroke-width="1"/>
+<rect x="1620.6" y="801" width="6.3" height="36" rx="1" fill="#E9A23B" stroke="#E9A23B" stroke-width="1"/>
+<rect x="1628.0" y="801" width="6.3" height="36" rx="1" fill="#E9A23B" stroke="#E9A23B" stroke-width="1"/>
+<rect x="1635.4" y="801" width="6.3" height="36" rx="1" fill="#52A778" stroke="#52A778" stroke-width="1"/>
+<rect x="1642.8" y="801" width="6.3" height="36" rx="1" fill="#52A778" stroke="#52A778" stroke-width="1"/>
+<rect x="1650.2" y="801" width="6.3" height="36" rx="1" fill="#52A778" stroke="#52A778" stroke-width="1"/>
+<rect x="1657.6" y="801" width="6.3" height="36" rx="1" fill="#52A778" stroke="#52A778" stroke-width="1"/>
+<rect x="1665.0" y="801" width="6.3" height="36" rx="1" fill="#52A778" stroke="#52A778" stroke-width="1"/>
+<rect x="1672.4" y="801" width="6.3" height="36" rx="1" fill="#52A778" stroke="#52A778" stroke-width="1"/>
+<rect x="1679.8" y="801" width="6.3" height="36" rx="1" fill="#52A778" stroke="#52A778" stroke-width="1"/>
+<rect x="1687.2" y="801" width="6.3" height="36" rx="1" fill="#52A778" stroke="#52A778" stroke-width="1"/>
+<rect x="1694.6" y="801" width="6.3" height="36" rx="1" fill="#939EAA" stroke="#939EAA" stroke-width="1"/>
+<rect x="1702.0" y="801" width="6.3" height="36" rx="1" fill="#939EAA" stroke="#939EAA" stroke-width="1"/>
+<rect x="1709.4" y="801" width="6.3" height="36" rx="1" fill="#939EAA" stroke="#939EAA" stroke-width="1"/>
+<rect x="1716.8" y="801" width="6.3" height="36" rx="1" fill="#939EAA" stroke="#939EAA" stroke-width="1"/>
+<rect x="1724.2" y="801" width="6.3" height="36" rx="1" fill="#939EAA" stroke="#939EAA" stroke-width="1"/>
+<rect x="1731.6" y="801" width="6.3" height="36" rx="1" fill="#939EAA" stroke="#939EAA" stroke-width="1"/>
+<rect x="1739.0" y="801" width="6.3" height="36" rx="1" fill="#939EAA" stroke="#939EAA" stroke-width="1"/>
+<rect x="1746.4" y="801" width="6.3" height="36" rx="1" fill="#939EAA" stroke="#939EAA" stroke-width="1"/>
+<rect x="1753.8" y="801" width="6.3" height="36" rx="1" fill="#4285BA" stroke="#4285BA" stroke-width="1"/>
+<rect x="1761.2" y="801" width="6.3" height="36" rx="1" fill="#4285BA" stroke="#4285BA" stroke-width="1"/>
+<rect x="1768.6" y="801" width="6.3" height="36" rx="1" fill="#4285BA" stroke="#4285BA" stroke-width="1"/>
+<rect x="1776.0" y="801" width="6.3" height="36" rx="1" fill="#4285BA" stroke="#4285BA" stroke-width="1"/>
+<rect x="1783.4" y="801" width="6.3" height="36" rx="1" fill="#4285BA" stroke="#4285BA" stroke-width="1"/>
+<rect x="1790.8" y="801" width="6.3" height="36" rx="1" fill="#4285BA" stroke="#4285BA" stroke-width="1"/>
+<rect x="1798.2" y="801" width="6.3" height="36" rx="1" fill="#4285BA" stroke="#4285BA" stroke-width="1"/>
+<rect x="1805.6" y="801" width="6.3" height="36" rx="1" fill="#4285BA" stroke="#4285BA" stroke-width="1"/>
+<text x="1544.0" y="846" dominant-baseline="text-before-edge" text-anchor="middle" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="17" font-weight="700" fill="#DC5B57">h0</text>
+<text x="1603.2" y="846" dominant-baseline="text-before-edge" text-anchor="middle" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="17" font-weight="700" fill="#E9A23B">h1</text>
+<text x="1662.4" y="846" dominant-baseline="text-before-edge" text-anchor="middle" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="17" font-weight="700" fill="#52A778">h2</text>
+<text x="1721.6" y="846" dominant-baseline="text-before-edge" text-anchor="middle" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="17" font-weight="700" fill="#939EAA">h3</text>
+<text x="1780.8" y="846" dominant-baseline="text-before-edge" text-anchor="middle" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="17" font-weight="700" fill="#4285BA">edge</text>
+<text x="1665" y="875" dominant-baseline="text-before-edge" text-anchor="middle" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="19" font-weight="700" fill="#1F2937">5묶음 × 8개 = 40개 숫자</text>
+<text x="76" y="941" dominant-baseline="text-before-edge" text-anchor="start" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="22" font-weight="400" fill="#28658C">여기서는 Encoder 출력들을 모아 패턴을 요약한다.  Decoder와 복원 비교는 학습 단계에서 사용한다.</text>
+<text x="957" y="1022" dominant-baseline="text-before-edge" text-anchor="middle" font-family="Noto Sans CJK KR, Malgun Gothic, sans-serif" font-size="26" font-weight="700" fill="#1F2937">Decoder는 Encoder가 유용한 특징을 만들도록 훈련하는 도구이고, 최종 40D는 Encoder 특징을 집계한 결과다.</text>
+</svg>
